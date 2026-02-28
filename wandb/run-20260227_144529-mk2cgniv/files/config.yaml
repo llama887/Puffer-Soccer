@@ -1,0 +1,65 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            5ef49kiy3953iwe7m7a7j6moouzdm3a9:
+                args:
+                    - --players-per-team
+                    - "5"
+                    - --num-envs
+                    - "128"
+                    - --total-timesteps
+                    - "1000000"
+                codePath: scripts/train_pufferl.py
+                codePathLocal: scripts/train_pufferl.py
+                cpu_count: 16
+                cpu_count_logical: 32
+                cudaVersion: "12.6"
+                disk:
+                    /:
+                        total: "1081101176832"
+                        used: "185095901184"
+                email: fyy2003@nyu.edu
+                executable: /home/fyiu/repos/Puffer-Soccer/.venv/bin/python3
+                git:
+                    commit: 701196b49ce929718d46452360b9653cd290e874
+                    remote: git@github.com:llama887/Puffer-Soccer.git
+                gpu: NVIDIA GeForce RTX 4080
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      memoryTotal: "17171480576"
+                      name: NVIDIA GeForce RTX 4080
+                      uuid: GPU-9a8d14d2-e1d0-7cc8-18b0-dfa479a5f344
+                host: FranklinPC
+                memory:
+                    total: "16674574336"
+                os: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.35
+                program: /home/fyiu/repos/Puffer-Soccer/scripts/train_pufferl.py
+                python: CPython 3.12.1
+                root: /home/fyiu/repos/Puffer-Soccer
+                startedAt: "2026-02-27T19:45:29.576527Z"
+                writerId: 5ef49kiy3953iwe7m7a7j6moouzdm3a9
+        m: []
+        python_version: 3.12.1
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 2
+                - 14
+                - 15
+                - 16
+                - 61
+            "4": 3.12.1
+            "5": 0.25.0
+            "12": 0.25.0
+            "13": linux-x86_64
+tag:
+    value: null
+wandb_group:
+    value: puffer-default
+wandb_project:
+    value: robot-soccer

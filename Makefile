@@ -1,6 +1,16 @@
-run:
-	./football_env/bin/python3 ./main.py
-build_env:
-	python3 -m venv football_env
-	./football_env/bin/pip3 install -r requirements.txt
+.PHONY: build test train benchmark demo
 
+build:
+	uv sync --extra dev
+
+test:
+	uv run pytest -q
+
+train:
+	uv run python scripts/train_pufferl.py --players-per-team 5 --num-envs 8 --total-timesteps 200000
+
+benchmark:
+	uv run python scripts/benchmark_sps.py --num-envs 64 --seconds 10 --action-mode discrete
+
+demo:
+	uv run python main.py

@@ -1,28 +1,44 @@
-# MARL2DFootball
-MARL2DFootball is a lightweight 2D football environment that can be used to training multi-agent reinforcement learning (MARL) systems. The environment provides partial observations to each player and can run anything from 1 vs 1 up to 11 vs 11 player matches.
+# Puffer Soccer
 
-# Environment
-Top view of the 2D football environment for 22 players and 4 players on the field respectively.
-<p style="text-align:center;">
-<img align="center" src="Images/11_agent_top.png" width="47%">
-<img align="center" src="Images/2_agent_top.png" width="47%">
-</p>
+Native C-backed MARL 2D soccer environment for PufferLib, with:
 
-Below is gameplay footage of a team of MARL agents (trained for 35 hours) in blue playing against a handcrafted opponent in red. 
+- `make_puffer_env(...)` high-throughput native env
+- `make_parallel_env(...)` PettingZoo `ParallelEnv` API
+- centralized critic state in `infos[agent]["global_state"]`
+- discrete and continuous action modes
+- PuffeRL training script and SPS benchmark
 
-<p align="center">
-  <img align="center" src="Images/trained_agents.gif" width="50%">
-</p>
+## Install
 
-# Installation
-
-This installation was tested on an Linux (Ubuntu 21.04) machine.
-### Virtual Environment (**Recommended**)
-
-Run the below commands to setup this football environment and run the main example.
+```bash
+uv sync --extra dev
 ```
-make build_env   # Setup the virtual environment.
-make run         # Run the main example file.
-```
-You can replace the example with your own custom python file by editing the makefile.
 
+## Quick demo
+
+```bash
+uv run python main.py
+```
+
+## Train (PuffeRL PPO baseline)
+
+```bash
+uv run python scripts/train_pufferl.py --players-per-team 5 --num-envs 8 --total-timesteps 200000
+```
+
+This writes a self-play video at `experiments/self_play.mp4` after training.
+W&B logging is enabled by default with the `robot-soccer` project and logs the generated self-play video to the same run.
+
+## Benchmark
+
+```bash
+uv run python scripts/benchmark_sps.py --num-envs 64 --seconds 10 --action-mode discrete
+```
+
+## Tests
+
+```bash
+uv run pytest -q
+```
+
+`tests/test_parity.py` compares against `third-party/MARL2DFootball` when its dependencies are available.

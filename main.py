@@ -1,23 +1,21 @@
-from env_wrapper import FootballEnvWrapper
-from fixed_agent import NaiveTeamAttentionBot
+from __future__ import annotations
 
-# Initialise the football environment
-football_env = FootballEnvWrapper(num_per_team=11, render=True, include_wait=True)
+import numpy as np
 
-while True:
-    # Start new game
-    teams = [NaiveTeamAttentionBot(), NaiveTeamAttentionBot()]
-    for i in range(len(teams)):
-        teams[i].reset_brain()
-    observations, states, rewards = football_env.reset_game()
-    
+from puffer_soccer.envs.marl2d import make_parallel_env
+
+
+def main():
+    env = make_parallel_env(players_per_team=2, action_mode="discrete", render_mode="human")
+    obs, _ = env.reset(seed=0)
     done = False
     while not done:
+        actions = {agent: np.random.randint(0, 9) for agent in env.agents}
+        obs, rewards, terms, truncs, infos = env.step(actions)
+        env.render()
+        done = all(terms.values()) or all(truncs.values())
+    env.close()
 
-        # Get the agent actions
-        actions = []
-        for a_i in range(len(teams)):
-            actions.extend(teams[a_i].get_action(observations[a_i], states[a_i], add_to_memory=False))
 
-        # Environment steps
-        observations, _, rewards, done = football_env.step(actions)
+if __name__ == "__main__":
+    main()
