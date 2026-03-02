@@ -10,6 +10,7 @@ import pufferlib
 
 from .csrc import binding
 from .constants import DEFAULT_GAME_LENGTH, DEFAULT_VISION_RANGE
+from .renderer import SoccerRenderer
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         super().__init__(buf)
 
         self.global_states = np.zeros((self.num_agents, self.state_size), dtype=np.float32)
+        self._renderer = SoccerRenderer(render_mode=render_mode) if render_mode in ("human", "rgb_array") else None
         self._handle = binding.vec_init(
             observations=self.observations,
             actions=self.actions,
@@ -126,53 +128,27 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         return binding.vec_get_state(self._handle, env_idx)
 
+    def get_last_episode_scores(self, env_idx: int = 0, clear: bool = True) -> tuple[int, int] | None:
+        scores = binding.vec_get_last_scores(self._handle, env_idx, clear)
+        if scores is None:
+            return None
+        return int(scores[0]), int(scores[1])
+
+    def render(self, env_idx: int = 0):
+        if self._renderer is None:
+            return None
+        if env_idx < 0 or env_idx >= self.num_envs:
+            raise ValueError("invalid env index")
+        state = self.get_state(env_idx)
+        return self._renderer.render(state)
+
     def close(self):
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
         if getattr(self, "_handle", None) is not None:
             binding.vec_close(self._handle)
             self._handle = None
-
-
-def flatten_obs_dict(obs: dict[str, np.ndarray]) -> np.ndarray:
-    return np.concatenate(
-        [
-            np.asarray(obs["time_left"], dtype=np.float32).reshape(1),
-            np.asarray(obs["self"], dtype=np.float32),
-            np.asarray(obs["one_hot_id"], dtype=np.float32),
-            np.asarray(obs["ball"], dtype=np.float32),
-            np.asarray(obs["teammates"], dtype=np.float32).reshape(-1),
-            np.asarray(obs["opponents"], dtype=np.float32).reshape(-1),
-        ],
-        axis=0,
-    )
-
-
-def unflatten_obs(flat: np.ndarray, players_per_team: int) -> dict[str, np.ndarray]:
-    idx = 0
-    time_left = flat[idx]
-    idx += 1
-
-    self_obs = flat[idx : idx + 6]
-    idx += 6
-
-    one_hot = flat[idx : idx + 11]
-    idx += 11
-
-    ball = flat[idx : idx + 5]
-    idx += 5
-
-    teammates = flat[idx : idx + (players_per_team - 1) * 7].reshape(players_per_team - 1, 7)
-    idx += (players_per_team - 1) * 7
-
-    opponents = flat[idx : idx + players_per_team * 7].reshape(players_per_team, 7)
-
-    return {
-        "self": self_obs.astype(np.float32, copy=False),
-        "ball": ball.astype(np.float32, copy=False),
-        "teammates": teammates.astype(np.float32, copy=False),
-        "opponents": opponents.astype(np.float32, copy=False),
-        "time_left": np.asarray(time_left, dtype=np.float32),
-        "one_hot_id": one_hot.astype(np.float32, copy=False),
-    }
 
 
 def make_puffer_env(**kwargs: Any) -> MARL2DPufferEnv:

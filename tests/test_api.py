@@ -1,6 +1,6 @@
 import numpy as np
 
-from puffer_soccer.envs.marl2d import make_parallel_env, make_puffer_env
+from puffer_soccer.envs.marl2d import make_puffer_env
 
 
 def test_puffer_env_shapes_discrete():
@@ -18,26 +18,36 @@ def test_puffer_env_shapes_discrete():
     env.close()
 
 
-def test_parallel_env_roundtrip():
-    env = make_parallel_env(players_per_team=2, action_mode="discrete")
+def test_puffer_env_roundtrip():
+    env = make_puffer_env(num_envs=1, players_per_team=2, action_mode="discrete")
     obs, infos = env.reset(seed=123)
-    assert len(obs) == 4
-    assert len(infos) == 4
+    assert obs.shape == (4, 44)
+    assert infos == []
 
-    actions = {a: 0 for a in env.agents}
+    actions = np.zeros((4,), dtype=np.int32)
     obs, rewards, terms, truncs, infos = env.step(actions)
-    assert len(obs) == 4
-    assert len(rewards) == 4
-    assert all("global_state" in infos[a] for a in infos)
-    assert set(terms.keys()) == set(obs.keys())
-    assert set(truncs.keys()) == set(obs.keys())
+    assert obs.shape == (4, 44)
+    assert rewards.shape == (4,)
+    assert terms.shape == (4,)
+    assert truncs.shape == (4,)
+    assert isinstance(infos, list)
     env.close()
 
 
-def test_parallel_env_rgb_array_render():
-    env = make_parallel_env(players_per_team=2, action_mode="discrete", render_mode="rgb_array")
+def test_puffer_env_rgb_array_render():
+    env = make_puffer_env(num_envs=1, players_per_team=2, action_mode="discrete", render_mode="rgb_array")
     env.reset(seed=0)
     frame = env.render()
+    assert frame is not None
+    assert frame.ndim == 3
+    assert frame.shape[2] == 3
+    env.close()
+
+
+def test_puffer_env_rgb_array_render_second_env():
+    env = make_puffer_env(num_envs=2, players_per_team=2, action_mode="discrete", render_mode="rgb_array")
+    env.reset(seed=0)
+    frame = env.render(env_idx=1)
     assert frame is not None
     assert frame.ndim == 3
     assert frame.shape[2] == 3

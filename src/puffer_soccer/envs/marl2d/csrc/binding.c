@@ -70,6 +70,10 @@ typedef struct {
     float log_ep_return;
     float log_ep_len;
     float log_n;
+
+    int* last_goals_blue;
+    int* last_goals_red;
+    unsigned char* last_done;
 } Vec;
 
 static const float init_position_11[11][2] = {
@@ -475,6 +479,9 @@ static void step_env(Vec* vec, Env* env, int env_idx) {
         }
         float ret = 0.0f;
         for (int i = 0; i < np; i++) ret += vec->rewards[env_idx*np + i];
+        vec->last_goals_blue[env_idx] = env->goals_blue;
+        vec->last_goals_red[env_idx] = env->goals_red;
+        vec->last_done[env_idx] = 1;
         vec->log_score += (float)(env->goals_blue - env->goals_red);
         vec->log_ep_return += ret;
         vec->log_ep_len += env->num_steps;
@@ -535,6 +542,9 @@ static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     vec->global_states = (float*)PyArray_DATA(gst);
 
     vec->envs = (Env*)calloc(num_envs, sizeof(Env));
+    vec->last_goals_blue = (int*)calloc(num_envs, sizeof(int));
+    vec->last_goals_red = (int*)calloc(num_envs, sizeof(int));
+    vec->last_done = (unsigned char*)calloc(num_envs, sizeof(unsigned char));
 
     for (int i = 0; i < num_envs; i++) {
         Env* env = &vec->envs[i];
@@ -581,6 +591,9 @@ static PyObject* py_vec_reset(PyObject* self, PyObject* args) {
         env->rng = (uint32_t)(seed + i*7919 + 1);
         env->blue_left = 1;
         full_reset(env, 1);
+        vec->last_goals_blue[i] = 0;
+        vec->last_goals_red[i] = 0;
+        vec->last_done[i] = 0;
         compute_observations(vec, env, i, -1);
         for (int a = 0; a < env->num_players; a++) {
             vec->rewards[i*env->num_players + a] = 0.0f;
@@ -620,6 +633,28 @@ static PyObject* py_vec_log(PyObject* self, PyObject* args) {
     PyDict_SetItemString(d, "n", PyFloat_FromDouble(vec->log_n));
     vec->log_score = vec->log_ep_return = vec->log_ep_len = vec->log_n = 0.0f;
     return d;
+}
+
+static PyObject* py_vec_get_last_scores(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int env_idx;
+    int clear = 1;
+    if (!PyArg_ParseTuple(args, "Oi|p", &handle_obj, &env_idx, &clear)) return NULL;
+    Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
+    if (!vec || env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_ValueError, "invalid env index");
+        return NULL;
+    }
+
+    if (!vec->last_done[env_idx]) {
+        Py_RETURN_NONE;
+    }
+
+    PyObject* scores = Py_BuildValue("(ii)", vec->last_goals_blue[env_idx], vec->last_goals_red[env_idx]);
+    if (clear) {
+        vec->last_done[env_idx] = 0;
+    }
+    return scores;
 }
 
 static PyObject* py_vec_get_state(PyObject* self, PyObject* args) {
@@ -671,6 +706,9 @@ static PyObject* py_vec_close(PyObject* self, PyObject* args) {
     Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
     if (vec) {
         free(vec->envs);
+        free(vec->last_goals_blue);
+        free(vec->last_goals_red);
+        free(vec->last_done);
         free(vec);
     }
     Py_RETURN_NONE;
@@ -681,6 +719,7 @@ static PyMethodDef Methods[] = {
     {"vec_reset", py_vec_reset, METH_VARARGS, "Reset vector env"},
     {"vec_step", py_vec_step, METH_VARARGS, "Step vector env"},
     {"vec_log", py_vec_log, METH_VARARGS, "Log metrics"},
+    {"vec_get_last_scores", py_vec_get_last_scores, METH_VARARGS, "Get final score for the last completed episode"},
     {"vec_get_state", py_vec_get_state, METH_VARARGS, "Get one env state"},
     {"vec_close", py_vec_close, METH_VARARGS, "Close vector env"},
     {NULL, NULL, 0, NULL}
