@@ -15,6 +15,7 @@ dependencies = [
   "gymnasium>=0.29.1",
   "pufferlib>=3.0,<3.1",
   "wandb>=0.25.0",
+  "imageio[ffmpeg]>=2.37.2",
 ]
 
 [project.optional-dependencies]

@@ -13,7 +13,12 @@ import pufferlib
 import pufferlib.pytorch
 
 from puffer_soccer.envs.marl2d import make_puffer_env
-from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv, physical_cpu_count, total_sim_envs
+from puffer_soccer.vector_env import (
+    VecEnvConfig,
+    make_soccer_vecenv,
+    physical_cpu_count,
+    total_sim_envs,
+)
 
 
 class Policy(torch.nn.Module):
@@ -64,7 +69,9 @@ def load_env_file(path: str = ".env") -> None:
 
 
 def clone_state_dict(policy: torch.nn.Module) -> dict[str, torch.Tensor]:
-    return {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
+    return {
+        key: value.detach().cpu().clone() for key, value in policy.state_dict().items()
+    }
 
 
 def compute_eval_interval_epochs(total_epochs: int, fractions: int) -> int:
@@ -114,8 +121,14 @@ def make_side_assignment(num_envs: int) -> np.ndarray:
     return current_on_blue
 
 
-def score_metrics_from_perspective(goals_blue: int, goals_red: int, current_on_blue: bool) -> tuple[float, float]:
-    score_diff = float(goals_blue - goals_red) if current_on_blue else float(goals_red - goals_blue)
+def score_metrics_from_perspective(
+    goals_blue: int, goals_red: int, current_on_blue: bool
+) -> tuple[float, float]:
+    score_diff = (
+        float(goals_blue - goals_red)
+        if current_on_blue
+        else float(goals_red - goals_blue)
+    )
     if score_diff > 0:
         win = 1.0
     elif score_diff < 0:
@@ -160,8 +173,12 @@ def evaluate_against_past_iterate(
         else:
             current_agent_mask[split:end] = True
 
-    current_indices = torch.as_tensor(np.flatnonzero(current_agent_mask), dtype=torch.long, device=device)
-    previous_indices = torch.as_tensor(np.flatnonzero(~current_agent_mask), dtype=torch.long, device=device)
+    current_indices = torch.as_tensor(
+        np.flatnonzero(current_agent_mask), dtype=torch.long, device=device
+    )
+    previous_indices = torch.as_tensor(
+        np.flatnonzero(~current_agent_mask), dtype=torch.long, device=device
+    )
 
     completed_games = 0
     score_diffs: list[float] = []
@@ -177,11 +194,15 @@ def evaluate_against_past_iterate(
             actions = torch.zeros((total_agents,), dtype=torch.int64, device=device)
 
             current_logits, _ = current_policy.forward_eval(obs_tensor[current_indices])
-            previous_logits, _ = previous_policy.forward_eval(obs_tensor[previous_indices])
+            previous_logits, _ = previous_policy.forward_eval(
+                obs_tensor[previous_indices]
+            )
             actions[current_indices] = torch.argmax(current_logits, dim=-1)
             actions[previous_indices] = torch.argmax(previous_logits, dim=-1)
 
-            _, _, terminals, truncations, _ = eval_env.step(actions.cpu().numpy().astype(np.int32, copy=False))
+            _, _, terminals, truncations, _ = eval_env.step(
+                actions.cpu().numpy().astype(np.int32, copy=False)
+            )
             done_envs = np.flatnonzero(
                 terminals.reshape(num_envs, num_players).all(axis=1)
                 | truncations.reshape(num_envs, num_players).all(axis=1)
@@ -213,6 +234,14 @@ def evaluate_against_past_iterate(
     }
 
 
+def resolve_device(name: str) -> str:
+    if name == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
+    return name
+
+
 def main():
     try:
         import pufferlib.pufferl as pufferl
@@ -227,12 +256,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--players-per-team", type=int, default=5)
     parser.add_argument("--num-envs", type=int, default=8)
-    parser.add_argument("--vec-backend", type=str, default="native", choices=["native", "serial", "multiprocessing"])
+    parser.add_argument(
+        "--vec-backend",
+        type=str,
+        default="native",
+        choices=["native", "serial", "multiprocessing"],
+    )
     parser.add_argument("--vec-num-shards", type=int, default=None)
     parser.add_argument("--vec-batch-size", type=int, default=None)
     parser.add_argument("--shard-num-envs", type=int, default=None)
     parser.add_argument("--ppo-iterations", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--train-batch-size", type=int, default=None)
+    parser.add_argument("--bptt-horizon", type=int, default=256)
+    parser.add_argument("--minibatch-size", type=int, default=20_480)
+    parser.add_argument("--update-epochs", type=int, default=2)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wandb-project", type=str, default="robot-soccer")
     parser.add_argument("--wandb-group", type=str, default="puffer-default")
@@ -241,13 +280,17 @@ def main():
     parser.add_argument("--video-output", type=str, default="experiments/self_play.mp4")
     parser.add_argument("--video-fps", type=int, default=20)
     parser.add_argument("--video-max-steps", type=int, default=600)
-    parser.add_argument("--past-iterate-eval", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--past-iterate-eval", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--past-iterate-eval-fractions", type=int, default=10)
     parser.add_argument("--past-iterate-eval-envs", type=int, default=16)
     parser.add_argument("--past-iterate-eval-games", type=int, default=64)
     parser.add_argument("--past-iterate-eval-game-length", type=int, default=400)
     args = parser.parse_args()
     load_env_file(".env")
+
+    device = resolve_device(args.device)
 
     vec_config = resolve_vec_config(args)
     vecenv = make_soccer_vecenv(
@@ -279,11 +322,12 @@ def main():
     cfg["train"]["minibatch_size"] = minibatch_size
     cfg["train"]["total_timesteps"] = args.ppo_iterations * cfg["train"]["batch_size"]
     cfg["train"]["learning_rate"] = 3e-4
-    cfg["train"]["device"] = "cpu"
+    cfg["train"]["update_epochs"] = args.update_epochs
+    cfg["train"]["device"] = device
     cfg["train"]["seed"] = args.seed
     cfg["train"]["env"] = "puffer_soccer_marl2d"
 
-    policy = Policy(vecenv)
+    policy = Policy(vecenv).to(device)
     logger = None
     if args.wandb:
         logger_args = {
@@ -294,7 +338,9 @@ def main():
         logger = pufferl.WandbLogger(logger_args)
 
     trainer = pufferl.PuffeRL(cfg["train"], vecenv, policy, logger=logger)
-    eval_interval_epochs = compute_eval_interval_epochs(trainer.total_epochs, args.past_iterate_eval_fractions)
+    eval_interval_epochs = compute_eval_interval_epochs(
+        trainer.total_epochs, args.past_iterate_eval_fractions
+    )
 
     while trainer.epoch < trainer.total_epochs:
         previous_state_dict = clone_state_dict(policy)
@@ -303,10 +349,15 @@ def main():
         should_eval = (
             args.past_iterate_eval
             and trainer.epoch > 0
-            and (trainer.epoch % eval_interval_epochs == 0 or trainer.epoch == trainer.total_epochs)
+            and (
+                trainer.epoch % eval_interval_epochs == 0
+                or trainer.epoch == trainer.total_epochs
+            )
         )
         if should_eval:
-            eval_metrics = evaluate_against_past_iterate(policy, previous_state_dict, args, trainer.epoch)
+            eval_metrics = evaluate_against_past_iterate(
+                policy, previous_state_dict, args, trainer.epoch
+            )
             log_payload = {
                 "evaluation/past_iterate/win_rate": eval_metrics["win_rate"],
                 "evaluation/past_iterate/score_diff": eval_metrics["score_diff"],
@@ -357,6 +408,7 @@ def save_self_play_video(policy: torch.nn.Module, args):
 
     frames = []
     obs, _ = env.reset(seed=args.seed)
+    policy_device = next(policy.parameters()).device
 
     was_training = policy.training
     policy.eval()
@@ -366,8 +418,11 @@ def save_self_play_video(policy: torch.nn.Module, args):
             if frame is not None:
                 frames.append(frame.astype(np.uint8, copy=False))
 
-            logits, _ = policy.forward_eval(torch.from_numpy(obs))
-            actions = torch.argmax(logits, dim=-1).cpu().numpy().astype(np.int32, copy=False)
+            obs_tensor = torch.from_numpy(obs).to(policy_device)
+            logits, _ = policy.forward_eval(obs_tensor)
+            actions = (
+                torch.argmax(logits, dim=-1).cpu().numpy().astype(np.int32, copy=False)
+            )
 
             obs, _, terminations, truncations, _ = env.step(actions)
             if bool(terminations.all() or truncations.all()):
