@@ -82,8 +82,14 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
 
         super().__init__(buf)
 
-        self.global_states = np.zeros((self.num_agents, self.state_size), dtype=np.float32)
-        self._renderer = SoccerRenderer(render_mode=render_mode) if render_mode in ("human", "rgb_array") else None
+        self.global_states = np.zeros(
+            (self.num_agents, self.state_size), dtype=np.float32
+        )
+        self._renderer = (
+            SoccerRenderer(render_mode=render_mode)
+            if render_mode in ("human", "rgb_array")
+            else None
+        )
         self._handle = binding.vec_init(
             observations=self.observations,
             actions=self.actions,
@@ -128,7 +134,9 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         return binding.vec_get_state(self._handle, env_idx)
 
-    def get_last_episode_scores(self, env_idx: int = 0, clear: bool = True) -> tuple[int, int] | None:
+    def get_last_episode_scores(
+        self, env_idx: int = 0, clear: bool = True
+    ) -> tuple[int, int] | None:
         scores = binding.vec_get_last_scores(self._handle, env_idx, clear)
         if scores is None:
             return None
@@ -141,6 +149,12 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
             raise ValueError("invalid env index")
         state = self.get_state(env_idx)
         return self._renderer.render(state)
+
+    def flush_log(self) -> dict[str, float] | None:
+        log = binding.vec_log(self._handle)
+        if not log:
+            return None
+        return {str(k): float(v) for k, v in log.items()}
 
     def close(self):
         if self._renderer is not None:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 import imageio.v2 as imageio
 import numpy as np
@@ -50,6 +52,115 @@ class Policy(torch.nn.Module):
 
     def forward_eval(self, observations, state=None):
         return self.forward(observations, state=state)
+
+
+class IterateComparator:
+    def __init__(
+        self,
+        *,
+        players_per_team: int,
+        game_length: int,
+        eval_envs: int,
+        eval_episodes: int,
+        device: str,
+    ):
+        self.eval_episodes = eval_episodes
+        self.device = device
+        self.eval_env = make_puffer_env(
+            num_envs=eval_envs,
+            players_per_team=players_per_team,
+            action_mode="discrete",
+            game_length=game_length,
+            do_team_switch=True,
+            render_mode=None,
+            seed=0,
+        )
+        self.previous_policy = Policy(self.eval_env).to(device)
+        self.num_players = players_per_team * 2
+        base = np.arange(eval_envs, dtype=np.int64)[:, None] * self.num_players
+        blue_offsets = np.arange(players_per_team, dtype=np.int64)[None, :]
+        red_offsets = (np.arange(players_per_team, dtype=np.int64) + players_per_team)[
+            None, :
+        ]
+        self.blue_idx = (base + blue_offsets).reshape(-1)
+        self.red_idx = (base + red_offsets).reshape(-1)
+        self.blue_idx_t = torch.as_tensor(
+            self.blue_idx, dtype=torch.long, device=device
+        )
+        self.red_idx_t = torch.as_tensor(self.red_idx, dtype=torch.long, device=device)
+        self.action_buf = np.zeros((self.eval_env.num_agents,), dtype=np.int32)
+
+    def evaluate(
+        self,
+        current_policy: torch.nn.Module,
+        previous_state: Mapping[str, torch.Tensor],
+        seed: int,
+    ) -> dict[str, float]:
+        self.previous_policy.load_state_dict(previous_state, strict=True)
+        obs, _ = self.eval_env.reset(seed=seed)
+        self.eval_env.flush_log()
+
+        was_training_current = current_policy.training
+        current_policy.eval()
+        self.previous_policy.eval()
+
+        total_episodes = 0.0
+        total_wins = 0.0
+        total_score_sum = 0.0
+        with torch.no_grad():
+            while total_episodes < self.eval_episodes:
+                obs_tensor = torch.as_tensor(
+                    obs, device=self.device, dtype=torch.float32
+                )
+
+                blue_obs = obs_tensor.index_select(0, self.blue_idx_t)
+                red_obs = obs_tensor.index_select(0, self.red_idx_t)
+
+                blue_logits, _ = current_policy.forward_eval(blue_obs)
+                red_logits, _ = self.previous_policy.forward_eval(red_obs)
+
+                blue_actions = (
+                    torch.argmax(blue_logits, dim=-1)
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32, copy=False)
+                )
+                red_actions = (
+                    torch.argmax(red_logits, dim=-1)
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32, copy=False)
+                )
+
+                self.action_buf[self.blue_idx] = blue_actions
+                self.action_buf[self.red_idx] = red_actions
+
+                obs, _, _, _, _ = self.eval_env.step(self.action_buf)
+                log = self.eval_env.flush_log()
+                if log is None:
+                    continue
+
+                n = float(log.get("n", 0.0))
+                if n <= 0:
+                    continue
+                total_episodes += n
+                total_wins += float(log.get("wins_blue", 0.0))
+                total_score_sum += float(log.get("score_diff", 0.0)) * n
+
+        if was_training_current:
+            current_policy.train()
+
+        if total_episodes <= 0:
+            return {"win_rate": 0.0, "score_diff": 0.0, "episodes": 0.0}
+
+        return {
+            "win_rate": total_wins / total_episodes,
+            "score_diff": total_score_sum / total_episodes,
+            "episodes": total_episodes,
+        }
+
+    def close(self) -> None:
+        self.eval_env.close()
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -242,6 +353,85 @@ def resolve_device(name: str) -> str:
     return name
 
 
+def snapshot_policy_state(policy: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in policy.state_dict().items()
+    }
+
+
+def _configure_iterate_metrics(logger) -> None:
+    if logger is None or not hasattr(logger, "wandb"):
+        return
+    logger.wandb.define_metric("iterate_vs_prev/progress_step")
+    logger.wandb.define_metric(
+        "iterate_vs_prev/*", step_metric="iterate_vs_prev/progress_step"
+    )
+
+
+def _is_permission_like_error(err: Exception) -> bool:
+    message = str(err).lower()
+    return (
+        isinstance(err, PermissionError)
+        or "permission denied" in message
+        or "broken pipe" in message
+    )
+
+
+def _is_writable_target(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+
+    try:
+        if path.exists():
+            with path.open("ab"):
+                pass
+        else:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, prefix=".write_test_", delete=True
+            ):
+                pass
+        return True
+    except OSError:
+        return False
+
+
+def _unique_path(path: Path, max_attempts: int = 100) -> Path:
+    if not path.exists():
+        return path
+
+    for idx in range(1, max_attempts + 1):
+        candidate = path.with_name(f"{path.stem}_{idx}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not find an available filename for {path}")
+
+
+def _resolve_writable_output_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    if _is_writable_target(expanded):
+        return expanded
+
+    candidate = _unique_path(expanded)
+    if _is_writable_target(candidate):
+        print(f"Video output not writable at {expanded}; using {candidate}")
+        return candidate
+
+    tmp_base = Path(tempfile.gettempdir()) / "puffer-soccer-videos" / expanded.name
+    tmp_candidate = _unique_path(tmp_base)
+    if _is_writable_target(tmp_candidate):
+        print(
+            f"Video output not writable at {expanded}; using temp path {tmp_candidate}"
+        )
+        return tmp_candidate
+
+    raise PermissionError(
+        f"No writable output path available for video export (requested: {expanded})"
+    )
+
+
 def main():
     try:
         import pufferlib.pufferl as pufferl
@@ -336,6 +526,7 @@ def main():
             "tag": args.wandb_tag,
         }
         logger = pufferl.WandbLogger(logger_args)
+        _configure_iterate_metrics(logger)
 
     trainer = pufferl.PuffeRL(cfg["train"], vecenv, policy, logger=logger)
     eval_interval_epochs = compute_eval_interval_epochs(
@@ -436,22 +627,42 @@ def save_self_play_video(policy: torch.nn.Module, args):
     if was_training:
         policy.train()
 
-    out_path = Path(args.video_output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    requested_path = Path(args.video_output)
+    if requested_path.exists():
+        requested_path = _unique_path(requested_path)
+        print(f"Video output already exists; using {requested_path}")
     if not frames:
         print("No frames captured; skipping video export.")
         return None
 
+    out_path = _resolve_writable_output_path(requested_path)
     try:
         imageio.mimsave(out_path, frames, fps=args.video_fps, macro_block_size=None)
         print(f"Saved self-play video: {out_path}")
         return out_path
     except Exception as err:
+        if _is_permission_like_error(err):
+            retry_path = _resolve_writable_output_path(_unique_path(out_path))
+            if retry_path != out_path:
+                print(f"MP4 export path blocked; retrying at {retry_path}")
+                try:
+                    imageio.mimsave(
+                        retry_path, frames, fps=args.video_fps, macro_block_size=None
+                    )
+                    print(f"Saved self-play video: {retry_path}")
+                    return retry_path
+                except Exception as retry_err:
+                    print(f"MP4 retry failed ({retry_err}); falling back to GIF.")
+
         print(f"MP4 export failed ({err}); falling back to GIF.")
-        fallback = out_path.with_suffix(".gif")
-        imageio.mimsave(fallback, frames, fps=args.video_fps)
-        print(f"Saved self-play video fallback: {fallback}")
-        return fallback
+        fallback = _resolve_writable_output_path(out_path.with_suffix(".gif"))
+        try:
+            imageio.mimsave(fallback, frames, fps=args.video_fps)
+            print(f"Saved self-play video fallback: {fallback}")
+            return fallback
+        except Exception as gif_err:
+            print(f"GIF export failed ({gif_err}); skipping video artifact.")
+            return None
 
 
 if __name__ == "__main__":

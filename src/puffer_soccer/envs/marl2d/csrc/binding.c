@@ -74,6 +74,10 @@ typedef struct {
     int* last_goals_blue;
     int* last_goals_red;
     unsigned char* last_done;
+
+    float log_wins_blue;
+    float log_wins_red;
+    float log_draws;
 } Vec;
 
 static const float init_position_11[11][2] = {
@@ -483,6 +487,12 @@ static void step_env(Vec* vec, Env* env, int env_idx) {
         vec->last_goals_red[env_idx] = env->goals_red;
         vec->last_done[env_idx] = 1;
         vec->log_score += (float)(env->goals_blue - env->goals_red);
+
+        int score_diff = env->goals_blue - env->goals_red;
+        vec->log_score += (float)(score_diff);
+        if (score_diff > 0) vec->log_wins_blue += 1.0f;
+        else if (score_diff < 0) vec->log_wins_red += 1.0f;
+        else vec->log_draws += 1.0f;
         vec->log_ep_return += ret;
         vec->log_ep_len += env->num_steps;
         vec->log_n += 1.0f;
@@ -628,10 +638,16 @@ static PyObject* py_vec_log(PyObject* self, PyObject* args) {
 
     PyObject* d = PyDict_New();
     PyDict_SetItemString(d, "score", PyFloat_FromDouble(vec->log_score / vec->log_n));
+    PyDict_SetItemString(d, "score_diff", PyFloat_FromDouble(vec->log_score / vec->log_n));
     PyDict_SetItemString(d, "episode_return", PyFloat_FromDouble(vec->log_ep_return / vec->log_n));
     PyDict_SetItemString(d, "episode_length", PyFloat_FromDouble(vec->log_ep_len / vec->log_n));
+    PyDict_SetItemString(d, "wins_blue", PyFloat_FromDouble(vec->log_wins_blue));
+    PyDict_SetItemString(d, "wins_red", PyFloat_FromDouble(vec->log_wins_red));
+    PyDict_SetItemString(d, "draws", PyFloat_FromDouble(vec->log_draws));
+    PyDict_SetItemString(d, "win_rate_blue", PyFloat_FromDouble(vec->log_wins_blue / vec->log_n));
     PyDict_SetItemString(d, "n", PyFloat_FromDouble(vec->log_n));
     vec->log_score = vec->log_ep_return = vec->log_ep_len = vec->log_n = 0.0f;
+    vec->log_wins_blue = vec->log_wins_red = vec->log_draws = 0.0f;
     return d;
 }
 
