@@ -312,14 +312,15 @@ class IterateComparator:
     ):
         self.eval_episodes = eval_episodes
         self.device = device
-        self.eval_env = make_puffer_env(
-            num_envs=eval_envs,
+        self.eval_env = make_soccer_vecenv(
             players_per_team=players_per_team,
+            vec=VecEnvConfig(backend="native", shard_num_envs=eval_envs, num_shards=1),
             action_mode="discrete",
             game_length=game_length,
             do_team_switch=True,
             render_mode=None,
             seed=0,
+            log_interval=1,
         )
         self.previous_policy = Policy(self.eval_env).to(device)
         self.num_players = players_per_team * 2
@@ -460,9 +461,14 @@ def resolve_vec_config(args) -> VecEnvConfig:
             num_shards=1,
         )
 
-    num_shards = args.vec_num_shards or physical_cpu_count()
+    num_shards = args.vec_num_shards or min(args.num_envs, physical_cpu_count())
+    num_shards = max(1, min(num_shards, args.num_envs))
+    if args.num_envs % num_shards != 0:
+        raise ValueError(
+            "num_envs must be divisible by vec_num_shards for non-native backends"
+        )
     batch_size = args.vec_batch_size or num_shards
-    shard_num_envs = args.shard_num_envs or 2
+    shard_num_envs = args.num_envs // num_shards
     return VecEnvConfig(
         backend=args.vec_backend,
         shard_num_envs=shard_num_envs,
@@ -501,12 +507,18 @@ def evaluate_against_past_iterate(
     args,
     epoch: int,
 ) -> dict[str, float]:
-    eval_env = make_puffer_env(
-        num_envs=args.past_iterate_eval_envs,
+    eval_env = make_soccer_vecenv(
         players_per_team=args.players_per_team,
         game_length=args.past_iterate_eval_game_length,
         action_mode="discrete",
         seed=args.seed + epoch,
+        render_mode=None,
+        log_interval=1,
+        vec=VecEnvConfig(
+            backend="native",
+            shard_num_envs=args.past_iterate_eval_envs,
+            num_shards=1,
+        ),
     )
 
     device = next(current_policy.parameters()).device
@@ -690,7 +702,6 @@ def main():
     )
     parser.add_argument("--vec-num-shards", type=int, default=None)
     parser.add_argument("--vec-batch-size", type=int, default=None)
-    parser.add_argument("--shard-num-envs", type=int, default=None)
     parser.add_argument("--ppo-iterations", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train-batch-size", type=int, default=None)
@@ -736,6 +747,7 @@ def main():
         f"backend={vec_config.backend}, "
         f"shard_num_envs={vec_config.shard_num_envs}, "
         f"num_shards={vec_config.num_shards}, "
+        f"num_workers={vec_config.num_workers}, "
         f"batch_size={vec_config.batch_size}, "
         f"total_sim_envs={total_sim_envs(vec_config)}, "
         f"num_agents={vecenv.num_agents}"
@@ -839,7 +851,6 @@ def main():
 
 def save_self_play_video(policy: torch.nn.Module, args):
     env = make_puffer_env(
-        num_envs=1,
         players_per_team=args.players_per_team,
         action_mode="discrete",
         game_length=400,

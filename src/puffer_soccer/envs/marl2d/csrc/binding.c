@@ -1,14 +1,24 @@
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <Python.h>
 #include <numpy/arrayobject.h>
-#include <stdlib.h>
-#include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define MAX_PLAYERS 22
 #define MAX_PER_TEAM 11
 #define MAX_BALL_SPEED 5.0f
+
+typedef struct {
+    float score;
+    float episode_return;
+    float episode_length;
+    float wins_blue;
+    float wins_red;
+    float draws;
+    float n;
+} Log;
 
 typedef struct {
     float x;
@@ -16,68 +26,51 @@ typedef struct {
     float rot;
     float last_move;
     float last_rot;
-    int team;  // 0 blue, 1 red
+    int team;
 } Agent;
 
 typedef struct {
-    Agent agents[MAX_PLAYERS];
-    int players_per_team;
-    int num_players;
-    int game_length;
-    int num_steps;
-    int do_team_switch;
-    int blue_left; // 1 if blue attacks right (is on left side), 0 otherwise
-    int reset_setup; // 0 position, 1 random
-    float vision_range;
-
-    float x_out_start;
-    float x_out_end;
-    float y_out_start;
-    float y_out_end;
-    float goal_half_h;
-
-    float rot_speed;
-    float move_speed;
-
-    float ball_x;
-    float ball_y;
-    float ball_vx;
-    float ball_vy;
-
-    int goals_blue;
-    int goals_red;
-
-    uint32_t rng;
-} Env;
-
-typedef struct {
-    Env* envs;
-    int num_envs;
-    int players_per_team;
-    int num_players;
-    int obs_size;
-    int state_size;
-    int action_mode; // 0 discrete int32, 1 continuous float32[2]
-
+    Log log;
     float* observations;
     void* actions;
     float* rewards;
     unsigned char* terminals;
     unsigned char* truncations;
     float* global_states;
+    Agent agents[MAX_PLAYERS];
+    int players_per_team;
+    int num_players;
+    int game_length;
+    int num_steps;
+    int do_team_switch;
+    int blue_left;
+    int reset_setup;
+    int action_mode;
+    int last_goals_blue;
+    int last_goals_red;
+    unsigned char last_done;
+    float vision_range;
+    float x_out_start;
+    float x_out_end;
+    float y_out_start;
+    float y_out_end;
+    float goal_half_h;
+    float rot_speed;
+    float move_speed;
+    float ball_x;
+    float ball_y;
+    float ball_vx;
+    float ball_vy;
+    int goals_blue;
+    int goals_red;
+    int obs_size;
+    int state_size;
+    uint32_t rng;
+} Env;
 
-    float log_score;
-    float log_ep_return;
-    float log_ep_len;
-    float log_n;
-
-    int* last_goals_blue;
-    int* last_goals_red;
-    unsigned char* last_done;
-
-    float log_wins_blue;
-    float log_wins_red;
-    float log_draws;
+typedef struct {
+    Env* envs;
+    int num_envs;
 } Vec;
 
 static const float init_position_11[11][2] = {
@@ -292,13 +285,10 @@ static void rel_obs_ball(const Env* env, const Agent* focus, float* out5) {
     out5[4] = rel_y;
 }
 
-static void compute_observations(Vec* vec, Env* env, int env_idx, int goal_scored_team) {
-    int n = env->players_per_team;
+static void compute_observations(Env* env, int goal_scored_team) {
     int np = env->num_players;
-    float sign_state = team_on_left(env, 0) ? 1.0f : -1.0f; // agent_0 side
-
-    // Shared state for centralized critic.
-    float* state = vec->global_states + (env_idx * np * vec->state_size);
+    float sign_state = team_on_left(env, 0) ? 1.0f : -1.0f;
+    float* state = env->global_states;
     float time_left = 1.0f - ((float)env->num_steps / (float)env->game_length);
     float* state_base = state;
     state_base[0] = time_left;
@@ -321,17 +311,14 @@ static void compute_observations(Vec* vec, Env* env, int env_idx, int goal_score
         for (int k = 0; k < 11; k++) state_base[sidx++] = onehot[k];
     }
 
-    // Copy same global state for each agent entry.
     for (int a = 1; a < np; a++) {
-        memcpy(state + a * vec->state_size, state_base, sizeof(float) * vec->state_size);
+        memcpy(state + a * env->state_size, state_base, sizeof(float) * env->state_size);
     }
 
-    // Per-agent observations.
     for (int i = 0; i < np; i++) {
         Agent* focus = &env->agents[i];
         float sign = team_on_left(env, focus->team) ? 1.0f : -1.0f;
-
-        float* out = vec->observations + ((env_idx * np + i) * vec->obs_size);
+        float* out = env->observations + (i * env->obs_size);
         int o = 0;
 
         out[o++] = time_left;
@@ -350,7 +337,6 @@ static void compute_observations(Vec* vec, Env* env, int env_idx, int goal_score
         rel_obs_ball(env, focus, brobs);
         for (int k = 0; k < 5; k++) out[o++] = brobs[k];
 
-        // Teammates first, then opponents.
         for (int j = 0; j < np; j++) {
             if (j == i) continue;
             if (env->agents[j].team != focus->team) continue;
@@ -365,41 +351,95 @@ static void compute_observations(Vec* vec, Env* env, int env_idx, int goal_score
             for (int k = 0; k < 7; k++) out[o++] = aobs[k];
         }
 
-        // Rewards.
         float r = 0.0f;
         if (goal_scored_team >= 0) {
             r = (focus->team == goal_scored_team) ? 1.0f : -1.0f;
         }
-        vec->rewards[env_idx * np + i] = r;
+        env->rewards[i] = r;
     }
 }
 
-static void step_env(Vec* vec, Env* env, int env_idx) {
+static void clear_outputs(Env* env) {
+    for (int i = 0; i < env->num_players; i++) {
+        env->rewards[i] = 0.0f;
+        env->terminals[i] = 0;
+        env->truncations[i] = 0;
+    }
+}
+
+static void init_env_common(
+    Env* env,
+    int seed,
+    int players_per_team,
+    int game_length,
+    int action_mode,
+    int do_team_switch,
+    float vision_range,
+    int reset_setup
+) {
+    memset(&env->log, 0, sizeof(Log));
+    env->players_per_team = players_per_team;
+    env->num_players = players_per_team * 2;
+    env->game_length = game_length;
+    env->do_team_switch = do_team_switch;
+    env->blue_left = 1;
+    env->reset_setup = reset_setup;
+    env->vision_range = vision_range;
+    env->action_mode = action_mode;
+    env->obs_size = obs_size_for_team(players_per_team);
+    env->state_size = state_size_for_team(players_per_team);
+    env->last_goals_blue = 0;
+    env->last_goals_red = 0;
+    env->last_done = 0;
+    env->x_out_start = -50.0f;
+    env->x_out_end = 50.0f;
+    env->y_out_start = -35.0f;
+    env->y_out_end = 35.0f;
+    env->goal_half_h = 20.0f;
+    env->rot_speed = 0.4f;
+    env->move_speed = 1.0f;
+    env->rng = (uint32_t)(seed + 1);
+
+    for (int a = 0; a < env->num_players; a++) {
+        env->agents[a].team = (a < players_per_team) ? 0 : 1;
+    }
+
+    full_reset(env, 1);
+    clear_outputs(env);
+    compute_observations(env, -1);
+}
+
+static void c_reset(Env* env, int seed) {
+    env->rng = (uint32_t)(seed + 1);
+    env->blue_left = 1;
+    full_reset(env, 1);
+    env->last_goals_blue = 0;
+    env->last_goals_red = 0;
+    env->last_done = 0;
+    clear_outputs(env);
+    compute_observations(env, -1);
+}
+
+static void c_step(Env* env) {
     int np = env->num_players;
     env->num_steps += 1;
-
-    // Clear step outputs.
-    for (int i = 0; i < np; i++) {
-        vec->rewards[env_idx*np + i] = 0.0f;
-        vec->terminals[env_idx*np + i] = 0;
-        vec->truncations[env_idx*np + i] = 0;
-    }
+    clear_outputs(env);
 
     for (int i = 0; i < np; i++) {
         Agent* a = &env->agents[i];
         float move = 0.0f;
         float rot = 0.0f;
 
-        if (vec->action_mode == 0) {
-            int* atn = (int*)vec->actions;
-            int action = atn[env_idx*np + i];
+        if (env->action_mode == 0) {
+            int* atn = (int*)env->actions;
+            int action = atn[i];
             if (action < 0) action = 0;
             if (action > 8) action = 8;
             move = (float)(action / 3) - 1.0f;
             rot = (float)(action % 3) - 1.0f;
         } else {
-            float* atn = (float*)vec->actions;
-            float* arow = atn + ((env_idx*np + i) * 2);
+            float* atn = (float*)env->actions;
+            float* arow = atn + (i * 2);
             move = clampf(arow[0], -1.0f, 1.0f);
             rot = clampf(arow[1], -1.0f, 1.0f);
         }
@@ -414,7 +454,6 @@ static void step_env(Vec* vec, Env* env, int env_idx) {
         float sin_comp = move * env->move_speed * sinf(a->rot);
         float cos_comp = move * env->move_speed * cosf(a->rot);
 
-        // Intentional parity with upstream implementation (double-add before clip).
         a->x = a->x + cos_comp;
         a->y = a->y + sin_comp;
         a->x = clampf(a->x + cos_comp, env->x_out_start, env->x_out_end);
@@ -433,7 +472,7 @@ static void step_env(Vec* vec, Env* env, int env_idx) {
         env->ball_vy = 0.0f;
     }
 
-    int goal_scored = -1; // 0 blue, 1 red
+    int goal_scored = -1;
     if (fabsf(env->ball_y) <= env->goal_half_h) {
         if (env->ball_x < env->x_out_start) {
             goal_scored = team_on_left(env, 1) ? 1 : 0;
@@ -475,46 +514,171 @@ static void step_env(Vec* vec, Env* env, int env_idx) {
     }
 
     int done = (env->num_steps >= env->game_length);
-    compute_observations(vec, env, env_idx, goal_scored);
+    compute_observations(env, goal_scored);
 
     if (done) {
-        for (int i = 0; i < np; i++) {
-            vec->terminals[env_idx*np + i] = 1;
-        }
         float ret = 0.0f;
-        for (int i = 0; i < np; i++) ret += vec->rewards[env_idx*np + i];
-        vec->last_goals_blue[env_idx] = env->goals_blue;
-        vec->last_goals_red[env_idx] = env->goals_red;
-        vec->last_done[env_idx] = 1;
-        vec->log_score += (float)(env->goals_blue - env->goals_red);
-
-        int score_diff = env->goals_blue - env->goals_red;
-        vec->log_score += (float)(score_diff);
-        if (score_diff > 0) vec->log_wins_blue += 1.0f;
-        else if (score_diff < 0) vec->log_wins_red += 1.0f;
-        else vec->log_draws += 1.0f;
-        vec->log_ep_return += ret;
-        vec->log_ep_len += env->num_steps;
-        vec->log_n += 1.0f;
-
+        int score_diff;
+        for (int i = 0; i < np; i++) {
+            env->terminals[i] = 1;
+            ret += env->rewards[i];
+        }
+        env->last_goals_blue = env->goals_blue;
+        env->last_goals_red = env->goals_red;
+        env->last_done = 1;
+        score_diff = env->goals_blue - env->goals_red;
+        env->log.score += (float)score_diff;
+        if (score_diff > 0) env->log.wins_blue += 1.0f;
+        else if (score_diff < 0) env->log.wins_red += 1.0f;
+        else env->log.draws += 1.0f;
+        env->log.episode_return += ret;
+        env->log.episode_length += env->num_steps;
+        env->log.n += 1.0f;
         full_reset(env, 1);
     }
 }
 
-static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
+static int assign_log_dict(PyObject* d, const Log* log) {
+    if (PyDict_SetItemString(d, "score", PyFloat_FromDouble(log->score / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "score_diff", PyFloat_FromDouble(log->score / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "episode_return", PyFloat_FromDouble(log->episode_return / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "episode_length", PyFloat_FromDouble(log->episode_length / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "wins_blue", PyFloat_FromDouble(log->wins_blue)) < 0) return -1;
+    if (PyDict_SetItemString(d, "wins_red", PyFloat_FromDouble(log->wins_red)) < 0) return -1;
+    if (PyDict_SetItemString(d, "draws", PyFloat_FromDouble(log->draws)) < 0) return -1;
+    if (PyDict_SetItemString(d, "win_rate_blue", PyFloat_FromDouble(log->wins_blue / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "n", PyFloat_FromDouble(log->n)) < 0) return -1;
+    return 0;
+}
+
+static PyObject* build_log_dict(Log* log) {
+    if (log->n <= 0.0f) {
+        Py_RETURN_NONE;
+    }
+    PyObject* d = PyDict_New();
+    if (assign_log_dict(d, log) < 0) {
+        Py_DECREF(d);
+        return NULL;
+    }
+    memset(log, 0, sizeof(Log));
+    return d;
+}
+
+static Env* unpack_env_handle(PyObject* handle_obj) {
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "env_handle must be an integer");
+        return NULL;
+    }
+    Env* env = (Env*)PyLong_AsVoidPtr(handle_obj);
+    if (!env) {
+        PyErr_SetString(PyExc_ValueError, "invalid env handle");
+        return NULL;
+    }
+    return env;
+}
+
+static Vec* unpack_vec_handle(PyObject* handle_obj) {
+    if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "vec_handle must be an integer");
+        return NULL;
+    }
+    Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
+    if (!vec) {
+        PyErr_SetString(PyExc_ValueError, "invalid vec handle");
+        return NULL;
+    }
+    return vec;
+}
+
+static int validate_common_arrays(
+    PyArrayObject* obs,
+    PyArrayObject* act,
+    PyArrayObject* rew,
+    PyArrayObject* term,
+    PyArrayObject* trunc,
+    PyArrayObject* gst,
+    int players_per_team
+) {
+    int num_players = players_per_team * 2;
+    if (PyArray_ITEMSIZE(act) == sizeof(double)) {
+        PyErr_SetString(PyExc_ValueError, "Action tensor passed as float64 (pass np.float32 buffer)");
+        return -1;
+    }
+    if (PyArray_NDIM(rew) != 1 || PyArray_DIM(rew, 0) != num_players) {
+        PyErr_SetString(PyExc_ValueError, "Rewards must be shape (num_players,)");
+        return -1;
+    }
+    if (PyArray_NDIM(term) != 1 || PyArray_DIM(term, 0) != num_players) {
+        PyErr_SetString(PyExc_ValueError, "Terminals must be shape (num_players,)");
+        return -1;
+    }
+    if (PyArray_NDIM(trunc) != 1 || PyArray_DIM(trunc, 0) != num_players) {
+        PyErr_SetString(PyExc_ValueError, "Truncations must be shape (num_players,)");
+        return -1;
+    }
+    if (PyArray_NDIM(obs) != 2 || PyArray_DIM(obs, 0) != num_players) {
+        PyErr_SetString(PyExc_ValueError, "Observations must be shape (num_players, obs_size)");
+        return -1;
+    }
+    if (PyArray_NDIM(gst) != 2 || PyArray_DIM(gst, 0) != num_players) {
+        PyErr_SetString(PyExc_ValueError, "Global states must be shape (num_players, state_size)");
+        return -1;
+    }
+    return 0;
+}
+
+static int validate_vector_arrays(
+    PyArrayObject* obs,
+    PyArrayObject* act,
+    PyArrayObject* rew,
+    PyArrayObject* term,
+    PyArrayObject* trunc,
+    PyArrayObject* gst,
+    int num_envs,
+    int players_per_team
+) {
+    int total_players = num_envs * players_per_team * 2;
+    if (PyArray_ITEMSIZE(act) == sizeof(double)) {
+        PyErr_SetString(PyExc_ValueError, "Action tensor passed as float64 (pass np.float32 buffer)");
+        return -1;
+    }
+    if (PyArray_NDIM(rew) != 1 || PyArray_DIM(rew, 0) != total_players) {
+        PyErr_SetString(PyExc_ValueError, "Rewards must be shape (num_envs * num_players,)");
+        return -1;
+    }
+    if (PyArray_NDIM(term) != 1 || PyArray_DIM(term, 0) != total_players) {
+        PyErr_SetString(PyExc_ValueError, "Terminals must be shape (num_envs * num_players,)");
+        return -1;
+    }
+    if (PyArray_NDIM(trunc) != 1 || PyArray_DIM(trunc, 0) != total_players) {
+        PyErr_SetString(PyExc_ValueError, "Truncations must be shape (num_envs * num_players,)");
+        return -1;
+    }
+    if (PyArray_NDIM(obs) != 2 || PyArray_DIM(obs, 0) != total_players) {
+        PyErr_SetString(PyExc_ValueError, "Observations must be shape (num_envs * num_players, obs_size)");
+        return -1;
+    }
+    if (PyArray_NDIM(gst) != 2 || PyArray_DIM(gst, 0) != total_players) {
+        PyErr_SetString(PyExc_ValueError, "Global states must be shape (num_envs * num_players, state_size)");
+        return -1;
+    }
+    return 0;
+}
+
+static PyObject* py_env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyObject *obs_obj, *act_obj, *rew_obj, *term_obj, *trunc_obj, *state_obj;
-    int num_envs, seed, players_per_team, game_length, action_mode, do_team_switch, reset_setup;
+    int seed, players_per_team, game_length, action_mode, do_team_switch, reset_setup;
     float vision_range;
 
     static char* kwlist[] = {
         "observations", "actions", "rewards", "terminals", "truncations", "global_states",
-        "num_envs", "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
+        "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
         "vision_range", "reset_setup", NULL
     };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiii|fi", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiifi", kwlist,
             &obs_obj, &act_obj, &rew_obj, &term_obj, &trunc_obj, &state_obj,
-            &num_envs, &seed, &players_per_team, &game_length, &action_mode,
+            &seed, &players_per_team, &game_length, &action_mode,
             &do_team_switch, &vision_range, &reset_setup)) {
         return NULL;
     }
@@ -535,155 +699,81 @@ static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         Py_XDECREF(obs); Py_XDECREF(act); Py_XDECREF(rew); Py_XDECREF(term); Py_XDECREF(trunc); Py_XDECREF(gst);
         return NULL;
     }
-
-    Vec* vec = (Vec*)calloc(1, sizeof(Vec));
-    vec->num_envs = num_envs;
-    vec->players_per_team = players_per_team;
-    vec->num_players = players_per_team * 2;
-    vec->obs_size = obs_size_for_team(players_per_team);
-    vec->state_size = state_size_for_team(players_per_team);
-    vec->action_mode = action_mode;
-
-    vec->observations = (float*)PyArray_DATA(obs);
-    vec->actions = PyArray_DATA(act);
-    vec->rewards = (float*)PyArray_DATA(rew);
-    vec->terminals = (unsigned char*)PyArray_DATA(term);
-    vec->truncations = (unsigned char*)PyArray_DATA(trunc);
-    vec->global_states = (float*)PyArray_DATA(gst);
-
-    vec->envs = (Env*)calloc(num_envs, sizeof(Env));
-    vec->last_goals_blue = (int*)calloc(num_envs, sizeof(int));
-    vec->last_goals_red = (int*)calloc(num_envs, sizeof(int));
-    vec->last_done = (unsigned char*)calloc(num_envs, sizeof(unsigned char));
-
-    for (int i = 0; i < num_envs; i++) {
-        Env* env = &vec->envs[i];
-        env->players_per_team = players_per_team;
-        env->num_players = players_per_team * 2;
-        env->game_length = game_length;
-        env->do_team_switch = do_team_switch;
-        env->blue_left = 1;
-        env->reset_setup = reset_setup;
-        env->vision_range = vision_range;
-
-        env->x_out_start = -50.0f;
-        env->x_out_end = 50.0f;
-        env->y_out_start = -35.0f;
-        env->y_out_end = 35.0f;
-        env->goal_half_h = 20.0f;
-
-        env->rot_speed = 0.4f;
-        env->move_speed = 1.0f;
-        env->rng = (uint32_t)(seed + i*7919 + 1);
-
-        for (int a = 0; a < env->num_players; a++) {
-            env->agents[a].team = (a < players_per_team) ? 0 : 1;
-        }
-        full_reset(env, 1);
-        compute_observations(vec, env, i, -1);
+    if (validate_common_arrays(obs, act, rew, term, trunc, gst, players_per_team) < 0) {
+        Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
+        return NULL;
     }
 
+    Env* env = (Env*)calloc(1, sizeof(Env));
+    if (!env) {
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate env");
+        Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
+        return NULL;
+    }
+
+    env->observations = (float*)PyArray_DATA(obs);
+    env->actions = PyArray_DATA(act);
+    env->rewards = (float*)PyArray_DATA(rew);
+    env->terminals = (unsigned char*)PyArray_DATA(term);
+    env->truncations = (unsigned char*)PyArray_DATA(trunc);
+    env->global_states = (float*)PyArray_DATA(gst);
+    init_env_common(env, seed, players_per_team, game_length, action_mode, do_team_switch, vision_range, reset_setup);
+
     Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
-    return PyLong_FromVoidPtr((void*)vec);
+    return PyLong_FromVoidPtr((void*)env);
 }
 
-static PyObject* py_vec_reset(PyObject* self, PyObject* args) {
+static PyObject* py_env_reset(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     int seed;
     if (!PyArg_ParseTuple(args, "Oi", &handle_obj, &seed)) {
         return NULL;
     }
-    Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
-    if (!vec) Py_RETURN_NONE;
-
-    for (int i = 0; i < vec->num_envs; i++) {
-        Env* env = &vec->envs[i];
-        env->rng = (uint32_t)(seed + i*7919 + 1);
-        env->blue_left = 1;
-        full_reset(env, 1);
-        vec->last_goals_blue[i] = 0;
-        vec->last_goals_red[i] = 0;
-        vec->last_done[i] = 0;
-        compute_observations(vec, env, i, -1);
-        for (int a = 0; a < env->num_players; a++) {
-            vec->rewards[i*env->num_players + a] = 0.0f;
-            vec->terminals[i*env->num_players + a] = 0;
-            vec->truncations[i*env->num_players + a] = 0;
-        }
-    }
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    c_reset(env, seed);
     Py_RETURN_NONE;
 }
 
-static PyObject* py_vec_step(PyObject* self, PyObject* args) {
+static PyObject* py_env_step(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     if (!PyArg_ParseTuple(args, "O", &handle_obj)) {
         return NULL;
     }
-    Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
-    if (!vec) Py_RETURN_NONE;
-
-    for (int i = 0; i < vec->num_envs; i++) {
-        step_env(vec, &vec->envs[i], i);
-    }
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    c_step(env);
     Py_RETURN_NONE;
 }
 
-static PyObject* py_vec_log(PyObject* self, PyObject* args) {
+static PyObject* py_env_log(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
-    if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
-    Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
-    if (!vec || vec->log_n <= 0.0f) {
-        Py_RETURN_NONE;
-    }
-
-    PyObject* d = PyDict_New();
-    PyDict_SetItemString(d, "score", PyFloat_FromDouble(vec->log_score / vec->log_n));
-    PyDict_SetItemString(d, "score_diff", PyFloat_FromDouble(vec->log_score / vec->log_n));
-    PyDict_SetItemString(d, "episode_return", PyFloat_FromDouble(vec->log_ep_return / vec->log_n));
-    PyDict_SetItemString(d, "episode_length", PyFloat_FromDouble(vec->log_ep_len / vec->log_n));
-    PyDict_SetItemString(d, "wins_blue", PyFloat_FromDouble(vec->log_wins_blue));
-    PyDict_SetItemString(d, "wins_red", PyFloat_FromDouble(vec->log_wins_red));
-    PyDict_SetItemString(d, "draws", PyFloat_FromDouble(vec->log_draws));
-    PyDict_SetItemString(d, "win_rate_blue", PyFloat_FromDouble(vec->log_wins_blue / vec->log_n));
-    PyDict_SetItemString(d, "n", PyFloat_FromDouble(vec->log_n));
-    vec->log_score = vec->log_ep_return = vec->log_ep_len = vec->log_n = 0.0f;
-    vec->log_wins_blue = vec->log_wins_red = vec->log_draws = 0.0f;
-    return d;
-}
-
-static PyObject* py_vec_get_last_scores(PyObject* self, PyObject* args) {
-    PyObject* handle_obj;
-    int env_idx;
-    int clear = 1;
-    if (!PyArg_ParseTuple(args, "Oi|p", &handle_obj, &env_idx, &clear)) return NULL;
-    Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
-    if (!vec || env_idx < 0 || env_idx >= vec->num_envs) {
-        PyErr_SetString(PyExc_ValueError, "invalid env index");
+    if (!PyArg_ParseTuple(args, "O", &handle_obj)) {
         return NULL;
     }
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    return build_log_dict(&env->log);
+}
 
-    if (!vec->last_done[env_idx]) {
-        Py_RETURN_NONE;
-    }
-
-    PyObject* scores = Py_BuildValue("(ii)", vec->last_goals_blue[env_idx], vec->last_goals_red[env_idx]);
-    if (clear) {
-        vec->last_done[env_idx] = 0;
-    }
+static PyObject* py_env_get_last_scores(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int clear = 1;
+    if (!PyArg_ParseTuple(args, "O|p", &handle_obj, &clear)) return NULL;
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    if (!env->last_done) Py_RETURN_NONE;
+    PyObject* scores = Py_BuildValue("(ii)", env->last_goals_blue, env->last_goals_red);
+    if (clear) env->last_done = 0;
     return scores;
 }
 
-static PyObject* py_vec_get_state(PyObject* self, PyObject* args) {
+static PyObject* py_env_get_state(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
-    int env_idx;
-    if (!PyArg_ParseTuple(args, "Oi", &handle_obj, &env_idx)) return NULL;
-    Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
-    if (!vec || env_idx < 0 || env_idx >= vec->num_envs) {
-        PyErr_SetString(PyExc_ValueError, "invalid env index");
-        return NULL;
-    }
+    if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
 
-    Env* env = &vec->envs[env_idx];
     npy_intp pos_dims[2] = {env->num_players, 2};
     npy_intp rot_dims[1] = {env->num_players};
 
@@ -700,7 +790,6 @@ static PyObject* py_vec_get_state(PyObject* self, PyObject* args) {
 
     PyObject* ball = Py_BuildValue("(ffff)", env->ball_x, env->ball_y, env->ball_vx, env->ball_vy);
     PyObject* goals = Py_BuildValue("(ii)", env->goals_blue, env->goals_red);
-
     PyObject* d = PyDict_New();
     PyDict_SetItemString(d, "positions", pos);
     PyDict_SetItemString(d, "rotations", rot);
@@ -708,7 +797,6 @@ static PyObject* py_vec_get_state(PyObject* self, PyObject* args) {
     PyDict_SetItemString(d, "goals", goals);
     PyDict_SetItemString(d, "num_steps", PyLong_FromLong(env->num_steps));
     PyDict_SetItemString(d, "blue_left", PyBool_FromLong(env->blue_left));
-
     Py_DECREF(pos);
     Py_DECREF(rot);
     Py_DECREF(ball);
@@ -716,27 +804,206 @@ static PyObject* py_vec_get_state(PyObject* self, PyObject* args) {
     return d;
 }
 
-static PyObject* py_vec_close(PyObject* self, PyObject* args) {
+static PyObject* py_env_close(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
-    Vec* vec = (Vec*)PyLong_AsVoidPtr(handle_obj);
-    if (vec) {
-        free(vec->envs);
-        free(vec->last_goals_blue);
-        free(vec->last_goals_red);
-        free(vec->last_done);
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    free(env);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
+    PyObject *obs_obj, *act_obj, *rew_obj, *term_obj, *trunc_obj, *state_obj;
+    int num_envs, seed, players_per_team, game_length, action_mode, do_team_switch, reset_setup;
+    float vision_range;
+
+    static char* kwlist[] = {
+        "observations", "actions", "rewards", "terminals", "truncations", "global_states",
+        "num_envs", "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
+        "vision_range", "reset_setup", NULL
+    };
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiifi", kwlist,
+            &obs_obj, &act_obj, &rew_obj, &term_obj, &trunc_obj, &state_obj,
+            &num_envs, &seed, &players_per_team, &game_length, &action_mode,
+            &do_team_switch, &vision_range, &reset_setup)) {
+        return NULL;
+    }
+
+    if (num_envs < 1) {
+        PyErr_SetString(PyExc_ValueError, "num_envs must be positive");
+        return NULL;
+    }
+    if (players_per_team < 1 || players_per_team > 11) {
+        PyErr_SetString(PyExc_ValueError, "players_per_team must be in [1, 11]");
+        return NULL;
+    }
+
+    PyArrayObject* obs = (PyArrayObject*)PyArray_FROM_OTF(obs_obj, NPY_FLOAT32, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject* act = (PyArrayObject*)PyArray_FROM_O(act_obj);
+    PyArrayObject* rew = (PyArrayObject*)PyArray_FROM_OTF(rew_obj, NPY_FLOAT32, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject* term = (PyArrayObject*)PyArray_FROM_OTF(term_obj, NPY_BOOL, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject* trunc = (PyArrayObject*)PyArray_FROM_OTF(trunc_obj, NPY_BOOL, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject* gst = (PyArrayObject*)PyArray_FROM_OTF(state_obj, NPY_FLOAT32, NPY_ARRAY_IN_ARRAY);
+
+    if (!obs || !act || !rew || !term || !trunc || !gst) {
+        Py_XDECREF(obs); Py_XDECREF(act); Py_XDECREF(rew); Py_XDECREF(term); Py_XDECREF(trunc); Py_XDECREF(gst);
+        return NULL;
+    }
+    if (validate_vector_arrays(obs, act, rew, term, trunc, gst, num_envs, players_per_team) < 0) {
+        Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
+        return NULL;
+    }
+
+    Vec* vec = (Vec*)calloc(1, sizeof(Vec));
+    if (!vec) {
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate vec env");
+        Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
+        return NULL;
+    }
+    vec->num_envs = num_envs;
+    vec->envs = (Env*)calloc(num_envs, sizeof(Env));
+    if (!vec->envs) {
         free(vec);
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate env array");
+        Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
+        return NULL;
+    }
+
+    int num_players = players_per_team * 2;
+    npy_intp obs_stride = PyArray_STRIDE(obs, 0) * num_players;
+    npy_intp act_stride = PyArray_STRIDE(act, 0) * num_players;
+    npy_intp rew_stride = PyArray_STRIDE(rew, 0) * num_players;
+    npy_intp term_stride = PyArray_STRIDE(term, 0) * num_players;
+    npy_intp trunc_stride = PyArray_STRIDE(trunc, 0) * num_players;
+    npy_intp state_stride = PyArray_STRIDE(gst, 0) * num_players;
+
+    for (int i = 0; i < num_envs; i++) {
+        Env* env = &vec->envs[i];
+        env->observations = (float*)((char*)PyArray_DATA(obs) + i * obs_stride);
+        env->actions = (void*)((char*)PyArray_DATA(act) + i * act_stride);
+        env->rewards = (float*)((char*)PyArray_DATA(rew) + i * rew_stride);
+        env->terminals = (unsigned char*)((char*)PyArray_DATA(term) + i * term_stride);
+        env->truncations = (unsigned char*)((char*)PyArray_DATA(trunc) + i * trunc_stride);
+        env->global_states = (float*)((char*)PyArray_DATA(gst) + i * state_stride);
+        init_env_common(env, seed + i*7919, players_per_team, game_length, action_mode, do_team_switch, vision_range, reset_setup);
+    }
+
+    Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
+    return PyLong_FromVoidPtr((void*)vec);
+}
+
+static PyObject* py_vec_reset(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int seed;
+    if (!PyArg_ParseTuple(args, "Oi", &handle_obj, &seed)) {
+        return NULL;
+    }
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++) {
+        c_reset(&vec->envs[i], seed + i*7919);
     }
     Py_RETURN_NONE;
 }
 
+static PyObject* py_vec_step(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    if (!PyArg_ParseTuple(args, "O", &handle_obj)) {
+        return NULL;
+    }
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++) {
+        c_step(&vec->envs[i]);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_vec_log(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    Log aggregate;
+    memset(&aggregate, 0, sizeof(Log));
+    for (int i = 0; i < vec->num_envs; i++) {
+        Log* log = &vec->envs[i].log;
+        aggregate.score += log->score;
+        aggregate.episode_return += log->episode_return;
+        aggregate.episode_length += log->episode_length;
+        aggregate.wins_blue += log->wins_blue;
+        aggregate.wins_red += log->wins_red;
+        aggregate.draws += log->draws;
+        aggregate.n += log->n;
+        memset(log, 0, sizeof(Log));
+    }
+    return build_log_dict(&aggregate);
+}
+
+static PyObject* py_vec_get_last_scores(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int env_idx;
+    int clear = 1;
+    if (!PyArg_ParseTuple(args, "Oi|p", &handle_obj, &env_idx, &clear)) return NULL;
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_ValueError, "invalid env index");
+        return NULL;
+    }
+    Env* env = &vec->envs[env_idx];
+    if (!env->last_done) Py_RETURN_NONE;
+    PyObject* scores = Py_BuildValue("(ii)", env->last_goals_blue, env->last_goals_red);
+    if (clear) env->last_done = 0;
+    return scores;
+}
+
+static PyObject* py_vec_get_state(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int env_idx;
+    if (!PyArg_ParseTuple(args, "Oi", &handle_obj, &env_idx)) return NULL;
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_ValueError, "invalid env index");
+        return NULL;
+    }
+    PyObject* env_handle = PyLong_FromVoidPtr((void*)&vec->envs[env_idx]);
+    if (!env_handle) return NULL;
+    PyObject* packed = PyTuple_Pack(1, env_handle);
+    Py_DECREF(env_handle);
+    if (!packed) return NULL;
+    PyObject* result = py_env_get_state(self, packed);
+    Py_DECREF(packed);
+    return result;
+}
+
+static PyObject* py_vec_close(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    free(vec->envs);
+    free(vec);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef Methods[] = {
+    {"env_init", (PyCFunction)py_env_init, METH_VARARGS | METH_KEYWORDS, "Initialize one env"},
+    {"env_reset", py_env_reset, METH_VARARGS, "Reset one env"},
+    {"env_step", py_env_step, METH_VARARGS, "Step one env"},
+    {"env_log", py_env_log, METH_VARARGS, "Get one env log"},
+    {"env_get_last_scores", py_env_get_last_scores, METH_VARARGS, "Get last scalar env scores"},
+    {"env_get_state", py_env_get_state, METH_VARARGS, "Get one env state"},
+    {"env_close", py_env_close, METH_VARARGS, "Close one env"},
     {"vec_init", (PyCFunction)py_vec_init, METH_VARARGS | METH_KEYWORDS, "Initialize vector env"},
     {"vec_reset", py_vec_reset, METH_VARARGS, "Reset vector env"},
     {"vec_step", py_vec_step, METH_VARARGS, "Step vector env"},
-    {"vec_log", py_vec_log, METH_VARARGS, "Log metrics"},
-    {"vec_get_last_scores", py_vec_get_last_scores, METH_VARARGS, "Get final score for the last completed episode"},
-    {"vec_get_state", py_vec_get_state, METH_VARARGS, "Get one env state"},
+    {"vec_log", py_vec_log, METH_VARARGS, "Get vector log"},
+    {"vec_get_last_scores", py_vec_get_last_scores, METH_VARARGS, "Get last vector env scores"},
+    {"vec_get_state", py_vec_get_state, METH_VARARGS, "Get one env state from vector env"},
     {"vec_close", py_vec_close, METH_VARARGS, "Close vector env"},
     {NULL, NULL, 0, NULL}
 };

@@ -6,7 +6,7 @@ from functools import partial
 import psutil
 import pufferlib.vector
 
-from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.envs.marl2d import make_native_vec_env, make_puffer_env
 
 
 @dataclass(frozen=True)
@@ -30,19 +30,19 @@ def logical_cpu_count() -> int:
 
 def make_sharded_puffer_env(
     players_per_team: int,
-    shard_num_envs: int,
     action_mode: str,
     game_length: int,
+    do_team_switch: bool = False,
     render_mode: str | None = None,
     log_interval: int = 128,
     buf=None,
     seed: int = 0,
 ):
     return make_puffer_env(
-        num_envs=shard_num_envs,
         players_per_team=players_per_team,
         action_mode=action_mode,
         game_length=game_length,
+        do_team_switch=do_team_switch,
         render_mode=render_mode,
         log_interval=log_interval,
         buf=buf,
@@ -55,17 +55,19 @@ def make_soccer_vecenv(
     players_per_team: int,
     action_mode: str,
     game_length: int,
+    do_team_switch: bool = False,
     render_mode: str | None,
     seed: int,
     vec: VecEnvConfig,
     log_interval: int = 128,
 ):
     if vec.backend == "native":
-        return make_puffer_env(
-            num_envs=vec.shard_num_envs,
+        return make_native_vec_env(
+            num_envs=total_sim_envs(vec),
             players_per_team=players_per_team,
             action_mode=action_mode,
             game_length=game_length,
+            do_team_switch=do_team_switch,
             render_mode=render_mode,
             log_interval=log_interval,
             seed=seed,
@@ -74,9 +76,9 @@ def make_soccer_vecenv(
     env_creator = partial(
         make_sharded_puffer_env,
         players_per_team=players_per_team,
-        shard_num_envs=vec.shard_num_envs,
         action_mode=action_mode,
         game_length=game_length,
+        do_team_switch=do_team_switch,
         render_mode=render_mode,
         log_interval=log_interval,
     )
@@ -88,7 +90,7 @@ def make_soccer_vecenv(
     return pufferlib.vector.make(
         env_creator,
         backend=backend_cls,
-        num_envs=vec.num_shards,
+        num_envs=total_sim_envs(vec),
         num_workers=vec.num_workers,
         batch_size=vec.batch_size,
         zero_copy=vec.zero_copy,
@@ -101,4 +103,3 @@ def total_sim_envs(vec: VecEnvConfig) -> int:
     if vec.backend == "native":
         return vec.shard_num_envs
     return vec.shard_num_envs * vec.num_shards
-

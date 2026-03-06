@@ -2,7 +2,9 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
-from puffer_soccer.envs.marl2d import make_puffer_env
+import numpy as np
+
+from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "train_pufferl.py"
 SPEC = importlib.util.spec_from_file_location("train_pufferl", MODULE_PATH)
@@ -45,13 +47,23 @@ def test_make_side_assignment():
 
 
 def test_last_episode_scores_available_after_terminal_step():
-    env = make_puffer_env(num_envs=2, players_per_team=1, action_mode="discrete", game_length=1)
+    env = make_soccer_vecenv(
+        players_per_team=1,
+        action_mode="discrete",
+        game_length=1,
+        render_mode=None,
+        seed=0,
+        vec=VecEnvConfig(backend="native", shard_num_envs=2, num_shards=1),
+    )
     env.reset(seed=0)
 
-    actions = [0] * env.num_agents
+    actions = np.zeros((env.num_agents,), dtype=np.int32)
     _, _, terminals, _, _ = env.step(actions)
 
-    assert terminals.reshape(env.num_envs, env.num_players).all(axis=1).tolist() == [True, True]
+    assert terminals.reshape(env.num_envs, env.num_players).all(axis=1).tolist() == [
+        True,
+        True,
+    ]
     assert env.get_last_episode_scores(0) is not None
     assert env.get_last_episode_scores(1) is not None
     assert env.get_last_episode_scores(0) is None
@@ -59,7 +71,14 @@ def test_last_episode_scores_available_after_terminal_step():
 
 
 def test_evaluate_against_past_iterate_returns_metrics():
-    env = make_puffer_env(num_envs=2, players_per_team=1, action_mode="discrete", game_length=4)
+    env = make_soccer_vecenv(
+        players_per_team=1,
+        action_mode="discrete",
+        game_length=4,
+        render_mode=None,
+        seed=0,
+        vec=VecEnvConfig(backend="native", shard_num_envs=2, num_shards=1),
+    )
     policy = train_pufferl.Policy(env)
     args = SimpleNamespace(
         players_per_team=1,

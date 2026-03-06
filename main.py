@@ -6,7 +6,9 @@ from puffer_soccer.envs.marl2d import make_puffer_env
 
 
 def main():
-    env = make_puffer_env(num_envs=1, players_per_team=2, action_mode="discrete", render_mode="human")
+    env = make_puffer_env(
+        players_per_team=2, action_mode="discrete", render_mode="human"
+    )
     env.reset(seed=0)
     done = False
     while not done:

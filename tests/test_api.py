@@ -1,25 +1,26 @@
 import numpy as np
 
 from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv
 
 
-def test_puffer_env_shapes_discrete():
-    env = make_puffer_env(num_envs=2, players_per_team=3, action_mode="discrete")
+def test_scalar_puffer_env_shapes_discrete():
+    env = make_puffer_env(players_per_team=3, action_mode="discrete")
     obs, _ = env.reset(seed=0)
-    assert obs.shape == (12, 58)
-    assert env.global_states.shape == (12, 107)
+    assert obs.shape == (6, 58)
+    assert env.global_states.shape == (6, 107)
 
-    actions = np.zeros((12,), dtype=np.int32)
+    actions = np.zeros((6,), dtype=np.int32)
     obs, rewards, terminals, truncations, _ = env.step(actions)
-    assert obs.shape == (12, 58)
-    assert rewards.shape == (12,)
-    assert terminals.shape == (12,)
-    assert truncations.shape == (12,)
+    assert obs.shape == (6, 58)
+    assert rewards.shape == (6,)
+    assert terminals.shape == (6,)
+    assert truncations.shape == (6,)
     env.close()
 
 
-def test_puffer_env_roundtrip():
-    env = make_puffer_env(num_envs=1, players_per_team=2, action_mode="discrete")
+def test_scalar_puffer_env_roundtrip():
+    env = make_puffer_env(players_per_team=2, action_mode="discrete")
     obs, infos = env.reset(seed=123)
     assert obs.shape == (4, 44)
     assert infos == []
@@ -34,8 +35,10 @@ def test_puffer_env_roundtrip():
     env.close()
 
 
-def test_puffer_env_rgb_array_render():
-    env = make_puffer_env(num_envs=1, players_per_team=2, action_mode="discrete", render_mode="rgb_array")
+def test_scalar_puffer_env_rgb_array_render():
+    env = make_puffer_env(
+        players_per_team=2, action_mode="discrete", render_mode="rgb_array"
+    )
     env.reset(seed=0)
     frame = env.render()
     assert frame is not None
@@ -44,9 +47,26 @@ def test_puffer_env_rgb_array_render():
     env.close()
 
 
-def test_puffer_env_rgb_array_render_second_env():
-    env = make_puffer_env(num_envs=2, players_per_team=2, action_mode="discrete", render_mode="rgb_array")
-    env.reset(seed=0)
+def test_native_vec_env_shapes_and_second_render():
+    env = make_soccer_vecenv(
+        players_per_team=2,
+        action_mode="discrete",
+        game_length=400,
+        render_mode="rgb_array",
+        seed=0,
+        vec=VecEnvConfig(backend="native", shard_num_envs=2, num_shards=1),
+    )
+    obs, _ = env.reset(seed=0)
+    assert obs.shape == (8, 44)
+    assert env.global_states.shape == (8, 73)
+
+    actions = np.zeros((8,), dtype=np.int32)
+    obs, rewards, terminals, truncations, _ = env.step(actions)
+    assert obs.shape == (8, 44)
+    assert rewards.shape == (8,)
+    assert terminals.shape == (8,)
+    assert truncations.shape == (8,)
+
     frame = env.render(env_idx=1)
     assert frame is not None
     assert frame.ndim == 3

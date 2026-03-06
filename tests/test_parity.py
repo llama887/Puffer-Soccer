@@ -14,7 +14,9 @@ def _reference_available():
         return False
 
 
-pytestmark = pytest.mark.skipif(not _reference_available(), reason="third-party reference dependencies unavailable")
+pytestmark = pytest.mark.skipif(
+    not _reference_available(), reason="third-party reference dependencies unavailable"
+)
 
 
 @pytest.mark.parametrize("players_per_team", [1, 2, 5, 11])
@@ -22,8 +24,10 @@ pytestmark = pytest.mark.skipif(not _reference_available(), reason="third-party 
 def test_reset_parity(players_per_team, action_mode):
     from puffer_soccer.envs.marl2d.reference_adapter import ReferenceEnvAdapter
 
-    ref = ReferenceEnvAdapter(players_per_team=players_per_team, action_mode=action_mode)
-    new = make_puffer_env(num_envs=1, players_per_team=players_per_team, action_mode=action_mode)
+    ref = ReferenceEnvAdapter(
+        players_per_team=players_per_team, action_mode=action_mode
+    )
+    new = make_puffer_env(players_per_team=players_per_team, action_mode=action_mode)
 
     ref_step = ref.reset()
     new_obs, _ = new.reset(seed=0)
@@ -34,7 +38,9 @@ def test_reset_parity(players_per_team, action_mode):
     # Strict parity for 11v11 where one-hot ids are deterministic upstream.
     if players_per_team == 11:
         np.testing.assert_allclose(new_obs, ref_step.obs, rtol=1e-4, atol=1e-4)
-        np.testing.assert_allclose(new.global_states, ref_step.state, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(
+            new.global_states, ref_step.state, rtol=1e-4, atol=1e-4
+        )
 
     new.close()
 
@@ -44,8 +50,10 @@ def test_reset_parity(players_per_team, action_mode):
 def test_step_parity(players_per_team, action_mode):
     from puffer_soccer.envs.marl2d.reference_adapter import ReferenceEnvAdapter
 
-    ref = ReferenceEnvAdapter(players_per_team=players_per_team, action_mode=action_mode)
-    new = make_puffer_env(num_envs=1, players_per_team=players_per_team, action_mode=action_mode)
+    ref = ReferenceEnvAdapter(
+        players_per_team=players_per_team, action_mode=action_mode
+    )
+    new = make_puffer_env(players_per_team=players_per_team, action_mode=action_mode)
 
     ref.reset()
     new.reset(seed=0)
@@ -53,7 +61,9 @@ def test_step_parity(players_per_team, action_mode):
     rng = np.random.default_rng(7)
     for _ in range(10):
         if action_mode == "continuous":
-            actions = rng.uniform(-1.0, 1.0, size=(players_per_team * 2, 2)).astype(np.float32)
+            actions = rng.uniform(-1.0, 1.0, size=(players_per_team * 2, 2)).astype(
+                np.float32
+            )
         else:
             actions = rng.integers(0, 9, size=(players_per_team * 2,), dtype=np.int32)
 
@@ -67,7 +77,9 @@ def test_step_parity(players_per_team, action_mode):
         if players_per_team == 11:
             np.testing.assert_allclose(new_obs, ref_step.obs, rtol=1e-4, atol=1e-4)
             np.testing.assert_allclose(new_rew, ref_step.rewards, rtol=1e-6, atol=1e-6)
-            np.testing.assert_allclose(new.global_states, ref_step.state, rtol=1e-4, atol=1e-4)
+            np.testing.assert_allclose(
+                new.global_states, ref_step.state, rtol=1e-4, atol=1e-4
+            )
             assert bool(new_done.all()) == ref_step.done
 
     new.close()
