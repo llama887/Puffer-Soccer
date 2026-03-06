@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import copy
+from collections import defaultdict
 from collections.abc import Mapping
+import math
 import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 
 import imageio.v2 as imageio
 import numpy as np
 import torch
 
 import pufferlib
+import pufferlib.pufferl as pufferl
 import pufferlib.pytorch
 
 from puffer_soccer.envs.marl2d import make_puffer_env
@@ -52,6 +57,247 @@ class Policy(torch.nn.Module):
 
     def forward_eval(self, observations, state=None):
         return self.forward(observations, state=state)
+
+
+class RegularizedPuffeRL(pufferl.PuffeRL):
+    def __init__(
+        self,
+        config,
+        vecenv,
+        policy,
+        *,
+        logger=None,
+        regularization_enabled: bool = True,
+        past_kl_coef: float = 0.1,
+        uniform_kl_base_coef: float = 0.05,
+        uniform_kl_power: float = 0.3,
+    ):
+        super().__init__(config, vecenv, policy, logger=logger)
+        self.regularization_enabled = regularization_enabled
+        self.past_kl_coef = float(past_kl_coef) if regularization_enabled else 0.0
+        self.uniform_kl_base_coef = (
+            float(uniform_kl_base_coef) if regularization_enabled else 0.0
+        )
+        self.uniform_kl_power = float(uniform_kl_power)
+        if not hasattr(vecenv.single_action_space, "n"):
+            raise ValueError(
+                "RegularizedPuffeRL currently supports discrete action spaces only"
+            )
+
+        self.uniform_log_prob = -math.log(float(vecenv.single_action_space.n))
+        self.past_policy = copy.deepcopy(self.uncompiled_policy).to(config["device"])
+        self.past_policy.eval()
+        for param in self.past_policy.parameters():
+            param.requires_grad_(False)
+
+    def _sync_past_policy(self) -> None:
+        self.past_policy.load_state_dict(
+            self.uncompiled_policy.state_dict(), strict=True
+        )
+
+    @pufferl.record
+    def train(self):
+        profile = self.profile
+        epoch = self.epoch
+        profile("train", epoch)
+        losses = defaultdict(float)
+        config = self.config
+        device = config["device"]
+        self._sync_past_policy()
+
+        b0 = config["prio_beta0"]
+        a = config["prio_alpha"]
+        clip_coef = config["clip_coef"]
+        vf_clip = config["vf_clip_coef"]
+        anneal_beta = b0 + (1 - b0) * a * self.epoch / self.total_epochs
+        self.ratio[:] = 1
+
+        for mb in range(self.total_minibatches):
+            profile("train_misc", epoch, nest=True)
+            self.amp_context.__enter__()
+
+            shape = self.values.shape
+            advantages = torch.zeros(shape, device=device)
+            advantages = pufferl.compute_puff_advantage(
+                self.values,
+                self.rewards,
+                self.terminals,
+                self.ratio,
+                advantages,
+                config["gamma"],
+                config["gae_lambda"],
+                config["vtrace_rho_clip"],
+                config["vtrace_c_clip"],
+            )
+
+            profile("train_copy", epoch)
+            adv = advantages.abs().sum(axis=1)
+            prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
+            prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
+            idx = torch.multinomial(prio_probs, self.minibatch_segments)
+            mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
+            mb_obs = self.observations[idx]
+            mb_actions = self.actions[idx]
+            mb_logprobs = self.logprobs[idx]
+            mb_rewards = self.rewards[idx]
+            mb_terminals = self.terminals[idx]
+            mb_values = self.values[idx]
+            mb_returns = advantages[idx] + mb_values
+            mb_advantages = advantages[idx]
+
+            profile("train_forward", epoch)
+            if not config["use_rnn"]:
+                mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
+
+            state = dict(
+                action=mb_actions,
+                lstm_h=None,
+                lstm_c=None,
+            )
+
+            logits, newvalue = self.policy(mb_obs, state)
+            _, newlogprob, entropy = pufferlib.pytorch.sample_logits(
+                logits, action=mb_actions
+            )
+
+            profile("train_misc", epoch)
+            newlogprob = newlogprob.reshape(mb_logprobs.shape)
+            logratio = newlogprob - mb_logprobs
+            ratio = logratio.exp()
+            self.ratio[idx] = ratio.detach()
+
+            with torch.no_grad():
+                old_approx_kl = (-logratio).mean()
+                approx_kl = ((ratio - 1) - logratio).mean()
+                clipfrac = ((ratio - 1.0).abs() > config["clip_coef"]).float().mean()
+
+            adv = advantages[idx]
+            adv = pufferl.compute_puff_advantage(
+                mb_values,
+                mb_rewards,
+                mb_terminals,
+                ratio,
+                adv,
+                config["gamma"],
+                config["gae_lambda"],
+                config["vtrace_rho_clip"],
+                config["vtrace_c_clip"],
+            )
+            adv = mb_advantages
+            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+
+            pg_loss1 = -adv * ratio
+            pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            newvalue = newvalue.view(mb_returns.shape)
+            v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
+            v_loss_unclipped = (newvalue - mb_returns) ** 2
+            v_loss_clipped = (v_clipped - mb_returns) ** 2
+            v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+            entropy_loss = entropy.mean()
+
+            if not isinstance(logits, torch.Tensor):
+                raise ValueError(
+                    "RegularizedPuffeRL expects tensor logits for discrete actions"
+                )
+
+            if self.regularization_enabled:
+                with torch.no_grad():
+                    old_logits, _ = self.past_policy(mb_obs, state)
+                old_log_probs = torch.log_softmax(old_logits, dim=-1)
+                new_log_probs = torch.log_softmax(logits, dim=-1)
+                new_probs = torch.softmax(logits, dim=-1)
+                past_kl = torch.sum(
+                    new_probs * (new_log_probs - old_log_probs), dim=-1
+                ).mean()
+                iter_number = max(1, self.epoch + 1)
+                uniform_kl_coef = self.uniform_kl_base_coef / (
+                    iter_number**self.uniform_kl_power
+                )
+                uniform_kl = torch.sum(
+                    new_probs * (new_log_probs - self.uniform_log_prob),
+                    dim=-1,
+                ).mean()
+            else:
+                uniform_kl_coef = 0.0
+                past_kl = torch.zeros((), device=device)
+                uniform_kl = torch.zeros((), device=device)
+
+            loss = (
+                pg_loss
+                + config["vf_coef"] * v_loss
+                - config["ent_coef"] * entropy_loss
+                + self.past_kl_coef * past_kl
+                + uniform_kl_coef * uniform_kl
+            )
+            self.amp_context.__enter__()  # TODO: AMP needs some debugging
+
+            self.values[idx] = newvalue.detach().float()
+
+            profile("train_misc", epoch)
+            losses["policy_loss"] += pg_loss.item() / self.total_minibatches
+            losses["value_loss"] += v_loss.item() / self.total_minibatches
+            losses["entropy"] += entropy_loss.item() / self.total_minibatches
+            losses["old_approx_kl"] += old_approx_kl.item() / self.total_minibatches
+            losses["approx_kl"] += approx_kl.item() / self.total_minibatches
+            losses["clipfrac"] += clipfrac.item() / self.total_minibatches
+            losses["importance"] += ratio.mean().item() / self.total_minibatches
+            losses["past_kl"] += past_kl.item() / self.total_minibatches
+            losses["past_kl_coef"] += self.past_kl_coef / self.total_minibatches
+            losses["past_kl_term"] += (
+                self.past_kl_coef * past_kl
+            ).item() / self.total_minibatches
+            losses["uniform_kl"] += uniform_kl.item() / self.total_minibatches
+            losses["uniform_kl_coef"] += float(uniform_kl_coef) / self.total_minibatches
+            losses["uniform_kl_term"] += (
+                uniform_kl_coef * uniform_kl
+            ).item() / self.total_minibatches
+            losses["regularization_term"] += (
+                self.past_kl_coef * past_kl + uniform_kl_coef * uniform_kl
+            ).item() / self.total_minibatches
+
+            profile("learn", epoch)
+            loss.backward()
+            if (mb + 1) % self.accumulate_minibatches == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), config["max_grad_norm"]
+                )
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+        profile("train_misc", epoch)
+        if config["anneal_lr"]:
+            self.scheduler.step()
+
+        y_pred = self.values.flatten()
+        y_true = advantages.flatten() + self.values.flatten()
+        var_y = y_true.var()
+        explained_var = torch.nan if var_y == 0 else 1 - (y_true - y_pred).var() / var_y
+        losses["explained_variance"] = explained_var.item()
+
+        profile.end()
+        logs = None
+        self.epoch += 1
+        done_training = self.global_step >= config["total_timesteps"]
+        if (
+            done_training
+            or self.global_step == 0
+            or time.time() > self.last_log_time + 0.25
+        ):
+            self.losses = losses
+            logs = self.mean_and_log()
+            self.print_dashboard()
+            self.stats = defaultdict(list)
+            self.last_log_time = time.time()
+            self.last_log_step = self.global_step
+            profile.clear()
+
+        if self.epoch % config["checkpoint_interval"] == 0 or done_training:
+            self.save_checkpoint()
+            self.msg = f"Checkpoint saved at update {self.epoch}"
+
+        return logs
 
 
 class IterateComparator:
@@ -433,16 +679,6 @@ def _resolve_writable_output_path(path: Path) -> Path:
 
 
 def main():
-    try:
-        import pufferlib.pufferl as pufferl
-    except ImportError as err:
-        raise SystemExit(
-            "Failed to import pufferlib training backend. "
-            "Run this script with `uv run` from the repo, or reinstall `pufferlib` in the active "
-            "interpreter with `uv pip install --reinstall --no-build-isolation pufferlib==3.0.0`. "
-            f"Original error: {err}"
-        ) from err
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--players-per-team", type=int, default=5)
     parser.add_argument("--num-envs", type=int, default=8)
@@ -461,6 +697,10 @@ def main():
     parser.add_argument("--bptt-horizon", type=int, default=256)
     parser.add_argument("--minibatch-size", type=int, default=20_480)
     parser.add_argument("--update-epochs", type=int, default=2)
+    parser.add_argument("--no-regularization", action="store_true")
+    parser.add_argument("--past-kl-coef", type=float, default=0.1)
+    parser.add_argument("--uniform-kl-base-coef", type=float, default=0.05)
+    parser.add_argument("--uniform-kl-power", type=float, default=0.3)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wandb-project", type=str, default="robot-soccer")
@@ -513,6 +753,7 @@ def main():
     cfg["train"]["total_timesteps"] = args.ppo_iterations * cfg["train"]["batch_size"]
     cfg["train"]["learning_rate"] = 3e-4
     cfg["train"]["update_epochs"] = args.update_epochs
+    cfg["train"]["ent_coef"] = 0.0
     cfg["train"]["device"] = device
     cfg["train"]["seed"] = args.seed
     cfg["train"]["env"] = "puffer_soccer_marl2d"
@@ -528,7 +769,16 @@ def main():
         logger = pufferl.WandbLogger(logger_args)
         _configure_iterate_metrics(logger)
 
-    trainer = pufferl.PuffeRL(cfg["train"], vecenv, policy, logger=logger)
+    trainer = RegularizedPuffeRL(
+        cfg["train"],
+        vecenv,
+        policy,
+        logger=logger,
+        regularization_enabled=not args.no_regularization,
+        past_kl_coef=args.past_kl_coef,
+        uniform_kl_base_coef=args.uniform_kl_base_coef,
+        uniform_kl_power=args.uniform_kl_power,
+    )
     eval_interval_epochs = compute_eval_interval_epochs(
         trainer.total_epochs, args.past_iterate_eval_fractions
     )
