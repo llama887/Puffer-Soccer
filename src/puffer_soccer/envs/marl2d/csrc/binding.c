@@ -49,6 +49,7 @@ typedef struct {
     int last_goals_blue;
     int last_goals_red;
     unsigned char last_done;
+    unsigned char has_terminal_render_state;
     float vision_range;
     float x_out_start;
     float x_out_end;
@@ -66,6 +67,15 @@ typedef struct {
     int obs_size;
     int state_size;
     uint32_t rng;
+    Agent terminal_render_agents[MAX_PLAYERS];
+    int terminal_render_num_steps;
+    int terminal_render_blue_left;
+    float terminal_render_ball_x;
+    float terminal_render_ball_y;
+    float terminal_render_ball_vx;
+    float terminal_render_ball_vy;
+    int terminal_render_goals_blue;
+    int terminal_render_goals_red;
 } Env;
 
 typedef struct {
@@ -173,6 +183,27 @@ static void full_reset(Env* env, int hard_reset_score) {
         }
     }
     reset_field(env);
+}
+
+static void capture_terminal_render_state(Env* env) {
+    memcpy(
+        env->terminal_render_agents,
+        env->agents,
+        sizeof(Agent) * env->num_players
+    );
+    env->terminal_render_num_steps = env->num_steps;
+    env->terminal_render_blue_left = env->blue_left;
+    env->terminal_render_ball_x = env->ball_x;
+    env->terminal_render_ball_y = env->ball_y;
+    env->terminal_render_ball_vx = env->ball_vx;
+    env->terminal_render_ball_vy = env->ball_vy;
+    env->terminal_render_goals_blue = env->goals_blue;
+    env->terminal_render_goals_red = env->goals_red;
+    env->has_terminal_render_state = 1;
+}
+
+static void clear_terminal_render_state(Env* env) {
+    env->has_terminal_render_state = 0;
 }
 
 static void calc_line_ball_stats(float angle, float circ_rad, float circ_x, float circ_y,
@@ -391,6 +422,7 @@ static void init_env_common(
     env->last_goals_blue = 0;
     env->last_goals_red = 0;
     env->last_done = 0;
+    env->has_terminal_render_state = 0;
     env->x_out_start = -50.0f;
     env->x_out_end = 50.0f;
     env->y_out_start = -35.0f;
@@ -416,12 +448,14 @@ static void c_reset(Env* env, int seed) {
     env->last_goals_blue = 0;
     env->last_goals_red = 0;
     env->last_done = 0;
+    clear_terminal_render_state(env);
     clear_outputs(env);
     compute_observations(env, -1);
 }
 
 static void c_step(Env* env) {
     int np = env->num_players;
+    clear_terminal_render_state(env);
     env->num_steps += 1;
     clear_outputs(env);
 
@@ -454,8 +488,6 @@ static void c_step(Env* env) {
         float sin_comp = move * env->move_speed * sinf(a->rot);
         float cos_comp = move * env->move_speed * cosf(a->rot);
 
-        a->x = a->x + cos_comp;
-        a->y = a->y + sin_comp;
         a->x = clampf(a->x + cos_comp, env->x_out_start, env->x_out_end);
         a->y = clampf(a->y + sin_comp, env->y_out_start, env->y_out_end);
     }
@@ -534,8 +566,71 @@ static void c_step(Env* env) {
         env->log.episode_return += ret;
         env->log.episode_length += env->num_steps;
         env->log.n += 1.0f;
+        capture_terminal_render_state(env);
         full_reset(env, 1);
     }
+}
+
+static PyObject* build_state_dict(const Env* env, const Agent* agents, float ball_x, float ball_y,
+    float ball_vx, float ball_vy, int goals_blue, int goals_red, int num_steps, int blue_left) {
+    npy_intp pos_dims[2] = {env->num_players, 2};
+    npy_intp rot_dims[1] = {env->num_players};
+
+    PyObject* pos = PyArray_SimpleNew(2, pos_dims, NPY_FLOAT32);
+    PyObject* rot = PyArray_SimpleNew(1, rot_dims, NPY_FLOAT32);
+    if (!pos || !rot) {
+        Py_XDECREF(pos);
+        Py_XDECREF(rot);
+        return NULL;
+    }
+
+    float* pdat = (float*)PyArray_DATA((PyArrayObject*)pos);
+    float* rdat = (float*)PyArray_DATA((PyArrayObject*)rot);
+    for (int i = 0; i < env->num_players; i++) {
+        pdat[i*2] = agents[i].x;
+        pdat[i*2 + 1] = agents[i].y;
+        rdat[i] = agents[i].rot;
+    }
+
+    PyObject* ball = Py_BuildValue("(ffff)", ball_x, ball_y, ball_vx, ball_vy);
+    PyObject* goals = Py_BuildValue("(ii)", goals_blue, goals_red);
+    PyObject* d = PyDict_New();
+    PyObject* num_steps_obj = PyLong_FromLong(num_steps);
+    PyObject* blue_left_obj = PyBool_FromLong(blue_left);
+    if (!ball || !goals || !d || !num_steps_obj || !blue_left_obj) {
+        Py_XDECREF(pos);
+        Py_XDECREF(rot);
+        Py_XDECREF(ball);
+        Py_XDECREF(goals);
+        Py_XDECREF(d);
+        Py_XDECREF(num_steps_obj);
+        Py_XDECREF(blue_left_obj);
+        return NULL;
+    }
+
+    if (PyDict_SetItemString(d, "positions", pos) < 0 ||
+        PyDict_SetItemString(d, "rotations", rot) < 0 ||
+        PyDict_SetItemString(d, "ball", ball) < 0 ||
+        PyDict_SetItemString(d, "goals", goals) < 0 ||
+        PyDict_SetItemString(d, "num_steps", num_steps_obj) < 0 ||
+        PyDict_SetItemString(d, "blue_left", blue_left_obj) < 0) {
+        Py_DECREF(pos);
+        Py_DECREF(rot);
+        Py_DECREF(ball);
+        Py_DECREF(goals);
+        Py_DECREF(d);
+        Py_DECREF(num_steps_obj);
+        Py_DECREF(blue_left_obj);
+        return NULL;
+    }
+
+    Py_DECREF(pos);
+    Py_DECREF(rot);
+    Py_DECREF(ball);
+    Py_DECREF(goals);
+    Py_DECREF(num_steps_obj);
+    Py_DECREF(blue_left_obj);
+    return d;
 }
 
 static int assign_log_dict(PyObject* d, const Log* log) {
@@ -774,34 +869,33 @@ static PyObject* py_env_get_state(PyObject* self, PyObject* args) {
     Env* env = unpack_env_handle(handle_obj);
     if (!env) return NULL;
 
-    npy_intp pos_dims[2] = {env->num_players, 2};
-    npy_intp rot_dims[1] = {env->num_players};
-
-    PyObject* pos = PyArray_SimpleNew(2, pos_dims, NPY_FLOAT32);
-    PyObject* rot = PyArray_SimpleNew(1, rot_dims, NPY_FLOAT32);
-    float* pdat = (float*)PyArray_DATA((PyArrayObject*)pos);
-    float* rdat = (float*)PyArray_DATA((PyArrayObject*)rot);
-
-    for (int i = 0; i < env->num_players; i++) {
-        pdat[i*2] = env->agents[i].x;
-        pdat[i*2 + 1] = env->agents[i].y;
-        rdat[i] = env->agents[i].rot;
+    if (env->has_terminal_render_state) {
+        return build_state_dict(
+            env,
+            env->terminal_render_agents,
+            env->terminal_render_ball_x,
+            env->terminal_render_ball_y,
+            env->terminal_render_ball_vx,
+            env->terminal_render_ball_vy,
+            env->terminal_render_goals_blue,
+            env->terminal_render_goals_red,
+            env->terminal_render_num_steps,
+            env->terminal_render_blue_left
+        );
     }
 
-    PyObject* ball = Py_BuildValue("(ffff)", env->ball_x, env->ball_y, env->ball_vx, env->ball_vy);
-    PyObject* goals = Py_BuildValue("(ii)", env->goals_blue, env->goals_red);
-    PyObject* d = PyDict_New();
-    PyDict_SetItemString(d, "positions", pos);
-    PyDict_SetItemString(d, "rotations", rot);
-    PyDict_SetItemString(d, "ball", ball);
-    PyDict_SetItemString(d, "goals", goals);
-    PyDict_SetItemString(d, "num_steps", PyLong_FromLong(env->num_steps));
-    PyDict_SetItemString(d, "blue_left", PyBool_FromLong(env->blue_left));
-    Py_DECREF(pos);
-    Py_DECREF(rot);
-    Py_DECREF(ball);
-    Py_DECREF(goals);
-    return d;
+    return build_state_dict(
+        env,
+        env->agents,
+        env->ball_x,
+        env->ball_y,
+        env->ball_vx,
+        env->ball_vy,
+        env->goals_blue,
+        env->goals_red,
+        env->num_steps,
+        env->blue_left
+    );
 }
 
 static PyObject* py_env_close(PyObject* self, PyObject* args) {

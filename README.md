@@ -33,6 +33,15 @@ W&B logging is enabled by default with the `robot-soccer` project and logs the g
 
 The training path runs directly on `MARL2DPufferEnv` without a PettingZoo wrapper or Python serial vectorizer.
 
+To autotune the vector layout on the current machine before training, use the auto backend:
+
+```bash
+uv run python scripts/train_pufferl.py \
+  --players-per-team 5 \
+  --ppo-iterations 1000 \
+  --vec-backend auto
+```
+
 For higher CPU throughput, use Puffer's multiprocessing vecenv with small native shards per worker:
 
 ```bash
@@ -40,8 +49,8 @@ uv run python scripts/train_pufferl.py \
   --players-per-team 5 \
   --ppo-iterations 1000 \
   --vec-backend multiprocessing \
+  --num-envs 3072 \
   --vec-num-shards 16 \
-  --shard-num-envs 192 \
   --vec-batch-size 1
 ```
 
@@ -51,10 +60,13 @@ uv run python scripts/train_pufferl.py \
 uv run python scripts/benchmark_sps.py --num-envs 64 --seconds 10 --action-mode discrete
 ```
 
-Autotune the native env's internal parallel env count on the current machine:
+Autotune across native and multiprocessing layouts until the CPU saturates, then pick the highest-SPS configuration:
 
 ```bash
-uv run python scripts/benchmark_sps.py --backend native --players-per-team 5 --autotune --seconds 3 --action-mode discrete
+uv run python scripts/benchmark_sps.py --backend auto --players-per-team 5 --autotune --seconds 3 --action-mode discrete
+
+# `--seconds` is optional; autotune uses a built-in short sample and stops once
+# it reaches near-100% CPU usage and SPS plateaus.
 ```
 
 Benchmark the Puffer multiprocessing layout directly:

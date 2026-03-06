@@ -47,6 +47,35 @@ def test_scalar_puffer_env_rgb_array_render():
     env.close()
 
 
+def test_scalar_puffer_env_render_uses_terminal_snapshot_until_next_step():
+    env = make_puffer_env(
+        players_per_team=2,
+        action_mode="discrete",
+        game_length=3,
+        render_mode="rgb_array",
+    )
+    env.reset(seed=0)
+
+    actions = np.zeros((4,), dtype=np.int32)
+    terminals = np.zeros((4,), dtype=bool)
+    for _ in range(3):
+        _, _, terminals, _, _ = env.step(actions)
+
+    assert terminals.all()
+
+    terminal_state = env.get_state()
+    assert terminal_state["num_steps"] == 3
+
+    terminal_frame = env.render()
+    assert terminal_frame is not None
+    assert terminal_frame.ndim == 3
+
+    env.step(actions)
+    live_state = env.get_state()
+    assert live_state["num_steps"] == 1
+    env.close()
+
+
 def test_native_vec_env_shapes_and_second_render():
     env = make_soccer_vecenv(
         players_per_team=2,

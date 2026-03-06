@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
-import subprocess
-import threading
 import time
 from dataclasses import dataclass
 
@@ -17,6 +13,7 @@ import pufferlib.vector
 from pufferlib.emulation import PettingZooPufferEnv
 
 from puffer_soccer.envs.marl2d import make_parallel_env
+from puffer_soccer.utilization import UtilizationMonitor, query_nvidia_smi
 
 
 def parse_bool_arg(value: str) -> bool:
@@ -38,112 +35,6 @@ def format_num(value: float | None, digits: int = 1) -> str:
     if value is None:
         return "n/a"
     return f"{value:.{digits}f}"
-
-
-def query_nvidia_smi() -> dict[str, float] | None:
-    if shutil.which("nvidia-smi") is None:
-        return None
-
-    result = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=utilization.gpu,memory.used,memory.total",
-            "--format=csv,noheader,nounits",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-
-    try:
-        util, mem_used, mem_total = result.stdout.strip().splitlines()[0].split(",")
-        return {
-            "utilization": float(util.strip()),
-            "memory_used_mb": float(mem_used.strip()),
-            "memory_total_mb": float(mem_total.strip()),
-        }
-    except (ValueError, IndexError):
-        return None
-
-
-class UtilizationMonitor:
-    def __init__(self, sample_interval_s: float = 0.25):
-        self.sample_interval_s = sample_interval_s
-        self._cpu_samples: list[float] = []
-        self._gpu_samples: list[float] = []
-        self._gpu_mem_samples: list[float] = []
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        num_cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or 1
-        self._cpu_capacity = float(num_cores * 100)
-        self._root_process = psutil.Process(os.getpid())
-        self._process_cache: dict[int, psutil.Process] = {self._root_process.pid: self._root_process}
-
-    def start(self) -> None:
-        self._prime_process_tree()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> dict[str, float | None]:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join()
-
-        return {
-            "cpu_avg": float(np.mean(self._cpu_samples)) if self._cpu_samples else None,
-            "cpu_peak": float(np.max(self._cpu_samples)) if self._cpu_samples else None,
-            "gpu_avg": float(np.mean(self._gpu_samples)) if self._gpu_samples else None,
-            "gpu_peak": float(np.max(self._gpu_samples)) if self._gpu_samples else None,
-            "gpu_mem_peak_mb": float(np.max(self._gpu_mem_samples)) if self._gpu_mem_samples else None,
-        }
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            time.sleep(self.sample_interval_s)
-            self._cpu_samples.append(self._sample_process_tree_cpu())
-            gpu_stats = query_nvidia_smi()
-            if gpu_stats is not None:
-                self._gpu_samples.append(gpu_stats["utilization"])
-                self._gpu_mem_samples.append(gpu_stats["memory_used_mb"])
-
-    def _iter_process_tree(self) -> list[psutil.Process]:
-        try:
-            descendants = self._root_process.children(recursive=True)
-        except psutil.Error:
-            descendants = []
-        active_pids = {self._root_process.pid}
-        processes = [self._root_process]
-        for proc in descendants:
-            active_pids.add(proc.pid)
-            cached = self._process_cache.get(proc.pid)
-            if cached is None:
-                self._process_cache[proc.pid] = proc
-                cached = proc
-            processes.append(cached)
-
-        stale_pids = [pid for pid in self._process_cache if pid not in active_pids]
-        for pid in stale_pids:
-            del self._process_cache[pid]
-
-        return processes
-
-    def _prime_process_tree(self) -> None:
-        for proc in self._iter_process_tree():
-            try:
-                proc.cpu_percent(interval=None)
-            except psutil.Error:
-                continue
-
-    def _sample_process_tree_cpu(self) -> float:
-        total = 0.0
-        for proc in self._iter_process_tree():
-            try:
-                total += proc.cpu_percent(interval=None)
-            except psutil.Error:
-                continue
-        return min(100.0, 100.0 * total / self._cpu_capacity)
 
 
 class Policy(torch.nn.Module):
@@ -183,7 +74,9 @@ class Policy(torch.nn.Module):
             actions = torch.tanh(dist.sample())
         return actions, values
 
-    def ppoish_loss(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def ppoish_loss(
+        self, observations: torch.Tensor, actions: torch.Tensor
+    ) -> torch.Tensor:
         logits, values = self(observations)
         advantages = torch.randn_like(values)
         returns = advantages + values.detach()
@@ -242,7 +135,9 @@ class TrainCandidate:
     minibatch_size: int
 
 
-def build_env_creator(players_per_team: int, action_mode: str, game_length: int, seed: int):
+def build_env_creator(
+    players_per_team: int, action_mode: str, game_length: int, seed: int
+):
     def env_creator(**kwargs):
         pz = make_parallel_env(
             players_per_team=players_per_team,
@@ -256,7 +151,9 @@ def build_env_creator(players_per_team: int, action_mode: str, game_length: int,
     return env_creator
 
 
-def profile_single_env(env_creator, time_per_test: float, max_env_ram_gb: float, max_envs: int) -> Profile:
+def profile_single_env(
+    env_creator, time_per_test: float, max_env_ram_gb: float, max_envs: int
+) -> Profile:
     num_cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or 1
     load_ram = psutil.Process().memory_info().rss
     peak_ram = load_ram
@@ -266,7 +163,9 @@ def profile_single_env(env_creator, time_per_test: float, max_env_ram_gb: float,
     env.reset()
     actions = []
     for _ in range(1024):
-        action = np.array([env.single_action_space.sample() for _ in range(env.num_agents)])
+        action = np.array(
+            [env.single_action_space.sample() for _ in range(env.num_agents)]
+        )
         actions.append(action)
 
     obs_space = env.single_observation_space
@@ -292,7 +191,9 @@ def profile_single_env(env_creator, time_per_test: float, max_env_ram_gb: float,
     max_allowed_by_ram = max(1, int(max_env_ram_gb // env_ram_gb))
     return Profile(
         agents_per_env=env.num_agents,
-        obs_bytes_per_agent=int(np.prod(obs_space.shape) * np.dtype(obs_space.dtype).itemsize),
+        obs_bytes_per_agent=int(
+            np.prod(obs_space.shape) * np.dtype(obs_space.dtype).itemsize
+        ),
         env_ram_gb=env_ram_gb,
         single_env_sps=(steps * env.num_agents) / elapsed,
         reset_percent=100.0 * sum(reset_times) / elapsed,
@@ -302,7 +203,9 @@ def profile_single_env(env_creator, time_per_test: float, max_env_ram_gb: float,
     )
 
 
-def estimate_gpu_limits(profile: Profile, device: str, max_batch_vram_gb: float) -> int | None:
+def estimate_gpu_limits(
+    profile: Profile, device: str, max_batch_vram_gb: float
+) -> int | None:
     obs_gb_per_step = (profile.obs_bytes_per_agent * profile.agents_per_env) / 1e9
     if obs_gb_per_step <= 0:
         return None
@@ -321,7 +224,11 @@ def vector_config_candidates(profile: Profile, max_envs: int) -> list[dict]:
     if capped_envs < 1:
         capped_envs = 1
 
-    aligned_envs = capped_envs - (capped_envs % num_cores) if capped_envs >= num_cores else capped_envs
+    aligned_envs = (
+        capped_envs - (capped_envs % num_cores)
+        if capped_envs >= num_cores
+        else capped_envs
+    )
     if aligned_envs >= num_cores:
         capped_envs = aligned_envs
 
@@ -329,19 +236,25 @@ def vector_config_candidates(profile: Profile, max_envs: int) -> list[dict]:
     seen: set[tuple] = set()
 
     def add(config: dict) -> None:
-        key = tuple(sorted((k, v.__name__ if k == "backend" else v) for k, v in config.items()))
+        key = tuple(
+            sorted((k, v.__name__ if k == "backend" else v) for k, v in config.items())
+        )
         if key in seen:
             return
         seen.add(key)
         candidates.append(config)
 
-    for num_envs in sorted({1, min(2, capped_envs), min(4, capped_envs), min(8, capped_envs)}):
+    for num_envs in sorted(
+        {1, min(2, capped_envs), min(4, capped_envs), min(8, capped_envs)}
+    ):
         add({"num_envs": num_envs, "backend": pufferlib.vector.Serial})
 
     if capped_envs <= 1:
         return candidates
 
-    preferred_workers = sorted({1, min(num_cores // 2 or 1, capped_envs), min(num_cores, capped_envs)})
+    preferred_workers = sorted(
+        {1, min(num_cores // 2 or 1, capped_envs), min(num_cores, capped_envs)}
+    )
     for num_workers in preferred_workers:
         if num_workers < 1:
             continue
@@ -349,7 +262,9 @@ def vector_config_candidates(profile: Profile, max_envs: int) -> list[dict]:
             num_envs = num_workers * envs_per_worker
             if num_envs > capped_envs:
                 continue
-            for batch_size in sorted({envs_per_worker, max(1, num_envs // 2), num_envs}):
+            for batch_size in sorted(
+                {envs_per_worker, max(1, num_envs // 2), num_envs}
+            ):
                 if num_envs % batch_size != 0:
                     continue
                 if batch_size % envs_per_worker != 0:
@@ -404,7 +319,10 @@ def training_param_candidates(
     agents_per_batch = vecenv.agents_per_batch
     for horizon in base_horizons:
         train_batch_size = agents_per_batch * horizon
-        if max_train_batch_agents is not None and train_batch_size > max_train_batch_agents:
+        if (
+            max_train_batch_agents is not None
+            and train_batch_size > max_train_batch_agents
+        ):
             continue
         for update_epochs in epoch_options:
             for divisor in divisor_options:
@@ -434,7 +352,9 @@ def synthetic_update(
     update_epochs: int,
     device: str,
 ) -> None:
-    obs = torch.as_tensor(np.concatenate(obs_batches, axis=0), device=device, dtype=torch.float32)
+    obs = torch.as_tensor(
+        np.concatenate(obs_batches, axis=0), device=device, dtype=torch.float32
+    )
     actions_np = np.concatenate(action_batches, axis=0)
     action_dtype = torch.long if policy.discrete else torch.float32
     actions = torch.as_tensor(actions_np, device=device, dtype=action_dtype)
@@ -519,8 +439,9 @@ def benchmark_config(
         f"num_workers={vec_config.get('num_workers', 'n/a')} "
         f"vec_batch={vec_config.get('batch_size', 'n/a')} "
         f"zero_copy={vec_config.get('zero_copy', 'n/a')} "
-        f"with {len(train_candidates)} learner configs"
-    , flush=True)
+        f"with {len(train_candidates)} learner configs",
+        flush=True,
+    )
 
     results: list[BenchmarkResult] = []
     for train_index, candidate in enumerate(train_candidates, start=1):
@@ -529,8 +450,9 @@ def benchmark_config(
         minibatch_size = candidate.minibatch_size
         print(
             f"    learner [{train_index}/{len(train_candidates)}] "
-            f"horizon={rollout_horizon} epochs={update_epochs} minibatch={minibatch_size}"
-        , flush=True)
+            f"horizon={rollout_horizon} epochs={update_epochs} minibatch={minibatch_size}",
+            flush=True,
+        )
         rollout_obs: list[np.ndarray] = []
         rollout_actions: list[np.ndarray] = []
         steps = 0
@@ -564,8 +486,9 @@ def benchmark_config(
             if seconds >= 2.0 and now >= next_report:
                 print(
                     f"      progress elapsed={now - start:.1f}s "
-                    f"steps={steps} sps~={steps / max(now - start, 1e-6):.1f}"
-                , flush=True)
+                    f"steps={steps} sps~={steps / max(now - start, 1e-6):.1f}",
+                    flush=True,
+                )
                 next_report = now + report_interval
 
         if rollout_obs:
@@ -583,7 +506,9 @@ def benchmark_config(
         if device == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize()
             gpu_mem_peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-            util["gpu_mem_peak_mb"] = max(util["gpu_mem_peak_mb"] or 0.0, gpu_mem_peak_mb)
+            util["gpu_mem_peak_mb"] = max(
+                util["gpu_mem_peak_mb"] or 0.0, gpu_mem_peak_mb
+            )
 
         result = BenchmarkResult(
             vec_backend=vec_config["backend"].__name__,
@@ -612,7 +537,9 @@ def benchmark_config(
 
 
 def print_profile(profile: Profile, max_batch_vram_gb: float, device: str) -> None:
-    throughput_gb_s = (profile.obs_bytes_per_agent * profile.single_env_sps * profile.num_cores) / 1e9
+    throughput_gb_s = (
+        profile.obs_bytes_per_agent * profile.single_env_sps * profile.num_cores
+    ) / 1e9
     print("Single-env profile")
     print(f"  agents/env: {profile.agents_per_env}")
     print(f"  obs bytes/agent: {profile.obs_bytes_per_agent}")
@@ -632,7 +559,9 @@ def print_profile(profile: Profile, max_batch_vram_gb: float, device: str) -> No
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--players-per-team", type=int, default=5)
-    parser.add_argument("--action-mode", choices=["discrete", "continuous"], default="discrete")
+    parser.add_argument(
+        "--action-mode", choices=["discrete", "continuous"], default="discrete"
+    )
     parser.add_argument("--game-length", type=int, default=400)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -646,7 +575,9 @@ def main() -> None:
     parser.add_argument("--max-configs", type=int, default=12)
     args = parser.parse_args()
 
-    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
+    device = (
+        "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
+    )
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
     if device == "auto":
@@ -668,17 +599,27 @@ def main() -> None:
     )
     print_profile(profile, args.max_batch_vram_gb, device)
 
-    train_limit = estimate_gpu_limits(profile, device, args.max_batch_vram_gb) if device == "cuda" else None
+    train_limit = (
+        estimate_gpu_limits(profile, device, args.max_batch_vram_gb)
+        if device == "cuda"
+        else None
+    )
     vec_candidates = vector_config_candidates(profile, max_envs)
     if args.max_configs is not None:
         vec_candidates = vec_candidates[: max(1, args.max_configs)]
     per_vec_train_candidates = 4 if args.quick else (18 if device == "cpu" else 18)
-    estimated_minutes = (len(vec_candidates) * per_vec_train_candidates * args.benchmark_seconds) / 60.0
-    print(f"Benchmarking {len(vec_candidates)} vector configs on device={device}\n", flush=True)
+    estimated_minutes = (
+        len(vec_candidates) * per_vec_train_candidates * args.benchmark_seconds
+    ) / 60.0
+    print(
+        f"Benchmarking {len(vec_candidates)} vector configs on device={device}\n",
+        flush=True,
+    )
     print(
         f"Quick mode: {args.quick}. "
-        f"Estimated benchmark floor: ~{estimated_minutes:.1f} minutes plus setup overhead.\n"
-    , flush=True)
+        f"Estimated benchmark floor: ~{estimated_minutes:.1f} minutes plus setup overhead.\n",
+        flush=True,
+    )
 
     results: list[BenchmarkResult] = []
     for index, vec_config in enumerate(vec_candidates, start=1):

@@ -306,6 +306,8 @@ def make_puffer_env(num_envs: int | None = None, **kwargs: Any) -> MARL2DPufferE
         raise ValueError(
             "make_puffer_env now creates exactly one logical env; use make_native_vec_env or make_soccer_vecenv for multi-env execution"
         )
+    if not hasattr(binding, "env_init"):
+        return make_native_vec_env(num_envs=1, **kwargs)
     return MARL2DPufferEnv(**kwargs)
 
 
