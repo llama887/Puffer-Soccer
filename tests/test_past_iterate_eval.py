@@ -89,10 +89,29 @@ def test_evaluate_against_past_iterate_returns_metrics():
     )
 
     metrics = train_pufferl.evaluate_against_past_iterate(
-        policy, train_pufferl.clone_state_dict(policy), args, epoch=1
+        policy, train_pufferl.snapshot_policy_state(policy), args, epoch=1
     )
 
     assert metrics["games"] == 2.0
     assert isinstance(metrics["win_rate"], float)
     assert isinstance(metrics["score_diff"], float)
+    env.close()
+
+
+def test_snapshot_policy_state_clones_tensors():
+    env = make_soccer_vecenv(
+        players_per_team=1,
+        action_mode="discrete",
+        game_length=4,
+        render_mode=None,
+        seed=0,
+        vec=VecEnvConfig(backend="native", shard_num_envs=1, num_shards=1),
+    )
+    policy = train_pufferl.Policy(env)
+
+    snapshot = train_pufferl.snapshot_policy_state(policy)
+    first_name, first_param = next(iter(policy.state_dict().items()))
+
+    assert snapshot[first_name] is not first_param
+    assert np.array_equal(snapshot[first_name].numpy(), first_param.numpy())
     env.close()

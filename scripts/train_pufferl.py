@@ -19,12 +19,6 @@ import pufferlib
 import pufferlib.pufferl as pufferl
 import pufferlib.pytorch
 
-from puffer_soccer.autotune import (
-    DEFAULT_AUTOTUNE_SAMPLE_SECONDS,
-    autotune_vecenv,
-    format_benchmark_result,
-    vec_config_from_benchmark,
-)
 from puffer_soccer.envs.marl2d import make_puffer_env
 from puffer_soccer.vector_env import (
     VecEnvConfig,
@@ -460,22 +454,6 @@ def compute_train_sizes(total_agents: int, horizon: int = 64) -> tuple[int, int]
 
 
 def resolve_vec_config(args) -> VecEnvConfig:
-    if args.vec_backend == "auto":
-        outcome = autotune_vecenv(
-            players_per_team=args.players_per_team,
-            seconds=args.vec_autotune_seconds or DEFAULT_AUTOTUNE_SAMPLE_SECONDS,
-            action_mode="discrete",
-            backend="auto",
-            max_num_envs=args.vec_autotune_max_num_envs,
-            max_num_shards=args.vec_autotune_max_num_shards,
-            reporter=print,
-        )
-        print(
-            "Autotuned vecenv: "
-            f"{format_benchmark_result(outcome.best)}; {outcome.selection_reason}"
-        )
-        return vec_config_from_benchmark(outcome.best)
-
     if args.vec_backend == "native":
         return VecEnvConfig(
             backend="native",
@@ -712,38 +690,6 @@ def _resolve_writable_output_path(path: Path) -> Path:
     )
 
 
-def _log_self_play_video(logger, video_path: Path | None, args, step: int) -> None:
-    if logger is None or video_path is None or not hasattr(logger, "wandb"):
-        return
-
-    wandb = logger.wandb
-    resolved_path = video_path.expanduser().resolve()
-    video_format = "gif" if resolved_path.suffix.lower() == ".gif" else "mp4"
-
-    wandb.log(
-        {
-            args.wandb_video_key: wandb.Video(
-                str(resolved_path),
-                fps=args.video_fps,
-                format=video_format,
-            ),
-            f"{args.wandb_video_key}_path": str(resolved_path),
-        },
-        step=step,
-    )
-
-    run = getattr(wandb, "run", None)
-    if run is None:
-        return
-
-    run.summary[f"{args.wandb_video_key}_file"] = resolved_path.name
-    run.summary[f"{args.wandb_video_key}_format"] = video_format
-
-    artifact = wandb.Artifact(f"{run.id}-self-play-video", type="evaluation")
-    artifact.add_file(str(resolved_path), name=resolved_path.name)
-    run.log_artifact(artifact)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--players-per-team", type=int, default=5)
@@ -752,13 +698,10 @@ def main():
         "--vec-backend",
         type=str,
         default="native",
-        choices=["native", "serial", "multiprocessing", "auto"],
+        choices=["native", "serial", "multiprocessing"],
     )
     parser.add_argument("--vec-num-shards", type=int, default=None)
     parser.add_argument("--vec-batch-size", type=int, default=None)
-    parser.add_argument("--vec-autotune-seconds", type=float, default=None)
-    parser.add_argument("--vec-autotune-max-num-envs", type=int, default=None)
-    parser.add_argument("--vec-autotune-max-num-shards", type=int, default=None)
     parser.add_argument("--ppo-iterations", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train-batch-size", type=int, default=None)
@@ -890,7 +833,18 @@ def main():
     model_path = trainer.close()
     video_path = save_self_play_video(policy, args)
 
-    _log_self_play_video(logger, video_path, args, trainer.global_step)
+    if logger is not None and video_path is not None:
+        video_format = "gif" if video_path.suffix.lower() == ".gif" else "mp4"
+        logger.wandb.log(
+            {
+                args.wandb_video_key: logger.wandb.Video(
+                    str(video_path),
+                    fps=args.video_fps,
+                    format=video_format,
+                )
+            },
+            step=trainer.global_step,
+        )
     if logger is not None:
         logger.close(model_path)
 

@@ -1,14 +1,6 @@
 # Puffer Soccer
 
-Native C-backed MARL 2D soccer environment for PufferLib, with:
-
-- `make_puffer_env(...)` high-throughput native env
-- direct rendering from the native env
-- centralized critic state in `env.global_states`
-- discrete and continuous action modes
-- PuffeRL training script and SPS benchmark
-
-PettingZoo compatibility has been removed intentionally to keep training on the native C-batched path.
+Native C-backed MARL 2D soccer environment for PufferLib.
 
 ## Install
 
@@ -25,7 +17,7 @@ uv run python main.py
 ## Train (PuffeRL PPO baseline)
 
 ```bash
-uv run python scripts/train_pufferl.py --players-per-team 5 --num-envs 8 --ppo-iterations 1000
+uv run scripts/train_pufferl.py --players-per-team 5 --vec-backend auto 8 --ppo-iterations 1000
 ```
 
 This writes a self-play video at `experiments/self_play.mp4` after training.
