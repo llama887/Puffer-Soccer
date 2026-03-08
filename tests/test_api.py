@@ -1,43 +1,102 @@
 import numpy as np
 
-from puffer_soccer.envs.marl2d import make_parallel_env, make_puffer_env
+from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv
 
 
-def test_puffer_env_shapes_discrete():
-    env = make_puffer_env(num_envs=2, players_per_team=3, action_mode="discrete")
+def test_scalar_puffer_env_shapes_discrete():
+    env = make_puffer_env(players_per_team=3, action_mode="discrete")
     obs, _ = env.reset(seed=0)
-    assert obs.shape == (12, 58)
-    assert env.global_states.shape == (12, 107)
+    assert obs.shape == (6, 58)
+    assert env.global_states.shape == (6, 107)
 
-    actions = np.zeros((12,), dtype=np.int32)
+    actions = np.zeros((6,), dtype=np.int32)
     obs, rewards, terminals, truncations, _ = env.step(actions)
-    assert obs.shape == (12, 58)
-    assert rewards.shape == (12,)
-    assert terminals.shape == (12,)
-    assert truncations.shape == (12,)
+    assert obs.shape == (6, 58)
+    assert rewards.shape == (6,)
+    assert terminals.shape == (6,)
+    assert truncations.shape == (6,)
     env.close()
 
 
-def test_parallel_env_roundtrip():
-    env = make_parallel_env(players_per_team=2, action_mode="discrete")
+def test_scalar_puffer_env_roundtrip():
+    env = make_puffer_env(players_per_team=2, action_mode="discrete")
     obs, infos = env.reset(seed=123)
-    assert len(obs) == 4
-    assert len(infos) == 4
+    assert obs.shape == (4, 44)
+    assert infos == []
 
-    actions = {a: 0 for a in env.agents}
+    actions = np.zeros((4,), dtype=np.int32)
     obs, rewards, terms, truncs, infos = env.step(actions)
-    assert len(obs) == 4
-    assert len(rewards) == 4
-    assert all("global_state" in infos[a] for a in infos)
-    assert set(terms.keys()) == set(obs.keys())
-    assert set(truncs.keys()) == set(obs.keys())
+    assert obs.shape == (4, 44)
+    assert rewards.shape == (4,)
+    assert terms.shape == (4,)
+    assert truncs.shape == (4,)
+    assert isinstance(infos, list)
     env.close()
 
 
-def test_parallel_env_rgb_array_render():
-    env = make_parallel_env(players_per_team=2, action_mode="discrete", render_mode="rgb_array")
+def test_scalar_puffer_env_rgb_array_render():
+    env = make_puffer_env(
+        players_per_team=2, action_mode="discrete", render_mode="rgb_array"
+    )
     env.reset(seed=0)
     frame = env.render()
+    assert frame is not None
+    assert frame.ndim == 3
+    assert frame.shape[2] == 3
+    env.close()
+
+
+def test_scalar_puffer_env_render_uses_terminal_snapshot_until_next_step():
+    env = make_puffer_env(
+        players_per_team=2,
+        action_mode="discrete",
+        game_length=3,
+        render_mode="rgb_array",
+    )
+    env.reset(seed=0)
+
+    actions = np.zeros((4,), dtype=np.int32)
+    terminals = np.zeros((4,), dtype=bool)
+    for _ in range(3):
+        _, _, terminals, _, _ = env.step(actions)
+
+    assert terminals.all()
+
+    terminal_state = env.get_state()
+    assert terminal_state["num_steps"] == 3
+
+    terminal_frame = env.render()
+    assert terminal_frame is not None
+    assert terminal_frame.ndim == 3
+
+    env.step(actions)
+    live_state = env.get_state()
+    assert live_state["num_steps"] == 1
+    env.close()
+
+
+def test_native_vec_env_shapes_and_second_render():
+    env = make_soccer_vecenv(
+        players_per_team=2,
+        action_mode="discrete",
+        game_length=400,
+        render_mode="rgb_array",
+        seed=0,
+        vec=VecEnvConfig(backend="native", shard_num_envs=2, num_shards=1),
+    )
+    obs, _ = env.reset(seed=0)
+    assert obs.shape == (8, 44)
+    assert env.global_states.shape == (8, 73)
+
+    actions = np.zeros((8,), dtype=np.int32)
+    obs, rewards, terminals, truncations, _ = env.step(actions)
+    assert obs.shape == (8, 44)
+    assert rewards.shape == (8,)
+    assert terminals.shape == (8,)
+    assert truncations.shape == (8,)
+
+    frame = env.render(env_idx=1)
     assert frame is not None
     assert frame.ndim == 3
     assert frame.shape[2] == 3

@@ -1,9 +1,13 @@
-from .core import MARL2DPufferEnv, make_puffer_env
-from .pettingzoo_env import MARL2DParallelEnv, make_parallel_env
+from .core import (
+    MARL2DNativeVecEnv,
+    MARL2DPufferEnv,
+    make_native_vec_env,
+    make_puffer_env,
+)
 
 __all__ = [
     "MARL2DPufferEnv",
-    "MARL2DParallelEnv",
+    "MARL2DNativeVecEnv",
     "make_puffer_env",
-    "make_parallel_env",
+    "make_native_vec_env",
 ]
