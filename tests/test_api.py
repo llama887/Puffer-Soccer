@@ -1,6 +1,7 @@
 import numpy as np
 
 from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.envs.marl2d.core import MAX_SIGNED_ENV_SEED, normalize_env_seed
 from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv
 
 
@@ -100,4 +101,15 @@ def test_native_vec_env_shapes_and_second_render():
     assert frame is not None
     assert frame.ndim == 3
     assert frame.shape[2] == 3
+    env.close()
+
+
+def test_large_reset_seed_is_folded_into_signed_env_range():
+    env = make_puffer_env(players_per_team=2, action_mode="discrete")
+    large_seed = MAX_SIGNED_ENV_SEED + 123_456
+    obs, infos = env.reset(seed=large_seed)
+
+    assert obs.shape == (4, 44)
+    assert infos == []
+    assert normalize_env_seed(large_seed) == 123_456
     env.close()

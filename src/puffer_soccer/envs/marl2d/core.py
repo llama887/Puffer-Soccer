@@ -5,6 +5,31 @@ from typing import Any
 
 import gymnasium
 import numpy as np
+
+
+MAX_SIGNED_ENV_SEED = 2**31 - 1
+
+
+def normalize_env_seed(seed: int | None) -> int:
+    """Map arbitrary Python integer seeds onto the signed range accepted by the C env.
+
+    The native soccer binding accepts a signed 32-bit integer seed. Long training runs can
+    derive evaluation seeds from the epoch counter, and those values eventually exceed that
+    range even though they are still perfectly valid Python integers. That used to crash
+    evaluation late in training with an `OverflowError` when the reset call forwarded the raw
+    value into the binding.
+
+    This helper keeps the environment API ergonomic by accepting any Python integer or `None`
+    and folding it deterministically into the legal signed range before the binding sees it.
+    Using modulo arithmetic preserves reproducibility while ensuring every caller, including
+    old code paths that do not know about the C limit, remains safe.
+    """
+
+    if seed is None:
+        return 0
+    return int(seed) % MAX_SIGNED_ENV_SEED
+
+
 import pufferlib
 
 from .csrc import binding
@@ -109,9 +134,7 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         self.tick = 0
 
     def reset(self, seed: int | None = 0):
-        if seed is None:
-            seed = 0
-        binding.env_reset(self._handle, int(seed))
+        binding.env_reset(self._handle, normalize_env_seed(seed))
         self.tick = 0
         self.rewards[:] = 0
         self.terminals[:] = False
@@ -246,9 +269,7 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         self.tick = 0
 
     def reset(self, seed: int | None = 0):
-        if seed is None:
-            seed = 0
-        binding.vec_reset(self._handle, int(seed))
+        binding.vec_reset(self._handle, normalize_env_seed(seed))
         self.tick = 0
         self.rewards[:] = 0
         self.terminals[:] = False

@@ -17,7 +17,7 @@ uv run python main.py
 ## Train (PuffeRL PPO baseline)
 
 ```bash
-uv run scripts/train_pufferl.py --players-per-team 5 --vec-backend auto 8 --ppo-iterations 1000
+uv run scripts/train_pufferl.py --players-per-team 5 --vec-backend auto --ppo-iterations 1000
 ```
 
 This writes a self-play video at `experiments/self_play.mp4` after training.
@@ -25,7 +25,9 @@ W&B logging is enabled by default with the `robot-soccer` project and logs the g
 
 The training path runs directly on `MARL2DPufferEnv` without a PettingZoo wrapper or Python serial vectorizer.
 
-To autotune the vector layout on the current machine before training, use the auto backend:
+To autotune the vector layout on the current machine before training, use the auto backend.
+This runs a short pre-training sweep over vector layouts, prefers near-100% CPU usage,
+and then trains with the fastest selected configuration:
 
 ```bash
 uv run python scripts/train_pufferl.py \
