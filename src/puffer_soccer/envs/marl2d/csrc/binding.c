@@ -507,7 +507,7 @@ static void c_step(Env* env) {
     int goal_scored = -1;
     if (fabsf(env->ball_y) <= env->goal_half_h) {
         if (env->ball_x < env->x_out_start) {
-            goal_scored = team_on_left(env, 1) ? 1 : 0;
+            goal_scored = team_on_left(env, 0) ? 1 : 0;
             if (goal_scored == 0) env->goals_blue += 1;
             else env->goals_red += 1;
         } else if (env->ball_x > env->x_out_end) {

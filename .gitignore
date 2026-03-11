@@ -226,3 +226,6 @@ wandb/
 .axon/
 .opencode/
 AGENTS.md
+*.err
+*.out
+tmp

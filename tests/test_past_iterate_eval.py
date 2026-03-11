@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -26,7 +27,33 @@ score_metrics_from_perspective = train_pufferl.score_metrics_from_perspective
 
 def test_compute_eval_interval_epochs():
     assert compute_eval_interval_epochs(1000, 10) == 100
+    assert compute_eval_interval_epochs(1000, 20) == 50
     assert compute_eval_interval_epochs(5, 10) == 1
+
+
+def test_should_run_periodic_training_event_uses_interval_and_final_epoch():
+    """Verify the shared cadence helper fires on interval boundaries and the final epoch."""
+
+    assert not train_pufferl.should_run_periodic_training_event(0, 100, 5)
+    assert not train_pufferl.should_run_periodic_training_event(4, 100, 5)
+    assert train_pufferl.should_run_periodic_training_event(5, 100, 5)
+    assert train_pufferl.should_run_periodic_training_event(100, 103, 5)
+
+
+def test_load_env_file_supports_export_prefix(tmp_path):
+    """Verify `.env` lines using `export KEY=value` still populate the environment."""
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("export WANDB_API_KEY=test-key\n", encoding="utf-8")
+
+    original = os.environ.pop("WANDB_API_KEY", None)
+    try:
+        train_pufferl.load_env_file(str(env_path))
+        assert os.environ["WANDB_API_KEY"] == "test-key"
+    finally:
+        os.environ.pop("WANDB_API_KEY", None)
+        if original is not None:
+            os.environ["WANDB_API_KEY"] = original
 
 
 def test_compute_train_sizes_rounds_small_batches_up_to_horizon():
@@ -322,14 +349,31 @@ class DummyRun:
 class DummyWandb:
     Artifact = DummyArtifact
 
+    class Video:
+        def __init__(self, path, *, fps, format):
+            self.path = path
+            self.fps = fps
+            self.format = format
+
     def __init__(self):
         self.run = DummyRun()
+        self.logged = []
+        self.metrics = []
+
+    def log(self, payload, step=None):
+        self.logged.append((payload, step))
+
+    def define_metric(self, name, **kwargs):
+        self.metrics.append((name, kwargs))
 
 
 class DummyLogger:
     def __init__(self):
         self.wandb = DummyWandb()
         self.run_id = "run-123"
+
+    def close(self, *_args, **_kwargs):
+        return None
 
 
 def test_register_best_checkpoint_updates_pointer_and_history(tmp_path):
@@ -371,3 +415,243 @@ def test_register_best_checkpoint_updates_pointer_and_history(tmp_path):
     logged_artifact, aliases = logger.wandb.run.logged_artifacts[0]
     assert logged_artifact.files == [(str(checkpoint_path), "model.pt")]
     assert aliases == ["best", "epoch-000007"]
+
+
+def test_log_periodic_self_play_video_logs_shared_cadence_metadata(tmp_path):
+    """Verify periodic self-play video logs include the same cadence metadata as eval."""
+
+    logger = DummyLogger()
+    video_path = tmp_path / "self_play.mp4"
+    video_path.write_bytes(b"video")
+    args = SimpleNamespace(
+        export_videos=True,
+        wandb_video_key="self_play_video",
+        video_fps=20,
+    )
+
+    with patch.object(train_pufferl, "save_self_play_video", return_value=video_path):
+        saved_path = train_pufferl.log_periodic_self_play_video(
+            object(),
+            args,
+            logger=logger,
+            epoch=25,
+            global_step=2500,
+            eval_interval_epochs=5,
+            baseline_epoch=20,
+        )
+
+    assert saved_path == video_path
+    payload, step = logger.wandb.logged[0]
+    assert step == 2500
+    assert payload["video/progress_step"] == 2500.0
+    assert payload["video/self_play/current_epoch"] == 25.0
+    assert payload["video/self_play/baseline_epoch"] == 20.0
+    assert payload["video/self_play/eval_epochs_interval"] == 5.0
+
+
+def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
+    """Verify the main loop keeps eval, video logging, and baseline rollover in sync."""
+
+    class FakePolicy:
+        """Minimal policy stub that exposes versioned state snapshots for the loop test."""
+
+        def __init__(self):
+            self.version = 0
+            self.training = True
+            self._param = torch.nn.Parameter(torch.tensor([0.0]))
+
+        def to(self, _device):
+            """Mirror the Torch module API used by the training entrypoint."""
+
+            return self
+
+        def parameters(self):
+            """Expose a single parameter so snapshot helpers can discover a device."""
+
+            yield self._param
+
+        def state_dict(self):
+            """Encode the current fake training version into one tensor snapshot."""
+
+            return {"weight": torch.tensor([float(self.version)])}
+
+        def train(self):
+            """Match Torch train-mode toggling used by the video helpers."""
+
+            self.training = True
+            return self
+
+        def eval(self):
+            """Match Torch eval-mode toggling used by the video helpers."""
+
+            self.training = False
+            return self
+
+    class FakeVecEnv:
+        """Small vector-env stub that only exposes the agent count used by setup."""
+
+        num_agents = 2
+
+    class FakeTrainer:
+        """Tiny trainer stub that advances epochs and global steps deterministically."""
+
+        def __init__(self, _config, _vecenv, policy, **_kwargs):
+            self.policy = policy
+            self.epoch = 0
+            self.total_epochs = 100
+            self.global_step = 0
+            self.start_time = 0.0
+
+        def evaluate(self):
+            """Mirror the no-op evaluation call the real loop performs each epoch."""
+
+        def train(self):
+            """Advance one epoch and stamp the policy snapshot with that epoch number."""
+
+            self.epoch += 1
+            self.policy.version = self.epoch
+            self.global_step = self.epoch * 100
+
+        def print_dashboard(self):
+            """Mirror the real trainer shutdown path without producing output."""
+
+        def close(self):
+            """Write a small stand-in checkpoint file and return its path."""
+
+            model_path = tmp_path / "model.pt"
+            model_path.write_bytes(b"weights")
+            return str(model_path)
+
+        def save_checkpoint(self):
+            """Write a stand-in periodic checkpoint path for promotion code paths."""
+
+            checkpoint_path = tmp_path / "checkpoint.pt"
+            checkpoint_path.write_bytes(b"weights")
+            return str(checkpoint_path)
+
+    class FakeEvaluator:
+        """Minimal evaluator stub that only needs to support `close`."""
+
+        def __init__(self, *_args, **_kwargs):
+            self.closed = False
+
+        def close(self):
+            """Record that cleanup happened so the stub matches the real interface."""
+
+            self.closed = True
+
+    eval_calls: list[tuple[int, int]] = []
+    video_calls: list[tuple[int, int, int, int]] = []
+    run_summaries: list[dict[str, object]] = []
+    fake_policy = FakePolicy()
+    vec_config = VecEnvConfig(backend="native", shard_num_envs=4, num_shards=1)
+    logger = DummyLogger()
+
+    def fake_build_train_config(_args, _vecenv, _device):
+        """Return the minimum training config fields consumed by `main`."""
+
+        return {
+            "batch_size": 128,
+            "bptt_horizon": 64,
+            "minibatch_size": 64,
+            "total_timesteps": 12_800,
+            "learning_rate": 3e-4,
+            "update_epochs": 2,
+            "ent_coef": 0.0,
+            "gamma": 0.995,
+            "gae_lambda": 0.9,
+            "clip_coef": 0.2,
+            "vf_coef": 2.0,
+            "vf_clip_coef": 0.2,
+            "max_grad_norm": 1.5,
+            "prio_alpha": 0.8,
+            "prio_beta0": 0.2,
+        }
+
+    def fake_eval_against_past_iterate(policy, previous_state_dict, **_kwargs):
+        """Capture the baseline snapshot version chosen at each periodic eval point."""
+
+        eval_calls.append(
+            (policy.version, int(previous_state_dict["weight"].item()))
+        )
+        return {"games": 64.0, "win_rate": 0.5, "score_diff": 0.0}
+
+    def fake_log_video_artifact(
+        _logger,
+        _video_key,
+        _video_path,
+        _fps,
+        step,
+        extra_payload=None,
+    ):
+        """Capture periodic video metadata instead of sending anything to W&B."""
+
+        assert extra_payload is not None
+        video_calls.append(
+            (
+                int(extra_payload["video/self_play/current_epoch"]),
+                int(extra_payload["video/self_play/baseline_epoch"]),
+                int(extra_payload["video/self_play/eval_epochs_interval"]),
+                step,
+            )
+        )
+
+    def fake_maybe_write_run_summary(_path, payload):
+        """Capture the emitted run summary so the cadence fields can be asserted."""
+
+        run_summaries.append(dict(payload))
+
+    with patch.object(sys, "argv", ["train_pufferl.py"]), patch.object(
+        train_pufferl, "load_env_file", return_value=None
+    ), patch.object(
+        train_pufferl, "resolve_device", return_value="cpu"
+    ), patch.object(
+        train_pufferl, "resolve_training_vec_config", return_value=(vec_config, None)
+    ), patch.object(
+        train_pufferl, "make_soccer_vecenv", return_value=FakeVecEnv()
+    ), patch.object(
+        train_pufferl, "build_train_config", side_effect=fake_build_train_config
+    ), patch.object(
+        train_pufferl, "Policy", return_value=fake_policy
+    ), patch.object(
+        train_pufferl.pufferl, "WandbLogger", return_value=logger
+    ), patch.object(
+        train_pufferl, "RegularizedPuffeRL", side_effect=FakeTrainer
+    ), patch.object(
+        train_pufferl, "HeadToHeadEvaluator", side_effect=FakeEvaluator
+    ), patch.object(
+        train_pufferl,
+        "evaluate_against_past_iterate",
+        side_effect=fake_eval_against_past_iterate,
+    ), patch.object(
+        train_pufferl, "save_self_play_video", return_value=tmp_path / "self_play.mp4"
+    ), patch.object(
+        train_pufferl, "log_video_artifact", side_effect=fake_log_video_artifact
+    ), patch.object(
+        train_pufferl, "read_json_record", return_value=None
+    ), patch.object(
+        train_pufferl,
+        "register_best_checkpoint",
+        return_value={"artifact_ref": "entity/project/model:best"},
+    ), patch.object(
+        train_pufferl, "save_best_checkpoint_video", return_value=None
+    ), patch.object(
+        train_pufferl,
+        "maybe_write_run_summary",
+        side_effect=fake_maybe_write_run_summary,
+    ):
+        train_pufferl.main()
+
+    expected_epochs = list(range(5, 101, 5))
+    expected_eval_calls = [(epoch, epoch - 5) for epoch in expected_epochs]
+    expected_video_calls = [
+        (epoch, epoch - 5, 5, epoch * 100) for epoch in expected_epochs
+    ]
+
+    assert eval_calls == expected_eval_calls
+    assert video_calls == expected_video_calls
+    assert run_summaries[0]["past_iterate_eval_interval_epochs"] == 5
+    assert (
+        run_summaries[0]["effective_hyperparameters"]["past_iterate_eval_fractions"]
+        == 20
+    )

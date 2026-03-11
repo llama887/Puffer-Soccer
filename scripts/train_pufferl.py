@@ -543,6 +543,21 @@ class HeadToHeadEvaluator:
 
 
 def load_env_file(path: str = ".env") -> None:
+    """Load simple `.env` assignments into the current process environment.
+
+    Training often runs from shells, batch scripts, or remote workers that do not already have
+    every secret exported. This helper lets the trainer pick up values such as
+    ``WANDB_API_KEY`` directly from a local `.env` file before W&B is initialized.
+
+    The parser intentionally stays lightweight, but it supports the two assignment styles most
+    likely to appear in this repo:
+    - ``KEY=value``
+    - ``export KEY=value``
+
+    Existing environment variables still win so callers can override local defaults from the
+    outer shell when needed.
+    """
+
     env_path = Path(path)
     if not env_path.exists():
         return
@@ -553,6 +568,8 @@ def load_env_file(path: str = ".env") -> None:
             continue
         key, value = stripped.split("=", 1)
         key = key.strip()
+        if key.startswith("export "):
+            key = key.removeprefix("export ").strip()
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
@@ -580,6 +597,29 @@ def compute_eval_interval_epochs(total_epochs: int, fractions: int) -> int:
     """
 
     return max(1, total_epochs // max(1, fractions))
+
+
+def should_run_periodic_training_event(
+    epoch: int, total_epochs: int, interval_epochs: int
+) -> bool:
+    """Return whether a shared periodic training event should run at this epoch.
+
+    Training now uses one common cadence for three pieces of bookkeeping that must stay in
+    lockstep: past-iterate evaluation, periodic self-play video logging, and refreshing the
+    retained past-iterate snapshot used at the next comparison point. Keeping this decision in
+    one helper avoids subtle drift where one call site treats the final epoch specially and
+    another does not.
+
+    The final epoch always returns ``True`` even when the total epoch count is not an exact
+    multiple of the interval. That preserves the existing "always evaluate at the end" behavior
+    and extends the same guarantee to periodic self-play video logging.
+    """
+
+    if epoch <= 0:
+        return False
+    if interval_epochs <= 0:
+        raise ValueError("interval_epochs must be positive")
+    return epoch % interval_epochs == 0 or epoch == total_epochs
 
 
 def round_up_to_multiple(value: int, multiple: int) -> int:
@@ -823,6 +863,7 @@ def summarize_effective_hyperparameters(
         "past_kl_coef": float(args.past_kl_coef),
         "uniform_kl_base_coef": float(args.uniform_kl_base_coef),
         "uniform_kl_power": float(args.uniform_kl_power),
+        "past_iterate_eval_fractions": int(args.past_iterate_eval_fractions),
     }
 
 
@@ -1381,17 +1422,20 @@ def snapshot_policy_state(policy: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 
 def _configure_iterate_metrics(logger) -> None:
-    """Tell W&B to chart all evaluation metrics against a shared progress step.
+    """Tell W&B to chart periodic evaluation and video metrics against stable progress steps.
 
-    The previous configuration still referenced an old metric namespace. Defining a single
-    evaluation step metric here keeps both the past-iterate plots and the best-checkpoint plots
-    aligned on the same x-axis.
+    The previous configuration still referenced an old metric namespace. Defining shared step
+    metrics here keeps periodic evaluation plots and periodic self-play video metadata aligned on
+    the same x-axis, which matters when later inspecting whether a behavioral shift first showed
+    up in numeric evaluation or in the replay video.
     """
 
     if logger is None or not hasattr(logger, "wandb"):
         return
     logger.wandb.define_metric("evaluation/progress_step")
     logger.wandb.define_metric("evaluation/*", step_metric="evaluation/progress_step")
+    logger.wandb.define_metric("video/progress_step")
+    logger.wandb.define_metric("video/*", step_metric="video/progress_step")
 
 
 def _is_permission_like_error(err: Exception) -> bool:
@@ -1467,23 +1511,74 @@ def print_match_summary(label: str, epoch: int, metrics: Mapping[str, float]) ->
 
 
 def log_video_artifact(
-    logger, video_key: str, video_path: Path, fps: int, step: int
+    logger,
+    video_key: str,
+    video_path: Path,
+    fps: int,
+    step: int,
+    extra_payload: Mapping[str, float] | None = None,
 ) -> None:
-    """Upload one generated video to W&B if logging is enabled."""
+    """Upload one generated video to W&B together with any cadence metadata.
+
+    Video artifacts are most useful when they can be lined up with the exact training progress
+    point that produced them. Accepting an optional payload lets callers attach the shared
+    periodic-step metadata used by numeric evaluation without duplicating the W&B logging logic
+    at every call site.
+    """
 
     if logger is None or not hasattr(logger, "wandb"):
         return
     video_format = "gif" if video_path.suffix.lower() == ".gif" else "mp4"
-    logger.wandb.log(
-        {
-            video_key: logger.wandb.Video(
-                str(video_path),
-                fps=fps,
-                format=video_format,
-            )
-        },
-        step=step,
+    payload: dict[str, Any] = {}
+    if extra_payload is not None:
+        payload.update(extra_payload)
+    payload[video_key] = logger.wandb.Video(
+        str(video_path),
+        fps=fps,
+        format=video_format,
     )
+    logger.wandb.log(payload, step=step)
+
+
+def log_periodic_self_play_video(
+    policy: Policy,
+    args,
+    *,
+    logger,
+    epoch: int,
+    global_step: int,
+    eval_interval_epochs: int,
+    baseline_epoch: int,
+) -> Path | None:
+    """Render and log the shared-cadence self-play video for one training checkpoint.
+
+    Periodic self-play videos are intended to be inspected side by side with past-iterate
+    evaluation metrics. This helper keeps the render, W&B upload, and cadence metadata tied
+    together so callers cannot forget to log the video at the same progress point as the
+    matching numeric evaluation.
+    """
+
+    if not args.export_videos:
+        return None
+
+    video_path = save_self_play_video(policy, args)
+    if video_path is None:
+        return None
+
+    log_video_artifact(
+        logger,
+        args.wandb_video_key,
+        video_path,
+        args.video_fps,
+        global_step,
+        extra_payload={
+            "video/progress_step": float(global_step),
+            "video/self_play/current_epoch": float(epoch),
+            "video/self_play/baseline_epoch": float(baseline_epoch),
+            "video/self_play/eval_epochs_interval": float(eval_interval_epochs),
+        },
+    )
+    return video_path
 
 
 def _build_run_summary(
@@ -1491,6 +1586,7 @@ def _build_run_summary(
     args,
     trainer,
     train_config: Mapping[str, Any],
+    eval_interval_epochs: int,
     vec_config: VecEnvConfig,
     eval_vec_config: VecEnvConfig | None,
     best_record: Mapping[str, object] | None,
@@ -1526,6 +1622,7 @@ def _build_run_summary(
             train_config,
             args,
         ),
+        "past_iterate_eval_interval_epochs": int(eval_interval_epochs),
         "objective_metrics": objective_metrics,
         "latest_best_checkpoint_metrics": None
         if latest_best_metrics is None
@@ -1602,7 +1699,7 @@ def main():
     parser.add_argument(
         "--past-iterate-eval", action=argparse.BooleanOptionalAction, default=True
     )
-    parser.add_argument("--past-iterate-eval-fractions", type=int, default=100)
+    parser.add_argument("--past-iterate-eval-fractions", type=int, default=20)
     parser.add_argument("--past-iterate-eval-envs", type=int, default=None)
     parser.add_argument("--past-iterate-eval-games", type=int, default=64)
     parser.add_argument("--past-iterate-eval-game-length", type=int, default=400)
@@ -1772,23 +1869,23 @@ def main():
             "fixed-best-checkpoint mode requires a readable best checkpoint record"
         )
 
+    past_iterate_state_dict = clone_state_dict(policy)
+    past_iterate_epoch = 0
+
     while trainer.epoch < trainer.total_epochs:
-        previous_state_dict = clone_state_dict(policy)
         trainer.evaluate()
         trainer.train()
-        should_eval = (
-            args.past_iterate_eval
-            and trainer.epoch > 0
-            and (
-                trainer.epoch % eval_interval_epochs == 0
-                or trainer.epoch == trainer.total_epochs
-            )
+        should_run_periodic_event = should_run_periodic_training_event(
+            trainer.epoch,
+            trainer.total_epochs,
+            eval_interval_epochs,
         )
+        should_eval = args.past_iterate_eval and should_run_periodic_event
         if should_eval and evaluator is not None:
             eval_seed = args.seed + trainer.epoch * 10_000
             eval_metrics = evaluate_against_past_iterate(
                 policy,
-                previous_state_dict,
+                past_iterate_state_dict,
                 evaluator=evaluator,
                 games=args.past_iterate_eval_games,
                 seed=eval_seed,
@@ -1799,7 +1896,7 @@ def main():
                 "evaluation/past_iterate/score_diff": eval_metrics["score_diff"],
                 "evaluation/past_iterate/games": eval_metrics["games"],
                 "evaluation/past_iterate/eval_epochs_interval": eval_interval_epochs,
-                "evaluation/past_iterate/baseline_epoch": trainer.epoch - 1,
+                "evaluation/past_iterate/baseline_epoch": float(past_iterate_epoch),
                 "evaluation/past_iterate/current_epoch": trainer.epoch,
             }
             print_match_summary("Past iterate eval", trainer.epoch, eval_metrics)
@@ -1909,6 +2006,19 @@ def main():
             if logger is not None:
                 logger.wandb.log(log_payload, step=trainer.global_step)
 
+        if should_run_periodic_event:
+            log_periodic_self_play_video(
+                policy,
+                args,
+                logger=logger,
+                epoch=trainer.epoch,
+                global_step=trainer.global_step,
+                eval_interval_epochs=eval_interval_epochs,
+                baseline_epoch=past_iterate_epoch,
+            )
+            past_iterate_state_dict = snapshot_policy_state(policy)
+            past_iterate_epoch = trainer.epoch
+
     trainer.print_dashboard()
     model_path = Path(trainer.close())
 
@@ -1968,21 +2078,10 @@ def main():
             f"{best_record.get('artifact_ref') or model_path}"
         )
 
-    self_play_video_path = None
     best_video_path = None
-    if args.export_videos:
-        self_play_video_path = save_self_play_video(policy, args)
     if args.export_videos and best_state_dict is not None:
         best_video_path = save_best_checkpoint_video(policy, best_state_dict, args)
 
-    if self_play_video_path is not None:
-        log_video_artifact(
-            logger,
-            args.wandb_video_key,
-            self_play_video_path,
-            args.video_fps,
-            trainer.global_step,
-        )
     if best_video_path is not None:
         log_video_artifact(
             logger,
@@ -1996,6 +2095,7 @@ def main():
         args=args,
         trainer=trainer,
         train_config=train_config,
+        eval_interval_epochs=eval_interval_epochs,
         vec_config=vec_config,
         eval_vec_config=eval_vec_config,
         best_record=best_record,
