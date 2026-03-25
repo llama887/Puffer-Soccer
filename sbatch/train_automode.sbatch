@@ -5,31 +5,45 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --time=14:00:00
+#SBATCH --time=48:00:00
 #SBATCH --account=torch_pr_45_tandon_advanced
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
+#SBATCH --chdir=/scratch/fyy2003/repos/Puffer-Soccer
 #SBATCH --output=/scratch/fyy2003/repos/Puffer-Soccer/sbatch/logs/%x-%j.out
 #SBATCH --error=/scratch/fyy2003/repos/Puffer-Soccer/sbatch/logs/%x-%j.err
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
+REPO_ROOT="$(pwd -P)"
 SCRATCH_BASE="/scratch/$USER"
+LOCAL_TMP_BASE="/tmp/$USER"
 APPTAINER_IMAGE="docker://quay.io/pypa/manylinux_2_28_x86_64"
 
-export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-$SCRATCH_BASE/.cache/apptainer}"
+if [ "${TRAIN_AUTOMODE_PRINT_ROOT_ONLY:-0}" = "1" ]; then
+    printf '%s\n' "$REPO_ROOT"
+    exit 0
+fi
+
+export APPTAINER_CACHEDIR="${TRAIN_AUTOMODE_APPTAINER_CACHEDIR:-$SCRATCH_BASE/.cache/apptainer}"
 export SINGULARITY_CACHEDIR="$APPTAINER_CACHEDIR"
-export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-$SCRATCH_BASE/apptainer-tmp}"
+export APPTAINER_TMPDIR="${TRAIN_AUTOMODE_APPTAINER_TMPDIR:-$LOCAL_TMP_BASE/apptainer-tmp-${SLURM_JOB_ID:-local}}"
 export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$SCRATCH_BASE/.cache/uv}"
 export TMPDIR="${TMPDIR:-$SCRATCH_BASE/tmp}"
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$SCRATCH_BASE/.venvs/puffer-soccer-${SLURM_JOB_ID:-local}}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 mkdir -p \
     "$APPTAINER_CACHEDIR" \
     "$APPTAINER_TMPDIR" \
     "$UV_CACHE_DIR" \
     "$TMPDIR" \
+    "$(dirname "$UV_PROJECT_ENVIRONMENT")" \
     "$REPO_ROOT/sbatch/logs"
+
+printf 'REPO_ROOT=%s\n' "$REPO_ROOT"
+printf 'APPTAINER_CACHEDIR=%s\n' "$APPTAINER_CACHEDIR"
+printf 'APPTAINER_TMPDIR=%s\n' "$APPTAINER_TMPDIR"
 
 module purge
 
@@ -48,15 +62,33 @@ export APPTAINER_TMPDIR="'"$APPTAINER_TMPDIR"'"
 export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
 export UV_CACHE_DIR="'"$UV_CACHE_DIR"'"
 export TMPDIR="'"$TMPDIR"'"
+export UV_PROJECT_ENVIRONMENT="'"$UV_PROJECT_ENVIRONMENT"'"
+export PYTHONUNBUFFERED="'"$PYTHONUNBUFFERED"'"
 
 # Keep native extension builds from fanning out across many compiler workers.
 export MAX_JOBS="${MAX_JOBS:-1}"
 
-# Tune these per GPU if needed. The defaults target low-priority top-up work.
-export GPU_HEARTBEAT_THRESHOLD="${GPU_HEARTBEAT_THRESHOLD:-50}"
-export GPU_HEARTBEAT_CHECK_INTERVAL="${GPU_HEARTBEAT_CHECK_INTERVAL:-0.5}"
-export GPU_HEARTBEAT_MATRIX_SIZE="${GPU_HEARTBEAT_MATRIX_SIZE:-2048}"
-export GPU_HEARTBEAT_BURST_MATMULS="${GPU_HEARTBEAT_BURST_MATMULS:-15}"
+# Tune these per GPU if needed. The defaults target low-priority top-up work
+# that keeps scheduler-visible utilization near 70% without trying to fully
+# saturate the device.
+export GPU_HEARTBEAT_TARGET_UTILIZATION="${GPU_HEARTBEAT_TARGET_UTILIZATION:-70}"
+export GPU_HEARTBEAT_CHECK_INTERVAL="${GPU_HEARTBEAT_CHECK_INTERVAL:-0.2}"
+export GPU_HEARTBEAT_MATRIX_SIZE="${GPU_HEARTBEAT_MATRIX_SIZE:-6144}"
+export GPU_HEARTBEAT_UTILIZATION_TOLERANCE="${GPU_HEARTBEAT_UTILIZATION_TOLERANCE:-3}"
+export GPU_HEARTBEAT_MIN_COMPUTE_SECONDS="${GPU_HEARTBEAT_MIN_COMPUTE_SECONDS:-0.10}"
+export GPU_HEARTBEAT_MAX_COMPUTE_SECONDS="${GPU_HEARTBEAT_MAX_COMPUTE_SECONDS:-1.20}"
+export GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS="${GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS:-0.03}"
+export GPU_HEARTBEAT_MATMULS_PER_CHUNK="${GPU_HEARTBEAT_MATMULS_PER_CHUNK:-8}"
+export GPU_HEARTBEAT_DTYPE="${GPU_HEARTBEAT_DTYPE:-bfloat16}"
+export TRAIN_AUTOMODE_PPO_ITERATIONS="${TRAIN_AUTOMODE_PPO_ITERATIONS:-100000}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS="${TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS:-8}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS="${TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS:-$TRAIN_AUTOMODE_PPO_ITERATIONS}"
+export TRAIN_AUTOMODE_NO_OPPONENT_EVAL_INTERVAL="${TRAIN_AUTOMODE_NO_OPPONENT_EVAL_INTERVAL:-4}"
+export TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD="${TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD:-0.90}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD="${TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD:-0.0}"
+export TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES="${TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES:-100}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER="${TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER:-0.2,0.4,0.6,0.8,1.0}"
+export TRAIN_AUTOMODE_EXTRA_ARGS="${TRAIN_AUTOMODE_EXTRA_ARGS:-}"
 
 uv sync --python /opt/python/cp312-cp312/bin/python
 
@@ -68,14 +100,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-nice -n 19 uv run python sbatch/gpu_heartbeat.py &
+nice -n 19 uv run python -u sbatch/gpu_heartbeat.py &
 HEARTBEAT_PID=$!
 echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
 
-uv run python scripts/train_pufferl.py \
+uv run python -u scripts/train_pufferl.py \
+    --hyperparameters-path experiments/autoload_hyperparameters.json \
     --vec-backend auto \
     --device cuda \
     --wandb \
     --wandb-project robot-soccer \
-    --ppo-iterations 100000
+    --ppo-iterations "$TRAIN_AUTOMODE_PPO_ITERATIONS" \
+    --no-opponent-phase-min-iterations "$TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS" \
+    --no-opponent-phase-max-iterations "$TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS" \
+    --no-opponent-phase-eval-interval "$TRAIN_AUTOMODE_NO_OPPONENT_EVAL_INTERVAL" \
+    --no-opponent-phase-goal-rate-threshold "$TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD" \
+    --no-opponent-phase-multi-goal-rate-threshold "$TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD" \
+    --no-opponent-eval-games "$TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES" \
+    --no-opponent-map-scale-ladder "$TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER" \
+    $TRAIN_AUTOMODE_EXTRA_ARGS
 '

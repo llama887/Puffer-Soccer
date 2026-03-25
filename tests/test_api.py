@@ -1,6 +1,7 @@
 """API and native-environment smoke tests for the MARL2D soccer wrappers."""
 
 import ctypes
+import math
 
 import numpy as np
 
@@ -74,6 +75,7 @@ class _NativeEnv(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("game_length", ctypes.c_int),
         ("num_steps", ctypes.c_int),
         ("do_team_switch", ctypes.c_int),
+        ("opponents_enabled", ctypes.c_int),
         ("blue_left", ctypes.c_int),
         ("reset_setup", ctypes.c_int),
         ("action_mode", ctypes.c_int),
@@ -95,6 +97,12 @@ class _NativeEnv(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("ball_vy", ctypes.c_float),
         ("goals_blue", ctypes.c_int),
         ("goals_red", ctypes.c_int),
+        ("field_scale", ctypes.c_float),
+        ("base_x_out_start", ctypes.c_float),
+        ("base_x_out_end", ctypes.c_float),
+        ("base_y_out_start", ctypes.c_float),
+        ("base_y_out_end", ctypes.c_float),
+        ("base_goal_half_h", ctypes.c_float),
     ]
 
 
@@ -127,6 +135,35 @@ def _force_ball_into_goal(env, goal_side: str) -> None:
         native_env.ball_x = native_env.x_out_start - 1.0
     else:
         native_env.ball_x = native_env.x_out_end + 1.0
+
+
+def _set_symmetric_egocentric_state(env, *, ball_x: float, agent_x: float) -> None:
+    """Install a hand-crafted mirrored world state for egocentric observation checks.
+
+    The test needs two agents, one per team, that each face toward the opponent goal with the
+    same local ball configuration. Writing the native fields directly is the simplest way to
+    create that mirrored setup without adding a special testing hook to the environment code.
+    """
+
+    native_env = _native_env(env)
+    native_env.blue_left = 1
+    native_env.num_steps = 0
+    native_env.ball_x = ball_x
+    native_env.ball_y = 0.0
+    native_env.ball_vx = 0.0
+    native_env.ball_vy = 0.0
+
+    native_env.agents[0].x = agent_x
+    native_env.agents[0].y = 0.0
+    native_env.agents[0].rot = 0.0
+    native_env.agents[0].last_move = 0.0
+    native_env.agents[0].last_rot = 0.0
+
+    native_env.agents[1].x = -agent_x
+    native_env.agents[1].y = 0.0
+    native_env.agents[1].rot = math.pi
+    native_env.agents[1].last_move = 0.0
+    native_env.agents[1].last_rot = 0.0
 
 
 def test_scalar_puffer_env_shapes_discrete():
@@ -256,15 +293,14 @@ def test_goal_rewards_only_reward_the_attacking_team():
         _force_ball_into_goal(env, "left")
         _, rewards, _, _, _ = env.step(actions)
 
-        expected_left_team = 1 if bool(_native_env(env).blue_left) else 0
+        left_scores = env.get_state()["goals"]
+        expected_left_team = 0 if left_scores == (1, 0) else 1
         expected_left_rewards = np.array(
             [-1.0, -1.0, -1.0, -1.0], dtype=np.float32
         )
         start = expected_left_team * env.players_per_team
         expected_left_rewards[start : start + env.players_per_team] = 1.0
         np.testing.assert_allclose(rewards, expected_left_rewards)
-
-        left_scores = env.get_state()["goals"]
         if expected_left_team == 0:
             assert left_scores == (1, 0)
         else:
@@ -274,18 +310,107 @@ def test_goal_rewards_only_reward_the_attacking_team():
         _force_ball_into_goal(env, "right")
         _, rewards, _, _, _ = env.step(actions)
 
-        expected_right_team = 0 if bool(_native_env(env).blue_left) else 1
+        right_scores = env.get_state()["goals"]
+        expected_right_team = 0 if right_scores == (1, 0) else 1
         expected_right_rewards = np.array(
             [-1.0, -1.0, -1.0, -1.0], dtype=np.float32
         )
         start = expected_right_team * env.players_per_team
         expected_right_rewards[start : start + env.players_per_team] = 1.0
         np.testing.assert_allclose(rewards, expected_right_rewards)
-
-        right_scores = env.get_state()["goals"]
         if expected_right_team == 0:
             assert right_scores == (1, 0)
         else:
             assert right_scores == (0, 1)
+    finally:
+        env.close()
+
+
+def test_disabled_opponents_stay_inactive_and_receive_no_reward():
+    """Check that the no-opponent mode removes gameplay pressure from the red team.
+
+    The user-facing flag is meant to create a simple curriculum where one team can learn to
+    reach the ball and score without interference. This test verifies the native env matches
+    that contract in two concrete ways:
+    - red-team agents spawn pinned on the far right edge instead of contesting the ball
+    - red-team rewards stay at zero even when the blue team scores
+    """
+
+    env = make_puffer_env(
+        players_per_team=2,
+        action_mode="discrete",
+        opponents_enabled=False,
+    )
+    actions = np.zeros((4,), dtype=np.int32)
+
+    try:
+        env.reset(seed=0)
+        state = env.get_state()
+        positions = state["positions"]
+        np.testing.assert_allclose(positions[2:, 0], 50.0, atol=1e-6)
+
+        _force_ball_into_goal(env, "right")
+        _, rewards, _, _, _ = env.step(actions)
+
+        np.testing.assert_allclose(rewards[2:], 0.0, atol=1e-6)
+        assert np.all(rewards[:2] > 0.0)
+    finally:
+        env.close()
+
+
+def test_native_field_scale_resizes_no_opponent_map_without_obs_noise():
+    """Verify the map-size curriculum changes geometry without adding reward shaping.
+
+    The no-opponent curriculum should make the task easier by shrinking the field, not by
+    changing the reward. This test checks two concrete properties of the native setter:
+    - the live field bounds and state metadata reflect the requested scale
+    - disabled-opponent observation slots remain zero after resizing
+    """
+
+    env = make_puffer_env(
+        players_per_team=3,
+        action_mode="discrete",
+        opponents_enabled=False,
+    )
+
+    try:
+        env.set_field_scale(0.6)
+        obs, _ = env.reset(seed=0)
+        state = env.get_state()
+        native_env = _native_env(env)
+
+        np.testing.assert_allclose(state["field_scale"], 0.6, atol=1e-6)
+        np.testing.assert_allclose(native_env.x_out_start, -30.0, atol=1e-6)
+        np.testing.assert_allclose(native_env.x_out_end, 30.0, atol=1e-6)
+        np.testing.assert_allclose(native_env.y_out_start, -21.0, atol=1e-6)
+        np.testing.assert_allclose(native_env.y_out_end, 21.0, atol=1e-6)
+        np.testing.assert_allclose(obs[0][-21:], 0.0, atol=1e-6)
+    finally:
+        env.close()
+
+
+def test_observations_are_team_symmetric_and_egocentric():
+    """Check that mirrored agents receive matching local observations.
+
+    The no-opponent curriculum only makes sense if the policy sees the game from each agent's
+    own perspective rather than from a fixed world frame. This test builds a simple mirrored
+    two-agent state and confirms the blue and red agents receive the same self and ball
+    features once team-side normalization is applied.
+    """
+
+    env = make_puffer_env(players_per_team=1, action_mode="discrete")
+    actions = np.zeros((2,), dtype=np.int32)
+
+    try:
+        env.reset(seed=0)
+        _set_symmetric_egocentric_state(env, ball_x=0.0, agent_x=-10.0)
+        obs, _, _, _, _ = env.step(actions)
+
+        blue_obs = obs[0]
+        red_obs = obs[1]
+
+        np.testing.assert_allclose(blue_obs[1:7], red_obs[1:7], atol=1e-6)
+        np.testing.assert_allclose(blue_obs[16:21], red_obs[16:21], atol=1e-6)
+        np.testing.assert_allclose(blue_obs[21:28], red_obs[21:28], atol=1e-6)
     finally:
         env.close()

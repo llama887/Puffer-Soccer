@@ -52,6 +52,7 @@ class EnvConfig:
     game_length: int = DEFAULT_GAME_LENGTH
     action_mode: str = "discrete"
     do_team_switch: bool = False
+    opponents_enabled: bool = True
     vision_range: float = DEFAULT_VISION_RANGE
     reset_setup: str = "position"
     log_interval: int = 128
@@ -61,12 +62,25 @@ class EnvConfig:
 
 
 class MARL2DPufferEnv(pufferlib.PufferEnv):
+    """Wrap one native soccer environment and expose the compiled no-opponent mode.
+
+    The training experiments in this project need a clean diagnostic where the blue team plays
+    in a truly opponent-free world. That should still use the normal native reset path and the
+    same PPO loop as standard training, just with the red team disabled inside the simulator.
+
+    This wrapper therefore forwards `opponents_enabled` directly into the native binding rather
+    than trying to emulate the behavior in Python. Keeping that control inside the C simulator
+    avoids ghost opponents in observations, keeps post-goal resets consistent, and lets both
+    scalar and native vector environments share the same semantics.
+    """
+
     def __init__(
         self,
         players_per_team: int = 11,
         game_length: int = DEFAULT_GAME_LENGTH,
         action_mode: str = "discrete",
         do_team_switch: bool = False,
+        opponents_enabled: bool = True,
         vision_range: float = DEFAULT_VISION_RANGE,
         reset_setup: str = "position",
         log_interval: int = 128,
@@ -78,6 +92,7 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
 
         self.render_mode = render_mode
         self.players_per_team = players_per_team
+        self.opponents_enabled = opponents_enabled
         self.num_players = players_per_team * 2
         self.num_envs = 1
         self.num_agents = self.num_players
@@ -123,11 +138,12 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
             terminals=self.terminals,
             truncations=self.truncations,
             global_states=self.global_states,
-            seed=seed,
+            seed=normalize_env_seed(seed),
             players_per_team=players_per_team,
             game_length=game_length,
             action_mode=self._action_mode_i,
             do_team_switch=int(do_team_switch),
+            opponents_enabled=int(opponents_enabled),
             vision_range=float(vision_range),
             reset_setup=0 if reset_setup == "position" else 1,
         )
@@ -153,6 +169,21 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
                 infos.append(log)
 
         return self.observations, self.rewards, self.terminals, self.truncations, infos
+
+    def set_field_scale(self, scale: float) -> None:
+        """Resize the active field while keeping the current episode state valid.
+
+        The no-opponent curriculum for this project is expressed through environment
+        geometry rather than reward shaping. Training starts on a smaller field so the ball
+        and goal are easier to reach, then the field grows toward full size over training.
+
+        The native binding owns the live gameplay state, so the wrapper simply forwards the
+        requested scale. The binding clamps all agents and the ball into the resized field
+        and recomputes observations immediately so the next policy step sees a consistent
+        state.
+        """
+
+        binding.env_set_field_scale(self._handle, float(scale))
 
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         if env_idx != 0:
@@ -192,6 +223,13 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
 
 
 class MARL2DNativeVecEnv(pufferlib.PufferEnv):
+    """Wrap the compiled native vector environment.
+
+    The native backend is the fastest way to collect rollouts, so the no-opponent baseline
+    should use it whenever the compiled extension supports that mode. Forwarding
+    `opponents_enabled` here keeps scalar and vector environments behaviorally aligned.
+    """
+
     def __init__(
         self,
         num_envs: int = 1,
@@ -199,6 +237,7 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         game_length: int = DEFAULT_GAME_LENGTH,
         action_mode: str = "discrete",
         do_team_switch: bool = False,
+        opponents_enabled: bool = True,
         vision_range: float = DEFAULT_VISION_RANGE,
         reset_setup: str = "position",
         log_interval: int = 128,
@@ -212,6 +251,7 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
 
         self.render_mode = render_mode
         self.players_per_team = players_per_team
+        self.opponents_enabled = opponents_enabled
         self.num_players = players_per_team * 2
         self.num_envs = num_envs
         self.num_agents = self.num_players * num_envs
@@ -258,11 +298,12 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
             truncations=self.truncations,
             global_states=self.global_states,
             num_envs=num_envs,
-            seed=seed,
+            seed=normalize_env_seed(seed),
             players_per_team=players_per_team,
             game_length=game_length,
             action_mode=self._action_mode_i,
             do_team_switch=int(do_team_switch),
+            opponents_enabled=int(opponents_enabled),
             vision_range=float(vision_range),
             reset_setup=0 if reset_setup == "position" else 1,
         )
@@ -288,6 +329,16 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
                 infos.append(log)
 
         return self.observations, self.rewards, self.terminals, self.truncations, infos
+
+    def set_field_scale(self, scale: float) -> None:
+        """Apply one field scale to every native env shard used for training.
+
+        The trainer updates the curriculum once per epoch based on global training progress.
+        Native vector environments keep all env instances inside one C allocation, so the
+        update can be broadcast cheaply through a single binding call.
+        """
+
+        binding.vec_set_field_scale(self._handle, float(scale))
 
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         return binding.vec_get_state(self._handle, env_idx)

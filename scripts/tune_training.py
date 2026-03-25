@@ -3,17 +3,23 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import psutil
-import torch
 
 import pufferlib
 import pufferlib.vector
 from pufferlib.emulation import PettingZooPufferEnv
 
 from puffer_soccer.envs.marl2d import make_parallel_env
+from puffer_soccer.torch_loader import import_torch
 from puffer_soccer.utilization import UtilizationMonitor, query_nvidia_smi
+
+if TYPE_CHECKING:
+    import torch
+
+torch = import_torch()
 
 
 def parse_bool_arg(value: str) -> bool:

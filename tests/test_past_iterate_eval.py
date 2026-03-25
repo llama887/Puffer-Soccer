@@ -5,11 +5,17 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
+from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
-
+from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.torch_loader import import_torch
 from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv
+
+if TYPE_CHECKING:
+    import torch
+
+torch = import_torch()
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "train_pufferl.py"
 SPEC = importlib.util.spec_from_file_location("train_pufferl", MODULE_PATH)
@@ -38,6 +44,56 @@ def test_should_run_periodic_training_event_uses_interval_and_final_epoch():
     assert not train_pufferl.should_run_periodic_training_event(4, 100, 5)
     assert train_pufferl.should_run_periodic_training_event(5, 100, 5)
     assert train_pufferl.should_run_periodic_training_event(100, 103, 5)
+
+
+def test_split_phase_iterations_reserves_remaining_budget_for_self_play():
+    """Verify the warm-start consumes only its capped prefix of the PPO budget.
+
+    The new training flow starts with a short no-opponent phase and then hands the rest of
+    the PPO iterations to self-play. This test keeps that accounting explicit so later
+    refactors do not accidentally spend the whole run in the warm-start.
+    """
+
+    phase = train_pufferl.NoOpponentPhaseConfig(
+        min_iterations=8,
+        max_iterations=64,
+        eval_interval=4,
+        goal_rate_threshold=0.95,
+        multi_goal_rate_threshold=0.5,
+    )
+
+    warm_start, self_play = train_pufferl.split_phase_iterations(1_000, phase)
+
+    assert warm_start == 64
+    assert self_play == 936
+
+
+def test_blue_team_no_opponent_wrapper_exposes_only_learning_agents():
+    """Verify the warm-start wrapper removes dead red-agent trajectories from PPO input.
+
+    The warm-start fix depends on PPO seeing only blue agents even though the native simulator
+    still maintains full red-team slots for rendering and zero-filled opponent observations.
+    This regression test checks both sides of that contract:
+    - the wrapper exposes only `players_per_team` agents to the trainer
+    - the wrapped native env still keeps the full two-team state internally
+    """
+
+    base_env = make_puffer_env(
+        players_per_team=3,
+        action_mode="discrete",
+        opponents_enabled=False,
+    )
+    wrapped_env = train_pufferl.BlueTeamNoOpponentWrapper(base_env, players_per_team=3)
+
+    try:
+        obs, _ = wrapped_env.reset(seed=0)
+
+        assert wrapped_env.num_agents == 3
+        assert base_env.num_agents == 6
+        assert obs.shape[0] == 3
+        np.testing.assert_allclose(obs[0][-21:], 0.0, atol=1e-6)
+    finally:
+        wrapped_env.close()
 
 
 def test_load_env_file_supports_export_prefix(tmp_path):
@@ -449,6 +505,179 @@ def test_log_periodic_self_play_video_logs_shared_cadence_metadata(tmp_path):
     assert payload["video/self_play/eval_epochs_interval"] == 5.0
 
 
+def test_build_run_video_tag_uses_timestamp_and_optional_run_id():
+    """Verify default run video folders use the start timestamp and optional W&B run id.
+
+    The new run-scoped video layout relies on one stable tag that is readable in the filesystem
+    and unique across repeated launches. This test fixes that contract directly so later path
+    refactors do not silently drop either the timestamp or the run id component.
+    """
+
+    with patch.object(train_pufferl.time, "localtime", return_value=object()), patch.object(
+        train_pufferl.time,
+        "strftime",
+        return_value="2026-03-22_10-28-13",
+    ):
+        assert (
+            train_pufferl.build_run_video_tag(123.0, run_id="run-123")
+            == "2026-03-22_10-28-13_run-123"
+        )
+        assert train_pufferl.build_run_video_tag(123.0, run_id=None) == (
+            "2026-03-22_10-28-13"
+        )
+        assert train_pufferl.build_run_video_tag(123.0, run_id="") == (
+            "2026-03-22_10-28-13"
+        )
+
+
+def test_configure_run_video_outputs_uses_run_scoped_defaults():
+    """Verify default training videos move into one run-scoped directory.
+
+    The main loop mutates argparse outputs in place before any rendering happens. This regression
+    test checks that the default self-play and best-checkpoint paths both resolve into the same
+    `experiments/<tag>/video/` directory so later exports cannot collide across separate runs.
+    """
+
+    args = SimpleNamespace(
+        video_output=str(train_pufferl.DEFAULT_VIDEO_OUTPUT_PATH),
+        best_checkpoint_video_output=str(
+            train_pufferl.DEFAULT_BEST_CHECKPOINT_VIDEO_OUTPUT_PATH
+        ),
+        _explicit_video_output=False,
+        _explicit_best_checkpoint_video_output=False,
+    )
+
+    with patch.object(
+        train_pufferl,
+        "build_run_video_tag",
+        return_value="2026-03-22_10-28-13_run-123",
+    ):
+        train_pufferl.configure_run_video_outputs(
+            args,
+            logger=DummyLogger(),
+            run_start_time=123.0,
+        )
+
+    assert args.run_video_tag == "2026-03-22_10-28-13_run-123"
+    assert Path(args.video_output) == Path(
+        "experiments/2026-03-22_10-28-13_run-123/video/self_play.mp4"
+    )
+    assert Path(args.best_checkpoint_video_output) == Path(
+        "experiments/2026-03-22_10-28-13_run-123/video/best_checkpoint.mp4"
+    )
+
+
+def test_log_periodic_no_opponent_video_uses_run_scoped_default_path():
+    """Verify warm-start replay export stays inside the active run's video directory.
+
+    The no-opponent replay is derived from the self-play path rather than coming from its own
+    CLI flag. This test keeps that derivation explicit so the warm-start artifact lands beside
+    the self-play artifact inside the same run folder instead of drifting back into a shared
+    top-level experiments directory.
+    """
+
+    logger = DummyLogger()
+    expected_path = Path("experiments/run-123/video/self_play_no_opponent.mp4")
+    args = SimpleNamespace(
+        export_videos=True,
+        wandb_video_key="self_play_video",
+        video_fps=20,
+        run_video_tag="run-123",
+        _explicit_video_output=False,
+        video_output=str(train_pufferl.DEFAULT_VIDEO_OUTPUT_PATH),
+    )
+
+    with patch.object(
+        train_pufferl,
+        "save_match_video",
+        return_value=expected_path,
+    ) as mocked:
+        saved_path = train_pufferl.log_periodic_no_opponent_video(
+            object(),
+            args,
+            logger=logger,
+            epoch=4,
+            global_step=400,
+        )
+
+    assert saved_path == expected_path
+    assert mocked.call_args.kwargs["output_path"] == expected_path
+    assert mocked.call_args.kwargs["overwrite_existing"] is True
+
+
+def test_unique_path_finds_suffix_beyond_100(tmp_path):
+    """Verify fallback filename search keeps going after the old 100-file ceiling.
+
+    Long-running experiments can easily accumulate more than one hundred older local videos.
+    This test preserves the new unbounded search behavior so that path-collision handling stays
+    best-effort instead of aborting training once a shared directory gets crowded.
+    """
+
+    base_path = tmp_path / "self_play_no_opponent.mp4"
+    base_path.write_bytes(b"video")
+    for idx in range(1, 101):
+        (tmp_path / f"self_play_no_opponent_{idx}.mp4").write_bytes(b"video")
+
+    assert train_pufferl._unique_path(base_path) == (
+        tmp_path / "self_play_no_opponent_101.mp4"
+    )
+
+
+def test_write_video_frames_overwrites_existing_periodic_file(tmp_path):
+    """Verify rolling periodic videos reuse the same local file inside one run folder.
+
+    The run-scoped layout is meant to keep one latest replay per video type, not to create an
+    ever-growing list of numbered files. This test ensures the shared writer skips `_unique_path`
+    when overwrite mode is requested and instead writes directly to the existing path.
+    """
+
+    requested_path = tmp_path / "self_play.mp4"
+    requested_path.write_bytes(b"older-video")
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8)]
+
+    with patch.object(
+        train_pufferl,
+        "_unique_path",
+        side_effect=AssertionError("overwrite mode should not request a unique path"),
+    ), patch.object(train_pufferl.imageio, "mimsave", return_value=None) as mocked:
+        saved_path = train_pufferl._write_video_frames(
+            frames,
+            requested_path,
+            20,
+            "self-play video",
+            overwrite_existing=True,
+        )
+
+    assert saved_path == requested_path
+    assert mocked.call_args.args[0] == requested_path
+
+
+def test_write_video_frames_returns_none_when_all_exports_fail(tmp_path):
+    """Verify video export degrades to `None` instead of aborting the training process.
+
+    W&B uploads are useful but still secondary to keeping a long training job alive. This test
+    forces both MP4 and GIF writes to fail so the shared exporter must return `None` rather than
+    raising an exception back into the training loop.
+    """
+
+    requested_path = tmp_path / "self_play.mp4"
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8)]
+
+    with patch.object(
+        train_pufferl.imageio,
+        "mimsave",
+        side_effect=RuntimeError("encoder failed"),
+    ):
+        saved_path = train_pufferl._write_video_frames(
+            frames,
+            requested_path,
+            20,
+            "self-play video",
+        )
+
+    assert saved_path is None
+
+
 def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
     """Verify the main loop keeps eval, video logging, and baseline rollover in sync."""
 
@@ -542,6 +771,8 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
 
     eval_calls: list[tuple[int, int]] = []
     video_calls: list[tuple[int, int, int, int]] = []
+    video_output_paths: list[Path] = []
+    best_video_output_paths: list[Path] = []
     run_summaries: list[dict[str, object]] = []
     fake_policy = FakePolicy()
     vec_config = VecEnvConfig(backend="native", shard_num_envs=4, num_shards=1)
@@ -601,16 +832,31 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
 
         run_summaries.append(dict(payload))
 
-    with patch.object(sys, "argv", ["train_pufferl.py"]), patch.object(
-        train_pufferl, "load_env_file", return_value=None
-    ), patch.object(
+    def fake_save_self_play_video(_policy, args, *, overwrite_existing=False):
+        """Capture the resolved periodic self-play path without writing a real video."""
+
+        assert overwrite_existing is True
+        video_output_paths.append(Path(str(args.video_output)))
+        return tmp_path / "self_play.mp4"
+
+    def fake_save_best_checkpoint_video(_policy, _best_state_dict, args):
+        """Capture the resolved best-checkpoint path used near the end of training."""
+
+        best_video_output_paths.append(Path(str(args.best_checkpoint_video_output)))
+        return None
+
+    with patch.object(train_pufferl, "load_env_file", return_value=None), patch.object(
         train_pufferl, "resolve_device", return_value="cpu"
     ), patch.object(
         train_pufferl, "resolve_training_vec_config", return_value=(vec_config, None)
     ), patch.object(
         train_pufferl, "make_soccer_vecenv", return_value=FakeVecEnv()
     ), patch.object(
-        train_pufferl, "build_train_config", side_effect=fake_build_train_config
+        train_pufferl,
+        "build_phase_train_config",
+        side_effect=lambda _args, _vecenv, _device, **_kwargs: fake_build_train_config(
+            _args, _vecenv, _device
+        ),
     ), patch.object(
         train_pufferl, "Policy", return_value=fake_policy
     ), patch.object(
@@ -624,7 +870,9 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         "evaluate_against_past_iterate",
         side_effect=fake_eval_against_past_iterate,
     ), patch.object(
-        train_pufferl, "save_self_play_video", return_value=tmp_path / "self_play.mp4"
+        train_pufferl,
+        "save_self_play_video",
+        side_effect=fake_save_self_play_video,
     ), patch.object(
         train_pufferl, "log_video_artifact", side_effect=fake_log_video_artifact
     ), patch.object(
@@ -634,13 +882,24 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         "register_best_checkpoint",
         return_value={"artifact_ref": "entity/project/model:best"},
     ), patch.object(
-        train_pufferl, "save_best_checkpoint_video", return_value=None
+        train_pufferl,
+        "save_best_checkpoint_video",
+        side_effect=fake_save_best_checkpoint_video,
     ), patch.object(
         train_pufferl,
         "maybe_write_run_summary",
         side_effect=fake_maybe_write_run_summary,
+    ), patch.object(
+        train_pufferl,
+        "build_run_video_tag",
+        return_value="2026-03-22_10-28-13_run-123",
     ):
-        train_pufferl.main()
+        with patch.object(
+            sys,
+            "argv",
+            ["train_pufferl.py", "--no-opponent-phase-max-iterations", "0"],
+        ):
+            train_pufferl.main()
 
     expected_epochs = list(range(5, 101, 5))
     expected_eval_calls = [(epoch, epoch - 5) for epoch in expected_epochs]
@@ -650,6 +909,12 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
 
     assert eval_calls == expected_eval_calls
     assert video_calls == expected_video_calls
+    assert video_output_paths == [
+        Path("experiments/2026-03-22_10-28-13_run-123/video/self_play.mp4")
+    ] * len(expected_epochs)
+    assert best_video_output_paths == [
+        Path("experiments/2026-03-22_10-28-13_run-123/video/best_checkpoint.mp4")
+    ]
     assert run_summaries[0]["past_iterate_eval_interval_epochs"] == 5
     assert (
         run_summaries[0]["effective_hyperparameters"]["past_iterate_eval_fractions"]
