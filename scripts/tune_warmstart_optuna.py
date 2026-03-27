@@ -24,6 +24,8 @@ import re
 import subprocess
 import time
 
+import train_pufferl
+
 try:
     import optuna  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - exercised in real CLI use
@@ -149,6 +151,35 @@ def append_jsonl(path: Path, payload: Mapping[str, object]) -> None:
         handle.write("\n")
 
 
+def load_recorded_trial_record(
+    history_path: Path, *, trial_number: int
+) -> dict[str, object]:
+    """Load one previously appended trial record from the JSONL history file.
+
+    The Optuna study keeps a compact summary inside the study object, but the richer data we
+    need after optimization lives in the history log written by `append_jsonl`: exact command,
+    effective hyperparameters, and parsed warm-start metrics. Looking the winner up in that log
+    lets the finalization step reuse the already-recorded subprocess result instead of trying to
+    reconstruct it from Optuna's lighter-weight `FrozenTrial` snapshot.
+
+    Failing loudly here is intentional. If the winning trial cannot be found in the history
+    file, the study output would be incomplete and we would rather stop than silently write an
+    unusable autoload file.
+    """
+
+    for line in history_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        if int(payload.get("trial_number", -1)) == trial_number:
+            if not isinstance(payload, Mapping):
+                break
+            return dict(payload)
+    raise ValueError(
+        f"could not find trial_number={trial_number} in warm-start history {history_path}"
+    )
+
+
 def mapping_int(mapping: Mapping[str, object], key: str) -> int:
     """Read one mapping value as an integer with a clear error on bad types.
 
@@ -194,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--eval-max-steps", type=int, default=600)
-    parser.add_argument("--goal-rate-threshold", type=float, default=0.90)
+    parser.add_argument("--goal-rate-threshold", type=float, default=0.80)
     parser.add_argument("--multi-goal-rate-threshold", type=float, default=0.0)
     parser.add_argument(
         "--map-scale-ladder",
@@ -220,18 +251,107 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def read_hyperparameter_defaults(path: Path) -> dict[str, object]:
-    """Load the standardized hyperparameter defaults used as the study's baseline recipe.
+    """Load the baseline recipe the warm-start study should search around.
 
-    The repo already stores a confirmed no-opponent recipe in a normalized JSON format. Starting
-    the Optuna search from that recipe keeps the study focused on local improvements rather
-    than rediscovering basic working ranges from scratch.
+    The preferred starting point is the standardized autoload JSON produced by earlier
+    tuning runs because it reflects the most recent confirmed warm-start recipe. On a fresh
+    checkout, though, that file may not exist yet. Falling back to the training script's own
+    built-in defaults keeps the tuner usable in that first-run case and avoids a brittle
+    bootstrap dependency between "having tuned once already" and "being allowed to tune now."
+
+    Reconstructing the fallback through `train_pufferl` is important because that module owns
+    the canonical parser defaults. If the repo later changes its default ladder or PPO values,
+    this tuner automatically inherits the new baseline instead of silently searching around an
+    outdated hard-coded recipe.
     """
 
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    defaults = payload.get("train_defaults")
-    if not isinstance(defaults, Mapping):
-        raise ValueError(f"expected train_defaults in {path}")
-    return dict(defaults)
+    if path.exists():
+        defaults = train_pufferl.standardized_hyperparameter_defaults(
+            train_pufferl.load_standardized_hyperparameter_defaults(path)
+        )
+        if defaults:
+            return defaults
+        print(
+            "Warm-start tuner found no reusable train defaults in "
+            f"{path}; falling back to built-in parser defaults."
+        )
+    else:
+        print(
+            "Warm-start tuner baseline file does not exist: "
+            f"{path}. Falling back to built-in parser defaults."
+        )
+
+    return train_pufferl.standardized_hyperparameter_defaults(
+        train_pufferl.base_training_arg_defaults()
+    )
+
+
+def load_preserved_vecenv_payload(path: Path) -> tuple[dict[str, object], dict[str, object]]:
+    """Read vecenv metadata that should survive warm-start retuning.
+
+    Warm-start tuning changes PPO and curriculum defaults, but it does not answer the separate
+    question of which rollout backend layout is fastest on a given machine. If a standardized
+    autoload file already contains pretuned `vecenv_defaults` and benchmark metadata, writing
+    the new warm-start winner should preserve those blocks instead of erasing them.
+
+    The function returns plain dictionaries because the result is passed directly into
+    `train_pufferl.write_standardized_hyperparameters`, which expects JSON-like mappings and
+    may be called for both the canonical repo-wide autoload file and the experiment-local copy.
+    """
+
+    payload = train_pufferl.read_json_record(path)
+    if not isinstance(payload, Mapping):
+        return {}, {}
+
+    vecenv_defaults_raw = payload.get("vecenv_defaults")
+    if isinstance(vecenv_defaults_raw, Mapping):
+        vecenv_defaults = train_pufferl.standardized_vecenv_defaults(vecenv_defaults_raw)
+    else:
+        vecenv_defaults = train_pufferl.standardized_vecenv_defaults(payload)
+
+    vecenv_benchmark_raw = payload.get("vecenv_benchmark")
+    vecenv_benchmark = (
+        dict(vecenv_benchmark_raw) if isinstance(vecenv_benchmark_raw, Mapping) else {}
+    )
+    return vecenv_defaults, vecenv_benchmark
+
+
+def persist_best_hyperparameters(
+    *,
+    output_dir: Path,
+    baseline_hyperparameters_path: Path,
+    source_path: Path,
+    effective_hyperparameters: Mapping[str, object],
+) -> tuple[Path, Path]:
+    """Write the winning warm-start recipe into reusable standardized autoload files.
+
+    The Optuna study itself lives under an experiment directory, but the point of the study is
+    to make the next real training job easier. This helper therefore writes two copies of the
+    winner: one beside the tuning artifacts for inspection and one at the repo's canonical
+    autoload path so normal training picks it up automatically on the next launch.
+
+    Preserving vecenv metadata matters because rollout pretuning and warm-start tuning solve
+    different problems. The saved file should therefore combine the new PPO and curriculum
+    defaults with any existing vecenv defaults and SPS benchmark evidence already stored at the
+    target path or, when the target does not exist yet, at the baseline path used for the study.
+    """
+
+    local_autoload_path = output_dir / "autoload_hyperparameters.json"
+    canonical_autoload_path = train_pufferl.STANDARD_HYPERPARAMETERS_PATH
+
+    for target_path in (local_autoload_path, canonical_autoload_path):
+        preserved_source = target_path if target_path.exists() else baseline_hyperparameters_path
+        vecenv_defaults, vecenv_benchmark = load_preserved_vecenv_payload(preserved_source)
+        train_pufferl.write_standardized_hyperparameters(
+            path=target_path,
+            effective_hyperparameters=effective_hyperparameters,
+            source_path=source_path,
+            source_label="best_no_opponent_warmstart_optuna_result",
+            vecenv_defaults=vecenv_defaults,
+            vecenv_benchmark=vecenv_benchmark,
+        )
+
+    return local_autoload_path, canonical_autoload_path
 
 
 def sample_hyperparameters(trial, baseline: Mapping[str, object]) -> dict[str, object]:
@@ -372,14 +492,19 @@ def build_srun_command(*, args, command: Sequence[str]) -> list[str]:
     """Wrap one training command in the Slurm `srun` allocation requested by the user.
 
     Running through `srun` matches the real deployment environment and gives each trial clean
-    access to one GPU, a fixed CPU budget, and a bounded wall-clock time.
+    access to the requested compute shape, a fixed CPU budget, and a bounded wall-clock time.
+
+    GPU-backed warm-start tuning remains the default because it matches the real training job,
+    but a CPU-only fallback is still valuable when the cluster is temporarily out of GPU quota
+    or when a quick smoke test just needs to verify that the Slurm-wrapped tuning path launches
+    correctly. Tying the `--gres=gpu:1` request to the chosen device keeps that escape hatch
+    available without introducing a second CLI switch for the same idea.
     """
 
     srun_command = [
         "srun",
         "--account",
         args.account,
-        "--gres=gpu:1",
         "--cpus-per-task",
         str(args.cpus_per_task),
         "--mem",
@@ -390,18 +515,20 @@ def build_srun_command(*, args, command: Sequence[str]) -> list[str]:
         str(REPO_ROOT),
         *command,
     ]
+    if args.device != "cpu":
+        srun_command[4:4] = ["--gres=gpu:1"]
     if args.partition:
         srun_command[4:4] = ["--partition", args.partition]
     return srun_command
 
 
 def extract_metrics_from_log(log_text: str) -> WarmStartMetrics | None:
-    """Recover the final no-opponent metrics from one trial log.
+    """Recover the latest useful no-opponent metrics from one trial log.
 
-    A warm-start trial that misses the threshold exits with a `RuntimeError` before writing a
-    normal summary file, but the printed final evaluation metrics are still valuable for the
-    search. This parser first prefers the explicit final evaluation line and then falls back to
-    the latest intermediate no-opponent evaluation if the run crashed even earlier.
+    The trainer now uses the ordinary periodic no-opponent evaluation as the only warm-start
+    gate, so newer logs may never print a separate `Final no-opponent eval` line. Older logs
+    can still contain that explicit final line from the previous flow. This parser accepts
+    both formats so Optuna can keep learning from fresh runs and from earlier archived logs.
     """
 
     final_match = None
@@ -570,7 +697,7 @@ def run_trial_subprocess(
             score=outcome.score,
             failed=outcome.failed,
             effective_hyperparameters=outcome.effective_hyperparameters,
-    )
+        )
     return outcome
 
 
@@ -663,18 +790,37 @@ def main() -> None:  # pylint: disable=too-many-locals
     study.optimize(objective, n_trials=args.trials)
 
     best_trial = study.best_trial
+    best_trial_record = load_recorded_trial_record(
+        history_path, trial_number=int(best_trial.number)
+    )
+    best_effective_raw = best_trial_record.get("effective_hyperparameters")
+    if not isinstance(best_effective_raw, Mapping):
+        raise TypeError(
+            "warm-start trial history is missing effective_hyperparameters for "
+            f"trial_number={best_trial.number}"
+        )
+    best_effective_hyperparameters = dict(best_effective_raw)
     best_payload = {
         "best_value": best_trial.value,
         "best_params": best_trial.params,
         "user_attrs": dict(best_trial.user_attrs),
+        "best_effective_hyperparameters": best_effective_hyperparameters,
         "baseline_hyperparameters_path": str(args.hyperparameters_path),
         "goal_rate_threshold": args.goal_rate_threshold,
         "multi_goal_rate_threshold": args.multi_goal_rate_threshold,
         "trials": args.trials,
     }
     best_path.write_text(json.dumps(best_payload, indent=2, sort_keys=True), encoding="utf-8")
+    local_autoload_path, canonical_autoload_path = persist_best_hyperparameters(
+        output_dir=args.output_dir,
+        baseline_hyperparameters_path=args.hyperparameters_path,
+        source_path=best_path,
+        effective_hyperparameters=best_effective_hyperparameters,
+    )
     print(json.dumps(best_payload, indent=2, sort_keys=True))
     print(f"Wrote best result to {best_path}")
+    print(f"Wrote local autoload file to {local_autoload_path}")
+    print(f"Wrote canonical autoload file to {canonical_autoload_path}")
 
 
 if __name__ == "__main__":

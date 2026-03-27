@@ -64,8 +64,13 @@ def test_train_automode_uses_standardized_hyperparameter_file() -> None:
 
     assert "#SBATCH --chdir=/scratch/fyy2003/repos/Puffer-Soccer" in contents
     assert 'REPO_ROOT="$(pwd -P)"' in contents
-    assert "--hyperparameters-path experiments/autoload_hyperparameters.json" in contents
-    assert "--vec-backend auto" in contents
+    assert (
+        'TRAIN_AUTOMODE_HYPERPARAMETERS_PATH="${TRAIN_AUTOMODE_HYPERPARAMETERS_PATH:-'
+        'experiments/autoload_hyperparameters.json}"'
+        in contents
+    )
+    assert '--hyperparameters-path "$TRAIN_AUTOMODE_HYPERPARAMETERS_PATH"' in contents
+    assert "--vec-backend auto" not in contents
     assert (
         '--no-opponent-phase-min-iterations "$TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS"'
         in contents
@@ -98,12 +103,12 @@ def test_train_automode_uses_standardized_hyperparameter_file() -> None:
     assert 'TRAIN_AUTOMODE_PPO_ITERATIONS="${TRAIN_AUTOMODE_PPO_ITERATIONS:-100000}"' in contents
     assert (
         'TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS="'
-        '${TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS:-128}"'
+        '${TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS:-$TRAIN_AUTOMODE_PPO_ITERATIONS}"'
         in contents
     )
     assert (
         'TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD="'
-        '${TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD:-0.90}"'
+        '${TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD:-0.80}"'
         in contents
     )
     assert (

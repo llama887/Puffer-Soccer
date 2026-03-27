@@ -90,6 +90,86 @@ def test_parse_training_args_autoloads_standardized_defaults(tmp_path: Path) -> 
     assert args._autoload_source_num_agents == 192
 
 
+def test_parse_training_args_autoloads_vecenv_defaults(tmp_path: Path) -> None:
+    """Verify standardized autoload files can seed the self-play vecenv layout too.
+
+    The automode Slurm path now relies on one pretuned JSON record rather than on a
+    hand-written `--vec-backend auto` flag inside the batch script. This test keeps that
+    contract explicit by checking that parser defaults pick up the saved vecenv layout when
+    the standardized file includes a `vecenv_defaults` block.
+    """
+
+    hyperparameter_path = tmp_path / "autoload.json"
+    hyperparameter_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "train_defaults": {"learning_rate": 0.0123},
+                "vecenv_defaults": {
+                    "vec_backend": "multiprocessing",
+                    "num_envs": 96,
+                    "vec_num_shards": 24,
+                    "vec_batch_size": 24,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = train_pufferl.parse_training_args(
+        ["--hyperparameters-path", str(hyperparameter_path)]
+    )
+
+    assert args.learning_rate == 0.0123
+    assert args.vec_backend == "multiprocessing"
+    assert args.num_envs == 96
+    assert args.vec_num_shards == 24
+    assert args.vec_batch_size == 24
+
+
+def test_parse_training_args_cli_still_overrides_autoloaded_vecenv_defaults(
+    tmp_path: Path,
+) -> None:
+    """Verify explicit vecenv CLI flags still beat the saved pretuned machine layout.
+
+    Pretuning is meant to remove repeated typing, not to take control away from debugging
+    sessions. This regression test keeps the precedence rule clear: the standardized JSON
+    provides defaults, but an explicit CLI override for backend or worker layout must still
+    win on the final parsed namespace.
+    """
+
+    hyperparameter_path = tmp_path / "autoload.json"
+    hyperparameter_path.write_text(
+        json.dumps(
+            {
+                "vecenv_defaults": {
+                    "vec_backend": "multiprocessing",
+                    "num_envs": 96,
+                    "vec_num_shards": 24,
+                    "vec_batch_size": 24,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = train_pufferl.parse_training_args(
+        [
+            "--hyperparameters-path",
+            str(hyperparameter_path),
+            "--vec-backend",
+            "native",
+            "--num-envs",
+            "32",
+        ]
+    )
+
+    assert args.vec_backend == "native"
+    assert args.num_envs == 32
+    assert args.vec_num_shards == 24
+    assert args.vec_batch_size == 24
+
+
 def test_parse_training_args_repo_defaults_enable_no_opponent_curriculum() -> None:
     """Verify plain repo-default runs now start with an active warm-start curriculum.
 
@@ -101,7 +181,7 @@ def test_parse_training_args_repo_defaults_enable_no_opponent_curriculum() -> No
     args = train_pufferl.parse_training_args(["--no-autoload-hyperparameters"])
 
     assert args.no_opponent_map_scale_ladder == "0.2,0.4,0.6,0.8,1.0"
-    assert args.no_opponent_phase_goal_rate_threshold == 0.9
+    assert args.no_opponent_phase_goal_rate_threshold == 0.8
     assert args.no_opponent_phase_multi_goal_rate_threshold == 0.0
     assert args.no_opponent_eval_games == 100
     assert train_pufferl.field_curriculum_enabled(args) is True

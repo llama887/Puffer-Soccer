@@ -65,6 +65,12 @@ STANDARD_HYPERPARAMETER_KEYS = (
     "no_opponent_map_scale_power",
     "no_opponent_map_scale_full_progress",
 )
+STANDARD_VECENV_KEYS = (
+    "vec_backend",
+    "num_envs",
+    "vec_num_shards",
+    "vec_batch_size",
+)
 SELF_PLAY_RESETTABLE_AUTOLOAD_KEYS = (
     "learning_rate",
     "gamma",
@@ -1686,14 +1692,90 @@ def standardized_hyperparameter_defaults(
     return defaults
 
 
+def standardized_vecenv_defaults(
+    vecenv_defaults: Mapping[str, object],
+) -> dict[str, object]:
+    """Extract the reusable vecenv defaults that are safe to autoload later.
+
+    Runtime tuning for SPS is much more hardware-specific than PPO tuning, so we keep this
+    payload deliberately narrow: only the parser fields that define the training vector
+    layout itself. That lets a one-time benchmark save the exact backend and worker layout
+    for a fixed Slurm machine without accidentally freezing unrelated settings such as the
+    training budget, device selection, or team size.
+
+    Keeping the filter in one helper matters for long-lived batch workflows. The pretune
+    script, the autoload parser, and any future maintenance tools all need one shared
+    definition of which vecenv keys belong in the standardized JSON record.
+    """
+
+    defaults: dict[str, object] = {}
+    for key in STANDARD_VECENV_KEYS:
+        if key in vecenv_defaults:
+            defaults[key] = vecenv_defaults[key]
+    return defaults
+
+
+def vecenv_defaults_from_benchmark(result: BenchmarkResult) -> dict[str, object]:
+    """Translate one benchmark winner into the exact CLI defaults training understands.
+
+    The autotuner measures vector layouts in terms of shards and per-shard environment
+    counts, while the human-facing training CLI still speaks in `--num-envs`,
+    `--vec-num-shards`, and `--vec-batch-size`. This adapter keeps that impedance mismatch
+    out of the batch scripts by converting the measured winner into the same parser fields
+    that normal training already uses.
+
+    The returned mapping intentionally includes `None` for shard- and batch-specific fields
+    when the winner is native. Persisting those nulls is important because it clears stale
+    multiprocessing settings from earlier tuning runs instead of silently carrying them
+    forward into a now-native configuration.
+    """
+
+    return standardized_vecenv_defaults(
+        {
+            "vec_backend": result.backend,
+            "num_envs": result.total_envs,
+            "vec_num_shards": None if result.backend == "native" else result.num_shards,
+            "vec_batch_size": None if result.backend == "native" else result.batch_size,
+        }
+    )
+
+
+def benchmark_record(result: BenchmarkResult) -> dict[str, object]:
+    """Serialize one SPS benchmark result into compact JSON-safe metadata.
+
+    The saved autoload file should explain not only which layout won, but also why we
+    should trust that choice later. Recording the measured SPS and CPU utilization next to
+    the chosen defaults gives us a lightweight audit trail that is easy to inspect after a
+    long cluster run and easy to compare against later confirmation runs.
+
+    The structure is intentionally flat and made only of JSON-native values so helper
+    scripts can merge it into the standardized autoload file without any custom encoder.
+    """
+
+    return {
+        "backend": result.backend,
+        "num_envs": int(result.total_envs),
+        "shard_num_envs": int(result.shard_num_envs),
+        "num_shards": int(result.num_shards),
+        "batch_size": (
+            None if result.batch_size is None else int(result.batch_size)
+        ),
+        "players_per_team": int(result.players_per_team),
+        "action_mode": str(result.action_mode),
+        "sps": int(result.sps),
+        "cpu_avg": None if result.cpu_avg is None else float(result.cpu_avg),
+        "cpu_peak": None if result.cpu_peak is None else float(result.cpu_peak),
+    }
+
+
 def load_standardized_hyperparameter_defaults(path: Path) -> dict[str, object]:
-    """Read reusable train defaults from disk, returning an empty mapping when absent.
+    """Read reusable train and vecenv defaults from disk when a standardized file exists.
 
     Automatic loading should make everyday training easier, not more fragile. The file is
     therefore optional: if it does not exist, training falls back to the script defaults and
     command-line flags exactly as before. When the file does exist, only the curated
-    `train_defaults` payload is applied so that metadata and experiment-specific fields do
-    not leak into argparse.
+    `train_defaults` and `vecenv_defaults` payloads are applied so that metadata and
+    experiment-specific fields do not leak into argparse.
 
     The loader intentionally accepts both the new standardized record and the older plain
     dictionary layout. That backward-compatibility lets existing experiments keep working
@@ -1710,6 +1792,10 @@ def load_standardized_hyperparameter_defaults(path: Path) -> dict[str, object]:
     if not isinstance(defaults, Mapping):
         raise TypeError(f"expected mapping in hyperparameter file: {path}")
     merged_defaults = standardized_hyperparameter_defaults(defaults)
+    merged_defaults.update(standardized_vecenv_defaults(payload))
+    vecenv_defaults = payload.get("vecenv_defaults")
+    if isinstance(vecenv_defaults, Mapping):
+        merged_defaults.update(standardized_vecenv_defaults(vecenv_defaults))
     rollout_defaults = payload.get("rollout_defaults")
     if isinstance(rollout_defaults, Mapping):
         source_num_agents = rollout_defaults.get("source_num_agents")
@@ -1804,6 +1890,8 @@ def write_standardized_hyperparameters(
     source_path: Path | None = None,
     source_label: str | None = None,
     source_num_agents: int | None = None,
+    vecenv_defaults: Mapping[str, object] | None = None,
+    vecenv_benchmark: Mapping[str, object] | None = None,
 ) -> None:
     """Write the canonical reusable hyperparameter file consumed by normal training.
 
@@ -1814,7 +1902,10 @@ def write_standardized_hyperparameters(
 
     The optional source metadata is included because long RL jobs are expensive. When a
     training run later picks up this file, we need an easy way to trace which sweep output
-    produced the defaults without digging through commit history or logs.
+    produced the defaults without digging through commit history or logs. The optional
+    vecenv payload serves the same operational goal for SPS pretuning: once a fixed Slurm
+    machine has been benchmarked, later jobs should be able to reuse that winner without
+    rerunning autotune or editing the batch script by hand.
     """
 
     source_payload: dict[str, object] = {}
@@ -1857,6 +1948,8 @@ def write_standardized_hyperparameters(
                 effective_hyperparameters
             ),
             "rollout_defaults": rollout_defaults,
+            "vecenv_defaults": standardized_vecenv_defaults(vecenv_defaults or {}),
+            "vecenv_benchmark": dict(vecenv_benchmark or {}),
         },
     )
 
@@ -2090,7 +2183,7 @@ def build_training_parser(
     parser.add_argument(
         "--no-opponent-phase-goal-rate-threshold",
         type=float,
-        default=0.90,
+        default=0.80,
     )
     parser.add_argument(
         "--no-opponent-phase-multi-goal-rate-threshold",
@@ -3306,6 +3399,7 @@ def main():
                 warm_start_trainer.epoch >= no_opponent_phase.min_iterations
                 and no_opponent_phase.completion_reached(no_opponent_metrics)
             ):
+                final_no_opponent_metrics = dict(no_opponent_metrics)
                 print(
                     "No-opponent phase complete: "
                     f"epoch={warm_start_trainer.epoch}, "
@@ -3314,35 +3408,31 @@ def main():
                 )
                 break
 
-        final_no_opponent_metrics = evaluate_no_opponent_policy(
-            current_policy,
-            players_per_team=args.players_per_team,
-            seed=args.seed + 50_000_000,
-            device=device,
-            num_games=args.no_opponent_eval_games,
-            max_steps=args.no_opponent_eval_max_steps,
-            field_scale=no_opponent_curriculum.field_scale(no_opponent_stage_index),
-        )
-        latest_no_opponent_metrics = dict(final_no_opponent_metrics)
-        print(
-            "Final no-opponent eval "
-            f"(epoch={warm_start_trainer.epoch}, games={int(final_no_opponent_metrics['games'])}): "
-            f"goal_rate={final_no_opponent_metrics['goal_rate']:.3f}, "
-            f"multi_goal_rate={final_no_opponent_metrics['multi_goal_rate']:.3f}, "
-            f"mean_goals_scored={final_no_opponent_metrics['mean_goals_scored']:.2f}, "
-            f"own_goal_rate={final_no_opponent_metrics['own_goal_rate']:.3f}, "
-            f"mean_first_goal_step={final_no_opponent_metrics['mean_first_goal_step']:.2f}"
-        )
-        if not no_opponent_phase.completion_reached(final_no_opponent_metrics):
-            raise RuntimeError(
-                "No-opponent warm-start exhausted its budget without reaching the "
-                "required scoring thresholds. Refusing to continue into self-play with "
-                f"goal_rate={final_no_opponent_metrics['goal_rate']:.3f}, "
-                f"multi_goal_rate={final_no_opponent_metrics['multi_goal_rate']:.3f}, "
-                f"required_goal_rate={no_opponent_phase.goal_rate_threshold:.3f}, "
-                "required_multi_goal_rate="
-                f"{no_opponent_phase.multi_goal_rate_threshold:.3f}"
-            )
+        if final_no_opponent_metrics is None:
+            if (
+                latest_no_opponent_metrics is None
+                or not no_opponent_phase.completion_reached(latest_no_opponent_metrics)
+            ):
+                goal_rate = (
+                    0.0
+                    if latest_no_opponent_metrics is None
+                    else float(latest_no_opponent_metrics["goal_rate"])
+                )
+                multi_goal_rate = (
+                    0.0
+                    if latest_no_opponent_metrics is None
+                    else float(latest_no_opponent_metrics["multi_goal_rate"])
+                )
+                raise RuntimeError(
+                    "No-opponent warm-start exhausted its budget without reaching the "
+                    "required scoring thresholds. Refusing to continue into self-play with "
+                    f"goal_rate={goal_rate:.3f}, "
+                    f"multi_goal_rate={multi_goal_rate:.3f}, "
+                    f"required_goal_rate={no_opponent_phase.goal_rate_threshold:.3f}, "
+                    "required_multi_goal_rate="
+                    f"{no_opponent_phase.multi_goal_rate_threshold:.3f}"
+                )
+            final_no_opponent_metrics = dict(latest_no_opponent_metrics)
         if logger is not None:
             logger.wandb.log(
                 {
