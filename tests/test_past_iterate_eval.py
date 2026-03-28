@@ -8,6 +8,7 @@ from unittest.mock import patch
 from typing import TYPE_CHECKING
 
 import numpy as np
+from puffer_soccer import policy_bundle
 from puffer_soccer.envs.marl2d import make_puffer_env
 from puffer_soccer.torch_loader import import_torch
 from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv
@@ -381,6 +382,53 @@ def test_load_best_checkpoint_state_falls_back_to_cached_path(tmp_path):
     env.close()
 
 
+def test_policy_bundle_export_and_load_round_trip(tmp_path):
+    """Verify bundle export writes the expected files and reloads a runnable module.
+
+    The self-contained baseline flow depends on the exported TorchScript module being usable
+    without reconstructing the live repo policy class. This test therefore exports a tiny
+    stand-in policy, checks the expected bundle files, and then confirms the loaded module can
+    still run an eval forward pass that preserves output shapes.
+    """
+
+    class TinyPolicy(torch.nn.Module):
+        """Minimal stand-in policy with the same two-tensor output contract as training."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.net = torch.nn.Linear(4, 3)
+            self.value = torch.nn.Linear(4, 1)
+
+        def forward(self, observations):
+            return self.net(observations), self.value(observations)
+
+    policy = TinyPolicy()
+    bundle_dir = tmp_path / "bundle"
+    export_result = policy_bundle.export_policy_bundle(
+        policy=policy,
+        checkpoint_state=policy.state_dict(),
+        bundle_dir=bundle_dir,
+        example_observation=torch.zeros((1, 4), dtype=torch.float32),
+        metadata={"run_id": "tiny", "epoch": 3},
+    )
+
+    assert Path(export_result["bundle_dir"]) == bundle_dir
+    assert (bundle_dir / "policy_module.pt").exists()
+    assert (bundle_dir / "checkpoint_state.pt").exists()
+    assert (bundle_dir / "manifest.json").exists()
+    assert (bundle_dir / "source_snapshot" / "policy_runner.py").exists()
+
+    loaded_module, manifest = policy_bundle.load_policy_module_from_bundle(
+        bundle_dir,
+        device="cpu",
+    )
+    logits, values = loaded_module(torch.zeros((2, 4), dtype=torch.float32))
+    assert logits.shape == (2, 3)
+    assert values.shape == (2, 1)
+    assert manifest["run_id"] == "tiny"
+    assert manifest["schema_version"] == policy_bundle.BUNDLE_SCHEMA_VERSION
+
+
 class DummyArtifact:
     def __init__(self, name, *, type, metadata):
         self.name = name
@@ -468,9 +516,61 @@ def test_register_best_checkpoint_updates_pointer_and_history(tmp_path):
     history_record = json.loads(history_path.read_text().strip())
     assert history_record["promotion_win_rate_vs_previous_best"] == 0.75
     assert history_record["previous_best_artifact_ref"] == "entity/project/older:best"
+    assert record["bundle_dir"] is None
+    assert history_record["bundle_dir"] is None
     logged_artifact, aliases = logger.wandb.run.logged_artifacts[0]
     assert logged_artifact.files == [(str(checkpoint_path), "model.pt")]
     assert aliases == ["best", "epoch-000007"]
+
+
+def test_register_best_checkpoint_exports_bundle_metadata_when_policy_is_provided(tmp_path):
+    """Verify best-checkpoint registration writes both pointer and bundle metadata.
+
+    The new saved-best flow extends the old pointer record instead of replacing it. This test
+    keeps that contract explicit by checking that registration still writes the checkpoint
+    metadata while also attaching the canonical current-best bundle paths and an immutable
+    archive path in the history record.
+    """
+
+    env = make_soccer_vecenv(
+        players_per_team=1,
+        action_mode="discrete",
+        game_length=4,
+        render_mode=None,
+        seed=0,
+        vec=VecEnvConfig(backend="native", shard_num_envs=1, num_shards=1),
+    )
+    checkpoint_path = tmp_path / "model.pt"
+    checkpoint_path.write_bytes(b"weights")
+    config_path = tmp_path / "best_checkpoint.json"
+    history_path = tmp_path / "best_checkpoint_history.jsonl"
+    logger = DummyLogger()
+    policy = train_pufferl.Policy(env)
+
+    record = train_pufferl.register_best_checkpoint(
+        logger=logger,
+        checkpoint_path=checkpoint_path,
+        best_config_path=config_path,
+        best_history_path=history_path,
+        previous_best=None,
+        vec_config=VecEnvConfig(backend="native", shard_num_envs=1, num_shards=1),
+        run_id="run-123",
+        epoch=11,
+        global_step=4321,
+        event="bootstrap",
+        promotion_metrics=None,
+        policy=policy,
+        observation_shape=tuple(env.single_observation_space.shape),
+        bundle_metadata={"run_id": "run-123", "epoch": 11},
+    )
+
+    history_record = json.loads(history_path.read_text(encoding="utf-8").strip())
+    assert Path(str(record["bundle_dir"])).name == "current_best"
+    assert Path(str(record["bundle_manifest_path"])).exists()
+    assert Path(str(record["bundle_policy_module_path"])).exists()
+    assert "archive" in str(history_record["bundle_dir"])
+    assert history_record["bundle_dir"] != record["bundle_dir"]
+    env.close()
 
 
 def test_log_periodic_self_play_video_logs_shared_cadence_metadata(tmp_path):
@@ -720,6 +820,7 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         """Small vector-env stub that only exposes the agent count used by setup."""
 
         num_agents = 2
+        single_observation_space = SimpleNamespace(shape=(4,))
 
     class FakeTrainer:
         """Tiny trainer stub that advances epochs and global steps deterministically."""
@@ -920,3 +1021,152 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         run_summaries[0]["effective_hyperparameters"]["past_iterate_eval_fractions"]
         == 20
     )
+
+
+def test_main_does_not_promote_mid_run_before_final_check(tmp_path):
+    """Verify periodic eval logs best-checkpoint metrics without replacing the pointer.
+
+    The new workflow should still measure progress throughout training, but it should defer
+    replacing the canonical best baseline until the final promotion check. This regression test
+    keeps that boundary explicit by ensuring the periodic loop never calls the registration
+    helper even when the lightweight best-checkpoint eval looks strong.
+    """
+
+    class FakePolicy:
+        def __init__(self):
+            self.version = 0
+            self.training = True
+            self._param = torch.nn.Parameter(torch.tensor([0.0]))
+
+        def to(self, _device):
+            return self
+
+        def parameters(self):
+            yield self._param
+
+        def state_dict(self):
+            return {"weight": torch.tensor([float(self.version)])}
+
+        def train(self):
+            self.training = True
+            return self
+
+        def eval(self):
+            self.training = False
+            return self
+
+    class FakeVecEnv:
+        num_agents = 2
+        single_observation_space = SimpleNamespace(shape=(4,))
+
+    class FakeTrainer:
+        def __init__(self, _config, _vecenv, policy, **_kwargs):
+            self.policy = policy
+            self.epoch = 0
+            self.total_epochs = 10
+            self.global_step = 0
+            self.start_time = 0.0
+
+        def evaluate(self):
+            return None
+
+        def train(self):
+            self.epoch += 1
+            self.policy.version = self.epoch
+            self.global_step = self.epoch * 100
+
+        def print_dashboard(self):
+            return None
+
+        def close(self):
+            model_path = tmp_path / "final_model.pt"
+            model_path.write_bytes(b"weights")
+            return str(model_path)
+
+    class FakeEvaluator:
+        def __init__(self, *_args, **_kwargs):
+            self.num_envs = 4
+
+        def evaluate(self, *_args, **_kwargs):
+            return {"games": 16.0, "win_rate": 0.75, "score_diff": 1.0}
+
+        def run_games(self, *_args, **_kwargs):
+            return [1.0] * 4, [1.0] * 4
+
+        def close(self):
+            return None
+
+    fake_policy = FakePolicy()
+    vec_config = VecEnvConfig(backend="native", shard_num_envs=4, num_shards=1)
+    register_calls: list[dict[str, object]] = []
+
+    def fake_register_best_checkpoint(**kwargs):
+        register_calls.append(dict(kwargs))
+        return {"artifact_ref": "entity/project/model:best", "bundle_dir": "bundle"}
+
+    with patch.object(train_pufferl, "load_env_file", return_value=None), patch.object(
+        train_pufferl, "resolve_device", return_value="cpu"
+    ), patch.object(
+        train_pufferl, "resolve_training_vec_config", return_value=(vec_config, None)
+    ), patch.object(
+        train_pufferl, "make_soccer_vecenv", return_value=FakeVecEnv()
+    ), patch.object(
+        train_pufferl,
+        "build_phase_train_config",
+        return_value={
+            "batch_size": 128,
+            "bptt_horizon": 64,
+            "minibatch_size": 64,
+            "total_timesteps": 1280,
+            "learning_rate": 3e-4,
+            "update_epochs": 2,
+            "ent_coef": 0.0,
+            "gamma": 0.995,
+            "gae_lambda": 0.9,
+            "clip_coef": 0.2,
+            "vf_coef": 2.0,
+            "vf_clip_coef": 0.2,
+            "max_grad_norm": 1.5,
+            "prio_alpha": 0.8,
+            "prio_beta0": 0.2,
+        },
+    ), patch.object(
+        train_pufferl, "Policy", return_value=fake_policy
+    ), patch.object(
+        train_pufferl, "RegularizedPuffeRL", side_effect=FakeTrainer
+    ), patch.object(
+        train_pufferl, "HeadToHeadEvaluator", side_effect=FakeEvaluator
+    ), patch.object(
+        train_pufferl,
+        "read_json_record",
+        return_value={
+            "artifact_ref": "entity/project/old:best",
+            "cached_checkpoint_path": str(tmp_path / "old.pt"),
+        },
+    ), patch.object(
+        train_pufferl,
+        "load_best_checkpoint_state",
+        return_value=({"weight": torch.tensor([0.0])}, tmp_path / "old.pt"),
+    ), patch.object(
+        train_pufferl, "register_best_checkpoint", side_effect=fake_register_best_checkpoint
+    ), patch.object(
+        train_pufferl, "log_periodic_self_play_video", return_value=None
+    ), patch.object(
+        train_pufferl, "save_best_checkpoint_video", return_value=None
+    ):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "train_pufferl.py",
+                "--no-opponent-phase-max-iterations",
+                "0",
+                "--final-best-eval-games",
+                "16",
+                "--no-wandb",
+            ],
+        ):
+            train_pufferl.main()
+
+    assert len(register_calls) == 1
+    assert register_calls[0]["event"] == "promotion"

@@ -74,6 +74,7 @@ class _NativeEnv(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("num_players", ctypes.c_int),
         ("game_length", ctypes.c_int),
         ("num_steps", ctypes.c_int),
+        ("cumulative_episode_return", ctypes.c_float),
         ("do_team_switch", ctypes.c_int),
         ("opponents_enabled", ctypes.c_int),
         ("blue_left", ctypes.c_int),
@@ -354,6 +355,41 @@ def test_disabled_opponents_stay_inactive_and_receive_no_reward():
 
         np.testing.assert_allclose(rewards[2:], 0.0, atol=1e-6)
         assert np.all(rewards[:2] > 0.0)
+    finally:
+        env.close()
+
+
+def test_episode_return_logs_the_full_accumulated_episode_reward():
+    """Verify the terminal logger reports the stored cumulative episode return.
+
+    The dashboard metric `environment/episode_return` is supposed to represent the reward
+    accumulated over the whole episode. A previous native-logging bug ignored that running
+    total and instead logged only the reward visible on the terminal step, which erased sparse
+    rewards that happened earlier.
+
+    This regression test writes a known cumulative total into the live native env, then ends
+    the episode on the next public step. If the logger is wired correctly it must emit that
+    stored total even though the final step itself contributes zero reward.
+    """
+
+    env = make_puffer_env(players_per_team=2, action_mode="discrete")
+    actions = np.zeros((4,), dtype=np.int32)
+
+    try:
+        env.reset(seed=0)
+        native_env = _native_env(env)
+        native_env.game_length = 1
+        native_env.cumulative_episode_return = 2.0
+
+        _, rewards, terminals, _, _ = env.step(actions)
+        np.testing.assert_allclose(rewards, 0.0, atol=1e-6)
+        assert terminals.all()
+
+        log = env.flush_log()
+        assert log is not None
+        assert log["n"] == 1.0
+        assert log["episode_length"] == 1.0
+        assert log["episode_return"] == 2.0
     finally:
         env.close()
 

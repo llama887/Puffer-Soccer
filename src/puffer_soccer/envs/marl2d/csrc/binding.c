@@ -42,6 +42,7 @@ typedef struct {
     int num_players;
     int game_length;
     int num_steps;
+    float cumulative_episode_return;
     int do_team_switch;
     int opponents_enabled;
     int blue_left;
@@ -225,6 +226,7 @@ static void reset_field(Env* env) {
 
 static void full_reset(Env* env, int hard_reset_score) {
     env->num_steps = 0;
+    env->cumulative_episode_return = 0.0f;
     if (hard_reset_score) {
         env->goals_blue = 0;
         env->goals_red = 0;
@@ -532,6 +534,7 @@ static void c_reset(Env* env, int seed) {
 
 static void c_step(Env* env) {
     int np = env->num_players;
+    float step_reward_sum = 0.0f;
     clear_terminal_render_state(env);
     env->num_steps += 1;
     clear_outputs(env);
@@ -630,13 +633,15 @@ static void c_step(Env* env) {
 
     int done = (env->num_steps >= env->game_length);
     compute_observations(env, goal_scored);
+    for (int i = 0; i < np; i++) {
+        step_reward_sum += env->rewards[i];
+    }
+    env->cumulative_episode_return += step_reward_sum;
 
     if (done) {
-        float ret = 0.0f;
         int score_diff;
         for (int i = 0; i < np; i++) {
             env->terminals[i] = 1;
-            ret += env->rewards[i];
         }
         env->last_goals_blue = env->goals_blue;
         env->last_goals_red = env->goals_red;
@@ -646,7 +651,7 @@ static void c_step(Env* env) {
         if (score_diff > 0) env->log.wins_blue += 1.0f;
         else if (score_diff < 0) env->log.wins_red += 1.0f;
         else env->log.draws += 1.0f;
-        env->log.episode_return += ret;
+        env->log.episode_return += env->cumulative_episode_return;
         env->log.episode_length += env->num_steps;
         env->log.n += 1.0f;
         capture_terminal_render_state(env);

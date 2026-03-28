@@ -89,6 +89,11 @@ export TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD="${TRAIN_AUTOMODE_NO_OPPON
 export TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD="${TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD:-0.0}"
 export TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES="${TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES:-100}"
 export TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER="${TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER:-0.2,0.4,0.6,0.8,1.0}"
+export TRAIN_AUTOMODE_PRETUNE_VECENV="${TRAIN_AUTOMODE_PRETUNE_VECENV:-1}"
+export TRAIN_AUTOMODE_PRETUNE_VECENV_BACKEND="${TRAIN_AUTOMODE_PRETUNE_VECENV_BACKEND:-auto}"
+export TRAIN_AUTOMODE_PRETUNE_AUTOTUNE_SECONDS="${TRAIN_AUTOMODE_PRETUNE_AUTOTUNE_SECONDS:-1.0}"
+export TRAIN_AUTOMODE_PRETUNE_MAX_NUM_ENVS="${TRAIN_AUTOMODE_PRETUNE_MAX_NUM_ENVS:-}"
+export TRAIN_AUTOMODE_PRETUNE_MAX_NUM_SHARDS="${TRAIN_AUTOMODE_PRETUNE_MAX_NUM_SHARDS:-}"
 export TRAIN_AUTOMODE_EXTRA_ARGS="${TRAIN_AUTOMODE_EXTRA_ARGS:-}"
 
 uv sync --python /opt/python/cp312-cp312/bin/python
@@ -104,6 +109,29 @@ trap cleanup EXIT
 nice -n 19 uv run python -u sbatch/gpu_heartbeat.py &
 HEARTBEAT_PID=$!
 echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
+
+if [ "$TRAIN_AUTOMODE_PRETUNE_VECENV" = "1" ]; then
+    PRETUNE_ARGS=(
+        uv run python -u scripts/pretune_train_automode_sps.py
+        --output-path "$TRAIN_AUTOMODE_HYPERPARAMETERS_PATH"
+        --players-per-team 5
+        --vec-backend "$TRAIN_AUTOMODE_PRETUNE_VECENV_BACKEND"
+        --autotune-seconds "$TRAIN_AUTOMODE_PRETUNE_AUTOTUNE_SECONDS"
+    )
+    if [ -n "$TRAIN_AUTOMODE_PRETUNE_MAX_NUM_ENVS" ]; then
+        PRETUNE_ARGS+=(
+            --autotune-max-num-envs "$TRAIN_AUTOMODE_PRETUNE_MAX_NUM_ENVS"
+        )
+    fi
+    if [ -n "$TRAIN_AUTOMODE_PRETUNE_MAX_NUM_SHARDS" ]; then
+        PRETUNE_ARGS+=(
+            --autotune-max-num-shards "$TRAIN_AUTOMODE_PRETUNE_MAX_NUM_SHARDS"
+        )
+    fi
+
+    echo "Pretuning self-play vecenv layout before training"
+    "${PRETUNE_ARGS[@]}"
+fi
 
 uv run python -u scripts/train_pufferl.py \
     --hyperparameters-path "$TRAIN_AUTOMODE_HYPERPARAMETERS_PATH" \

@@ -22,6 +22,7 @@ import pufferlib
 import pufferlib.pufferl as pufferl
 import pufferlib.pytorch
 
+from puffer_soccer import policy_bundle
 from puffer_soccer.autotune import (
     BenchmarkResult,
     autotune_vecenv,
@@ -143,6 +144,53 @@ class Policy(torch.nn.Module):
 
     def forward_eval(self, observations, state=None):
         return self.forward(observations, state=state)
+
+
+def forward_policy_eval(
+    policy_runner: Any,
+    observations: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run eval inference against either a live policy module or a frozen bundle module.
+
+    The project now supports two opponent formats during evaluation:
+    - a live in-repo ``Policy`` object, usually loaded from a raw state dict
+    - a TorchScript module revived from a saved policy bundle
+
+    Keeping the dispatch in one helper lets evaluators and replay exporters share the same
+    compatibility layer instead of each path re-implementing slightly different assumptions
+    about how a policy object exposes its eval forward pass.
+    """
+
+    if hasattr(policy_runner, "forward_eval"):
+        output = policy_runner.forward_eval(observations)
+    else:
+        output = policy_runner(observations)
+    if not isinstance(output, tuple) or len(output) != 2:
+        raise ValueError("Expected policy runner to return a (logits, values) tuple")
+    logits, values = output
+    if not isinstance(logits, torch.Tensor) or not isinstance(values, torch.Tensor):
+        raise ValueError("Policy runner returned non-tensor outputs")
+    return logits, values
+
+
+def policy_example_observation(
+    policy: torch.nn.Module,
+    observation_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Create one example observation tensor for TorchScript bundle export.
+
+    Exporting a traced evaluation module requires one representative input tensor. The
+    observation shape comes from the active soccer environment, while the device comes from
+    the live policy so the tracing call uses the same placement the model is already using.
+    Keeping this helper separate avoids hard-coding tensor construction details in the bundle
+    export path.
+    """
+
+    try:
+        device = next(policy.parameters()).device
+    except StopIteration as err:
+        raise ValueError("policy does not expose any parameters") from err
+    return torch.zeros((1, *observation_shape), dtype=torch.float32, device=device)
 
 class RegularizedPuffeRL(pufferl.PuffeRL):
     def __init__(
@@ -522,7 +570,7 @@ class HeadToHeadEvaluator:
     def run_games(
         self,
         current_policy: Policy,
-        opponent_state: Mapping[str, torch.Tensor],
+        opponent: Mapping[str, torch.Tensor] | Any,
         num_games: int,
         seed: int,
     ) -> tuple[list[float], list[float]]:
@@ -533,13 +581,18 @@ class HeadToHeadEvaluator:
         them until its confidence target is met.
         """
 
-        self.opponent_policy.load_state_dict(opponent_state, strict=True)
+        if isinstance(opponent, Mapping):
+            self.opponent_policy.load_state_dict(opponent, strict=True)
+            opponent_runner: Any = self.opponent_policy
+        else:
+            opponent_runner = opponent
         obs, _ = self.eval_env.reset(seed=seed)
         self.eval_env.flush_log()
 
         was_training_current = current_policy.training
         current_policy.eval()
-        self.opponent_policy.eval()
+        if hasattr(opponent_runner, "eval"):
+            opponent_runner.eval()
 
         completed_games = 0
         score_diffs: list[float] = []
@@ -550,10 +603,12 @@ class HeadToHeadEvaluator:
                     obs, device=self.device, dtype=torch.float32
                 )
 
-                current_logits, _ = current_policy.forward_eval(
+                current_logits, _ = forward_policy_eval(
+                    current_policy,
                     obs_tensor.index_select(0, self.current_indices)
                 )
-                opponent_logits, _ = self.opponent_policy.forward_eval(
+                opponent_logits, _ = forward_policy_eval(
+                    opponent_runner,
                     obs_tensor.index_select(0, self.opponent_indices)
                 )
                 current_actions = (
@@ -601,14 +656,14 @@ class HeadToHeadEvaluator:
     def evaluate(
         self,
         current_policy: Policy,
-        opponent_state: Mapping[str, torch.Tensor],
+        opponent: Mapping[str, torch.Tensor] | Any,
         num_games: int,
         seed: int,
     ) -> dict[str, float]:
         """Return mean head-to-head metrics for a fixed number of evaluation games."""
 
         win_scores, score_diffs = self.run_games(
-            current_policy, opponent_state, num_games=num_games, seed=seed
+            current_policy, opponent, num_games=num_games, seed=seed
         )
         return summarize_match_results(win_scores, score_diffs)
 
@@ -2444,7 +2499,7 @@ def should_attempt_promotion(metrics: Mapping[str, float]) -> bool:
 
 def run_promotion_evaluation(
     current_policy: Policy,
-    best_state_dict: Mapping[str, torch.Tensor],
+    best_opponent: Mapping[str, torch.Tensor] | Any,
     evaluator: HeadToHeadEvaluator,
     *,
     confidence: float,
@@ -2472,7 +2527,7 @@ def run_promotion_evaluation(
     for batch_idx in range(max_batches):
         win_scores, score_diffs = evaluator.run_games(
             current_policy,
-            best_state_dict,
+            best_opponent,
             num_games=games_per_batch,
             seed=seed + batch_idx,
         )
@@ -2674,10 +2729,156 @@ def load_best_checkpoint_state(
     return load_checkpoint_state_dict(checkpoint_path), checkpoint_path
 
 
+def load_best_policy_bundle(
+    best_record: Mapping[str, object] | None,
+    *,
+    device: str,
+) -> tuple[torch.jit.ScriptModule, dict[str, object], Path] | None:
+    """Load the self-contained best-model bundle when the pointer record exposes one.
+
+    Newer best-checkpoint records carry a bundle directory that contains a TorchScript policy
+    module. That module should be preferred over the raw checkpoint because it remains usable
+    even if the live repo policy architecture changes later. Returning ``None`` keeps older
+    records on the legacy checkpoint fallback path.
+    """
+
+    if not isinstance(best_record, Mapping):
+        return None
+    bundle_dir = policy_bundle.bundle_dir_from_record(dict(best_record))
+    if bundle_dir is None:
+        return None
+    bundle_module, manifest = policy_bundle.load_policy_module_from_bundle(
+        bundle_dir,
+        device=device,
+    )
+    return bundle_module, manifest, bundle_dir
+
+
 def current_timestamp() -> str:
     """Return a simple UTC timestamp string for metadata files."""
 
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def best_bundle_archive_dir(best_config_path: Path, artifact_name: str) -> Path:
+    """Return the immutable archive directory for one saved best-model bundle.
+
+    The canonical current-best path moves over time, but history records should still point at
+    the exact bundle created for one promotion event. An artifact-scoped archive directory keeps
+    that history durable while the separate ``current_best`` directory can continue acting as the
+    stable pointer for later eval runs.
+    """
+
+    return best_config_path.parent / "baselines" / "archive" / artifact_name
+
+
+def best_bundle_current_dir(best_config_path: Path) -> Path:
+    """Return the canonical directory that always mirrors the active current best bundle.
+
+    Users asked for one stable local folder they can evaluate against. This helper defines that
+    folder in one place so training, export tools, and tests all share the same path contract.
+    """
+
+    return best_config_path.parent / "baselines" / "current_best"
+
+
+def build_bundle_export_metadata(
+    *,
+    args,
+    run_id: str,
+    epoch: int,
+    global_step: int,
+    event: str,
+    checkpoint_path: Path,
+    previous_best: Mapping[str, object] | None,
+    train_config: Mapping[str, Any] | None,
+    objective_metrics: Mapping[str, float] | None,
+    promotion_metrics: Mapping[str, float] | None,
+) -> dict[str, object]:
+    """Build the manifest payload written into one exported best-model bundle.
+
+    The bundle should be understandable on its own long after the original run has finished.
+    Recording the train args, eval settings, source checkpoint, git commit, and promotion data
+    directly in the manifest makes the saved baseline far easier to inspect and trust later.
+    """
+
+    return {
+        "run_id": run_id,
+        "epoch": epoch,
+        "global_step": global_step,
+        "event": event,
+        "git_commit": policy_bundle.current_git_commit(Path.cwd()),
+        "original_checkpoint_path": str(checkpoint_path),
+        "previous_best_artifact_ref": None
+        if previous_best is None
+        else previous_best.get("artifact_ref"),
+        "train_args": {
+            key: value
+            for key, value in vars(args).items()
+            if not key.startswith("_")
+        },
+        "effective_train_config": None if train_config is None else dict(train_config),
+        "eval_settings": {
+            "past_iterate_eval_games": int(args.past_iterate_eval_games),
+            "past_iterate_eval_game_length": int(args.past_iterate_eval_game_length),
+            "final_best_eval_games": int(args.final_best_eval_games),
+            "promotion_confidence": float(args.best_checkpoint_promotion_confidence),
+            "promotion_min_batches": int(args.best_checkpoint_promotion_min_batches),
+            "promotion_max_batches": int(args.best_checkpoint_promotion_max_batches),
+        },
+        "objective_metrics": None
+        if objective_metrics is None
+        else dict(objective_metrics),
+        "promotion_metrics": None
+        if promotion_metrics is None
+        else dict(promotion_metrics),
+    }
+
+
+def export_best_policy_bundle(
+    *,
+    policy: torch.nn.Module,
+    checkpoint_state: dict[str, torch.Tensor],
+    best_config_path: Path,
+    artifact_name: str,
+    observation_shape: tuple[int, ...],
+    metadata: Mapping[str, object],
+) -> dict[str, object]:
+    """Export both the immutable archive bundle and the canonical current-best bundle.
+
+    The archive copy gives history records stable paths, while the canonical ``current_best``
+    directory gives every future evaluation run one fixed location to load. Both bundles carry
+    the same policy contents so the canonical pointer is just a movable mirror of the archive.
+    """
+
+    example_observation = policy_example_observation(policy, observation_shape)
+    archive_result = policy_bundle.export_policy_bundle(
+        policy=policy,
+        checkpoint_state=checkpoint_state,
+        bundle_dir=best_bundle_archive_dir(best_config_path, artifact_name),
+        example_observation=example_observation,
+        metadata=dict(metadata),
+    )
+    current_metadata = dict(metadata)
+    current_metadata["archived_bundle_dir"] = archive_result["bundle_dir"]
+    current_result = policy_bundle.export_policy_bundle(
+        policy=policy,
+        checkpoint_state=checkpoint_state,
+        bundle_dir=best_bundle_current_dir(best_config_path),
+        example_observation=example_observation,
+        metadata=current_metadata,
+    )
+    return {
+        "archive_bundle_dir": archive_result["bundle_dir"],
+        "archive_bundle_manifest_path": archive_result["bundle_manifest_path"],
+        "archive_bundle_policy_module_path": archive_result[
+            "bundle_policy_module_path"
+        ],
+        "bundle_dir": current_result["bundle_dir"],
+        "bundle_manifest_path": current_result["bundle_manifest_path"],
+        "bundle_policy_module_path": current_result["bundle_policy_module_path"],
+        "bundle_schema_version": current_result["bundle_schema_version"],
+    }
 
 
 def register_best_checkpoint(
@@ -2693,8 +2894,17 @@ def register_best_checkpoint(
     global_step: int,
     event: str,
     promotion_metrics: Mapping[str, float] | None,
+    policy: torch.nn.Module | None = None,
+    observation_shape: tuple[int, ...] | None = None,
+    bundle_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Persist and optionally upload a newly established best checkpoint."""
+    """Persist and optionally upload a newly established best checkpoint.
+
+    The record still carries the raw checkpoint metadata for backward compatibility, but when
+    a live policy snapshot is available the function also exports a self-contained policy bundle
+    and records its paths. That bundle is what later evals should prefer because it survives
+    policy-architecture changes in the main repo.
+    """
 
     artifact_name = build_best_artifact_name(run_id, epoch)
     metadata = {
@@ -2756,8 +2966,59 @@ def register_best_checkpoint(
         "run_id": run_id,
         "vec_config": serialize_vec_config(vec_config),
     }
+    history_record = dict(record)
+    if (
+        policy is not None
+        and observation_shape is not None
+        and bundle_metadata is not None
+    ):
+        bundle_result = export_best_policy_bundle(
+            policy=policy,
+            checkpoint_state=snapshot_policy_state(policy),
+            best_config_path=best_config_path,
+            artifact_name=artifact_name,
+            observation_shape=observation_shape,
+            metadata=dict(bundle_metadata),
+        )
+        record.update(
+            {
+                "bundle_dir": bundle_result["bundle_dir"],
+                "bundle_manifest_path": bundle_result["bundle_manifest_path"],
+                "bundle_policy_module_path": bundle_result["bundle_policy_module_path"],
+                "bundle_schema_version": bundle_result["bundle_schema_version"],
+            }
+        )
+        history_record.update(
+            {
+                "bundle_dir": bundle_result["archive_bundle_dir"],
+                "bundle_manifest_path": bundle_result[
+                    "archive_bundle_manifest_path"
+                ],
+                "bundle_policy_module_path": bundle_result[
+                    "archive_bundle_policy_module_path"
+                ],
+                "bundle_schema_version": bundle_result["bundle_schema_version"],
+            }
+        )
+    else:
+        record.update(
+            {
+                "bundle_dir": None,
+                "bundle_manifest_path": None,
+                "bundle_policy_module_path": None,
+                "bundle_schema_version": None,
+            }
+        )
+        history_record.update(
+            {
+                "bundle_dir": None,
+                "bundle_manifest_path": None,
+                "bundle_policy_module_path": None,
+                "bundle_schema_version": None,
+            }
+        )
     write_json_record(best_config_path, record)
-    append_jsonl_record(best_history_path, record)
+    append_jsonl_record(best_history_path, history_record)
     return record
 
 
@@ -3210,7 +3471,9 @@ def main():
     configure_run_video_outputs(args, logger=logger, run_start_time=run_start_time)
 
     best_record = read_json_record(best_config_path)
+    best_bundle_module: Any | None = None
     best_state_dict: dict[str, torch.Tensor] | None = None
+    best_opponent: Mapping[str, torch.Tensor] | Any | None = None
     latest_best_metrics: dict[str, float] | None = None
     final_best_metrics: dict[str, float] | None = None
     latest_no_opponent_metrics: dict[str, float] | None = None
@@ -3269,7 +3532,8 @@ def main():
             f"game_length={no_opponent_game_length}, "
             f"eval_max_steps={int(args.no_opponent_eval_max_steps)}, "
             f"field_curriculum_enabled={no_opponent_curriculum.enabled()}, "
-            f"stage_scales={','.join(f'{scale:.3f}' for scale in no_opponent_curriculum.stage_scales)}, "
+            "stage_scales="
+            f"{','.join(f'{scale:.3f}' for scale in no_opponent_curriculum.stage_scales)}, "
             f"initial_applied_scale={initial_no_opponent_scale:.3f}"
         )
         warm_start_train_config = build_phase_train_config(
@@ -3542,28 +3806,40 @@ def main():
 
         if best_record is not None:
             try:
-                best_state_dict, best_checkpoint_path = load_best_checkpoint_state(
-                    best_record,
-                    logger=logger,
-                    cache_dir=best_cache_dir,
-                )
-                if best_record.get("cached_checkpoint_path") != str(best_checkpoint_path):
-                    best_record = dict(best_record)
-                    best_record["cached_checkpoint_path"] = str(best_checkpoint_path)
-                    write_json_record(best_config_path, best_record)
-                print(
-                    "Loaded best checkpoint: "
-                    f"{best_record.get('artifact_ref') or best_checkpoint_path}"
-                )
+                loaded_bundle = load_best_policy_bundle(best_record, device=device)
+                if loaded_bundle is not None:
+                    best_bundle_module, _bundle_manifest, best_bundle_dir = loaded_bundle
+                    best_opponent = best_bundle_module
+                    print(f"Loaded best policy bundle: {best_bundle_dir}")
+                else:
+                    best_state_dict, best_checkpoint_path = load_best_checkpoint_state(
+                        best_record,
+                        logger=logger,
+                        cache_dir=best_cache_dir,
+                    )
+                    if (
+                        best_record.get("cached_checkpoint_path")
+                        != str(best_checkpoint_path)
+                    ):
+                        best_record = dict(best_record)
+                        best_record["cached_checkpoint_path"] = str(best_checkpoint_path)
+                        write_json_record(best_config_path, best_record)
+                    best_opponent = best_state_dict
+                    print(
+                        "Loaded best checkpoint: "
+                        f"{best_record.get('artifact_ref') or best_checkpoint_path}"
+                    )
             except Exception as err:
                 print(
                     "Best checkpoint load failed "
                     f"({err}); skipping best-checkpoint eval until a new best is registered."
                 )
                 best_record = None
+                best_bundle_module = None
                 best_state_dict = None
+                best_opponent = None
 
-        if args.fixed_best_checkpoint and best_state_dict is None:
+        if args.fixed_best_checkpoint and best_opponent is None:
             raise RuntimeError(
                 "fixed-best-checkpoint mode requires a readable best checkpoint record"
             )
@@ -3632,10 +3908,10 @@ def main():
                 }
                 print_match_summary("Past iterate eval", trainer.epoch, eval_metrics)
 
-                if best_state_dict is not None:
+                if best_opponent is not None:
                     best_metrics = evaluator.evaluate(
                         current_policy,
-                        best_state_dict,
+                        best_opponent,
                         num_games=args.past_iterate_eval_games,
                         seed=eval_seed + 1_000,
                     )
@@ -3652,87 +3928,7 @@ def main():
                     )
                     latest_best_metrics = dict(best_metrics)
                     print_match_summary("Best checkpoint eval", trainer.epoch, best_metrics)
-
-                    if (
-                        logger is not None
-                        and not args.fixed_best_checkpoint
-                        and should_attempt_promotion(best_metrics)
-                    ):
-                        promotion_metrics = run_promotion_evaluation(
-                            current_policy,
-                            best_state_dict,
-                            evaluator,
-                            confidence=args.best_checkpoint_promotion_confidence,
-                            min_batches=args.best_checkpoint_promotion_min_batches,
-                            max_batches=args.best_checkpoint_promotion_max_batches,
-                            seed=eval_seed + 2_000,
-                        )
-                        log_payload.update(
-                            {
-                                "evaluation/best_checkpoint/promotion_attempted": 1.0,
-                                "evaluation/best_checkpoint/promotion_batches": promotion_metrics[
-                                    "batches"
-                                ],
-                                "evaluation/best_checkpoint/promotion_games": promotion_metrics[
-                                    "games"
-                                ],
-                                "evaluation/best_checkpoint/promotion_games_per_batch": promotion_metrics[
-                                    "games_per_batch"
-                                ],
-                                "evaluation/best_checkpoint/promotion_win_rate": promotion_metrics[
-                                    "win_rate"
-                                ],
-                                "evaluation/best_checkpoint/promotion_score_diff": promotion_metrics[
-                                    "score_diff"
-                                ],
-                                "evaluation/best_checkpoint/promotion_win_rate_lcb": promotion_metrics[
-                                    "win_rate_lcb"
-                                ],
-                                "evaluation/best_checkpoint/promotion_confidence": promotion_metrics[
-                                    "confidence"
-                                ],
-                                "evaluation/best_checkpoint/promotion_promoted": promotion_metrics[
-                                    "promoted"
-                                ],
-                            }
-                        )
-                        print(
-                            "Best checkpoint promotion check "
-                            f"(epoch={trainer.epoch}, games={int(promotion_metrics['games'])}, "
-                            f"batches={int(promotion_metrics['batches'])}): "
-                            f"win_rate={promotion_metrics['win_rate']:.3f}, "
-                            f"score_diff={promotion_metrics['score_diff']:.3f}, "
-                            f"lcb95={promotion_metrics['win_rate_lcb']:.3f}, "
-                            f"promoted={bool(promotion_metrics['promoted'])}"
-                        )
-                        if promotion_metrics["promoted"] > 0.5:
-                            assert eval_vec_config is not None
-                            checkpoint_str = trainer.save_checkpoint()
-                            if checkpoint_str is None:
-                                raise RuntimeError(
-                                    "trainer.save_checkpoint() returned no path"
-                                )
-                            checkpoint_path = Path(checkpoint_str)
-                            best_record = register_best_checkpoint(
-                                logger=logger,
-                                checkpoint_path=checkpoint_path,
-                                best_config_path=best_config_path,
-                                best_history_path=best_history_path,
-                                previous_best=best_record,
-                                vec_config=eval_vec_config,
-                                run_id=logger.run_id,
-                                epoch=trainer.epoch,
-                                global_step=trainer.global_step,
-                                event="promotion",
-                                promotion_metrics=promotion_metrics,
-                            )
-                            best_state_dict = snapshot_policy_state(current_policy)
-                            print(
-                                "Promoted new best checkpoint: "
-                                f"{best_record.get('artifact_ref') or checkpoint_path}"
-                            )
-                    elif logger is not None:
-                        log_payload["evaluation/best_checkpoint/promotion_attempted"] = 0.0
+                    log_payload["evaluation/best_checkpoint/promotion_attempted"] = 0.0
 
                 if logger is not None:
                     logger.wandb.log(log_payload, step=trainer.global_step)
@@ -3756,14 +3952,15 @@ def main():
         effective_train_config = train_config
         effective_vec_config = vec_config
 
-        if best_state_dict is not None and args.final_best_eval_games > 0:
+        final_promotion_metrics: dict[str, float] | None = None
+        if best_opponent is not None and args.final_best_eval_games > 0:
             if evaluator is None:
                 raise RuntimeError(
                     "final best-checkpoint eval requested without an evaluator"
                 )
             final_best_metrics = evaluator.evaluate(
                 current_policy,
-                best_state_dict,
+                best_opponent,
                 num_games=args.final_best_eval_games,
                 seed=args.seed + 50_000_000,
             )
@@ -3789,10 +3986,123 @@ def main():
                     step=trainer.global_step,
                 )
 
+            if not args.fixed_best_checkpoint and should_attempt_promotion(
+                final_best_metrics
+            ):
+                final_promotion_metrics = run_promotion_evaluation(
+                    current_policy,
+                    best_opponent,
+                    evaluator,
+                    confidence=args.best_checkpoint_promotion_confidence,
+                    min_batches=args.best_checkpoint_promotion_min_batches,
+                    max_batches=args.best_checkpoint_promotion_max_batches,
+                    seed=args.seed + 60_000_000,
+                )
+                print(
+                    "Final best checkpoint promotion check "
+                    f"(epoch={trainer.epoch}, games={int(final_promotion_metrics['games'])}, "
+                    f"batches={int(final_promotion_metrics['batches'])}): "
+                    f"win_rate={final_promotion_metrics['win_rate']:.3f}, "
+                    f"score_diff={final_promotion_metrics['score_diff']:.3f}, "
+                    f"lcb95={final_promotion_metrics['win_rate_lcb']:.3f}, "
+                    f"promoted={bool(final_promotion_metrics['promoted'])}"
+                )
+                if logger is not None:
+                    logger.wandb.log(
+                        {
+                            "evaluation/final_best_checkpoint/promotion_attempted": 1.0,
+                            "evaluation/final_best_checkpoint/promotion_batches": (
+                                final_promotion_metrics["batches"]
+                            ),
+                            "evaluation/final_best_checkpoint/promotion_games": (
+                                final_promotion_metrics["games"]
+                            ),
+                            "evaluation/final_best_checkpoint/promotion_games_per_batch": (
+                                final_promotion_metrics["games_per_batch"]
+                            ),
+                            "evaluation/final_best_checkpoint/promotion_win_rate": (
+                                final_promotion_metrics["win_rate"]
+                            ),
+                            "evaluation/final_best_checkpoint/promotion_score_diff": (
+                                final_promotion_metrics["score_diff"]
+                            ),
+                            "evaluation/final_best_checkpoint/promotion_win_rate_lcb": (
+                                final_promotion_metrics["win_rate_lcb"]
+                            ),
+                            "evaluation/final_best_checkpoint/promotion_confidence": (
+                                final_promotion_metrics["confidence"]
+                            ),
+                            "evaluation/final_best_checkpoint/promotion_promoted": (
+                                final_promotion_metrics["promoted"]
+                            ),
+                            "evaluation/progress_step": float(trainer.global_step),
+                        },
+                        step=trainer.global_step,
+                    )
+            elif logger is not None:
+                logger.wandb.log(
+                    {
+                        "evaluation/final_best_checkpoint/promotion_attempted": 0.0,
+                        "evaluation/progress_step": float(trainer.global_step),
+                    },
+                    step=trainer.global_step,
+                )
+
         if evaluator is not None:
             evaluator.close()
 
-        if best_record is None and logger is not None and not args.fixed_best_checkpoint:
+        if (
+            final_promotion_metrics is not None
+            and final_promotion_metrics["promoted"] > 0.5
+        ):
+            bundle_metadata = build_bundle_export_metadata(
+                args=args,
+                run_id="local-run" if logger is None else logger.run_id,
+                epoch=trainer.epoch,
+                global_step=trainer.global_step,
+                event="promotion",
+                checkpoint_path=model_path,
+                previous_best=best_record,
+                train_config=train_config,
+                objective_metrics=final_best_metrics,
+                promotion_metrics=final_promotion_metrics,
+            )
+            best_record = register_best_checkpoint(
+                logger=logger,
+                checkpoint_path=model_path,
+                best_config_path=best_config_path,
+                best_history_path=best_history_path,
+                previous_best=best_record,
+                vec_config=vec_config if eval_vec_config is None else eval_vec_config,
+                run_id="local-run" if logger is None else logger.run_id,
+                epoch=trainer.epoch,
+                global_step=trainer.global_step,
+                event="promotion",
+                promotion_metrics=final_promotion_metrics,
+                policy=current_policy,
+                observation_shape=tuple(vecenv.single_observation_space.shape),
+                bundle_metadata=bundle_metadata,
+            )
+            best_state_dict = snapshot_policy_state(current_policy)
+            best_opponent = current_policy
+            print(
+                "Promoted new best checkpoint after final evaluation: "
+                f"{best_record.get('artifact_ref') or model_path}"
+            )
+
+        if best_record is None and not args.fixed_best_checkpoint:
+            bundle_metadata = build_bundle_export_metadata(
+                args=args,
+                run_id="local-run" if logger is None else logger.run_id,
+                epoch=trainer.epoch,
+                global_step=trainer.global_step,
+                event="bootstrap",
+                checkpoint_path=model_path,
+                previous_best=None,
+                train_config=train_config,
+                objective_metrics=final_best_metrics,
+                promotion_metrics=None,
+            )
             best_record = register_best_checkpoint(
                 logger=logger,
                 checkpoint_path=model_path,
@@ -3800,13 +4110,17 @@ def main():
                 best_history_path=best_history_path,
                 previous_best=None,
                 vec_config=vec_config if eval_vec_config is None else eval_vec_config,
-                run_id=logger.run_id,
+                run_id="local-run" if logger is None else logger.run_id,
                 epoch=trainer.epoch,
                 global_step=trainer.global_step,
                 event="bootstrap",
                 promotion_metrics=None,
+                policy=current_policy,
+                observation_shape=tuple(vecenv.single_observation_space.shape),
+                bundle_metadata=bundle_metadata,
             )
             best_state_dict = snapshot_policy_state(current_policy)
+            best_opponent = current_policy
             print(
                 "Bootstrapped best checkpoint from final model: "
                 f"{best_record.get('artifact_ref') or model_path}"
@@ -3818,9 +4132,9 @@ def main():
         raise RuntimeError("training did not produce trainer metadata")
 
     best_video_path = None
-    if args.export_videos and best_state_dict is not None and current_policy is not None:
+    if args.export_videos and best_opponent is not None and current_policy is not None:
         best_video_path = save_best_checkpoint_video(
-            current_policy, best_state_dict, args
+            current_policy, best_opponent, args
         )
 
     if best_video_path is not None:
@@ -3915,6 +4229,7 @@ def save_match_video(
     opponents_enabled: bool = True,
     no_opponent_field_scale: float = 1.0,
     opponent_state_dict: Mapping[str, torch.Tensor] | None = None,
+    opponent_policy_runner: Any | None = None,
     overwrite_existing: bool = False,
 ) -> Path | None:
     """Capture one rendered policy replay against either itself, no opponents, or a snapshot.
@@ -3925,11 +4240,12 @@ def save_match_video(
     frame writing, and fallback behavior instead of drifting apart over time.
 
     ``opponents_enabled`` controls whether the environment should spawn the red team at all.
-    When an ``opponent_state_dict`` is supplied, the current policy controls blue and the loaded
-    opponent controls red. Otherwise the current policy simply controls every active agent in the
-    environment, which preserves the old self-play behavior. ``overwrite_existing`` is used by
-    periodic run-scoped videos so they update one stable local file that can then be uploaded to
-    W&B without fighting older runs for filenames.
+    When an ``opponent_state_dict`` or ``opponent_policy_runner`` is supplied, the current
+    policy controls blue and the supplied opponent controls red. Otherwise the current policy
+    simply controls every active agent in the environment, which preserves the old self-play
+    behavior. ``overwrite_existing`` is used by periodic run-scoped videos so they update one
+    stable local file that can then be uploaded to W&B without fighting older runs for
+    filenames.
     """
 
     game_length = (
@@ -3961,6 +4277,10 @@ def save_match_video(
         opponent_policy = Policy(env).to(policy_device)
         opponent_policy.load_state_dict(opponent_state_dict, strict=True)
         opponent_policy.eval()
+    elif opponent_policy_runner is not None:
+        opponent_policy = opponent_policy_runner
+        if hasattr(opponent_policy, "eval"):
+            opponent_policy.eval()
 
     was_training = current_policy.training
     current_policy.eval()
@@ -3972,7 +4292,7 @@ def save_match_video(
 
             obs_tensor = torch.from_numpy(obs).to(policy_device)
             if opponent_policy is None:
-                logits, _ = current_policy.forward_eval(obs_tensor)
+                logits, _ = forward_policy_eval(current_policy, obs_tensor)
                 actions = (
                     torch.argmax(logits, dim=-1)
                     .cpu()
@@ -3981,8 +4301,8 @@ def save_match_video(
                 )
             else:
                 split = args.players_per_team
-                current_logits, _ = current_policy.forward_eval(obs_tensor[:split])
-                opponent_logits, _ = opponent_policy.forward_eval(obs_tensor[split:])
+                current_logits, _ = forward_policy_eval(current_policy, obs_tensor[:split])
+                opponent_logits, _ = forward_policy_eval(opponent_policy, obs_tensor[split:])
                 current_actions = (
                     torch.argmax(current_logits, dim=-1)
                     .cpu()
@@ -4043,7 +4363,7 @@ def save_self_play_video(
 
 def save_best_checkpoint_video(
     policy: Policy,
-    best_state_dict: Mapping[str, torch.Tensor],
+    best_opponent: Mapping[str, torch.Tensor] | Any,
     args,
 ) -> Path | None:
     """Render the current policy against the stored best checkpoint opponent.
@@ -4058,7 +4378,12 @@ def save_best_checkpoint_video(
         output_path=Path(str(args.best_checkpoint_video_output)),
         label="best-checkpoint video",
         opponents_enabled=True,
-        opponent_state_dict=best_state_dict,
+        opponent_state_dict=best_opponent
+        if isinstance(best_opponent, Mapping)
+        else None,
+        opponent_policy_runner=None
+        if isinstance(best_opponent, Mapping)
+        else best_opponent,
     )
 
 
