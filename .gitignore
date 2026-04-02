@@ -229,3 +229,4 @@ AGENTS.md
 *.err
 *.out
 tmp
+srun-logs

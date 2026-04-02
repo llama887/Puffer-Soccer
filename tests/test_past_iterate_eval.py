@@ -26,6 +26,19 @@ assert SPEC.loader is not None
 sys.modules[SPEC.name] = train_pufferl
 SPEC.loader.exec_module(train_pufferl)
 
+REGISTER_MODULE_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "register_best_checkpoint.py"
+)
+REGISTER_SPEC = importlib.util.spec_from_file_location(
+    "register_best_checkpoint_script",
+    REGISTER_MODULE_PATH,
+)
+assert REGISTER_SPEC is not None
+register_best_checkpoint_script = importlib.util.module_from_spec(REGISTER_SPEC)
+assert REGISTER_SPEC.loader is not None
+sys.modules[REGISTER_SPEC.name] = register_best_checkpoint_script
+REGISTER_SPEC.loader.exec_module(register_best_checkpoint_script)
+
 compute_eval_interval_epochs = train_pufferl.compute_eval_interval_epochs
 compute_train_sizes = train_pufferl.compute_train_sizes
 make_side_assignment = train_pufferl.make_side_assignment
@@ -573,6 +586,74 @@ def test_register_best_checkpoint_exports_bundle_metadata_when_policy_is_provide
     env.close()
 
 
+def test_register_existing_checkpoint_promotes_finished_model_into_best_files(tmp_path):
+    """Verify the manual promotion script writes the same best-baseline artifacts as training.
+
+    A strong long-running job may finish outside the current Python process, so we need a small
+    utility that can register that final checkpoint after the fact. This test exercises the script
+    helper end to end with a real policy checkpoint and confirms it writes the pointer file,
+    history file, and self-contained bundle metadata rather than only printing a summary.
+    """
+
+    env = make_soccer_vecenv(
+        players_per_team=1,
+        action_mode="discrete",
+        game_length=4,
+        render_mode=None,
+        seed=0,
+        vec=VecEnvConfig(backend="native", shard_num_envs=1, num_shards=1),
+    )
+    policy = train_pufferl.Policy(env)
+    checkpoint_path = tmp_path / "finished.pt"
+    torch.save(policy.state_dict(), checkpoint_path)
+    older_best_path = tmp_path / "older.pt"
+    older_best_path.write_bytes(b"older")
+    (tmp_path / "best_checkpoint.json").write_text(
+        json.dumps(
+            {
+                "artifact_ref": "entity/project/older:best",
+                "cached_checkpoint_path": str(older_best_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        checkpoint_path=checkpoint_path,
+        run_id="finished-run",
+        epoch=42,
+        global_step=4200,
+        event="manual_backfill",
+        players_per_team=1,
+        device="cpu",
+        best_checkpoint_config_path=tmp_path / "best_checkpoint.json",
+        best_checkpoint_history_path=tmp_path / "best_checkpoint_history.jsonl",
+        vec_backend="native",
+        vec_shard_num_envs=1,
+        vec_num_shards=1,
+        vec_batch_size=None,
+        vec_num_workers=None,
+        wandb=False,
+        wandb_project="robot-soccer",
+        wandb_group="manual-best-checkpoint",
+        wandb_tag=None,
+    )
+
+    record = register_best_checkpoint_script.register_existing_checkpoint(args)
+
+    assert record["run_id"] == "finished-run"
+    assert record["epoch"] == 42
+    assert Path(str(record["bundle_dir"])).name == "current_best"
+    assert Path(str(record["bundle_manifest_path"])).exists()
+    assert Path(str(record["bundle_policy_module_path"])).exists()
+    history_record = json.loads(
+        args.best_checkpoint_history_path.read_text(encoding="utf-8").strip()
+    )
+    assert history_record["event"] == "manual_backfill"
+    assert Path(str(history_record["bundle_dir"])).exists()
+    assert history_record["previous_best_artifact_ref"] == "entity/project/older:best"
+    env.close()
+
+
 def test_log_periodic_self_play_video_logs_shared_cadence_metadata(tmp_path):
     """Verify periodic self-play video logs include the same cadence metadata as eval."""
 
@@ -603,6 +684,69 @@ def test_log_periodic_self_play_video_logs_shared_cadence_metadata(tmp_path):
     assert payload["video/self_play/current_epoch"] == 25.0
     assert payload["video/self_play/baseline_epoch"] == 20.0
     assert payload["video/self_play/eval_epochs_interval"] == 5.0
+
+
+def test_log_periodic_eval_match_videos_exports_every_eval_opponent(tmp_path):
+    """Verify periodic eval replay export mirrors latest-prior, past, and best matchups.
+
+    The user wants one replay for every numeric periodic eval matchup, not just the rolling
+    self-play clip. This test keeps that contract explicit by checking the helper emits one
+    replay for the latest prior iterate, one for each older retained checkpoint, and one for
+    the current best checkpoint with stable filenames and metadata labels.
+    """
+
+    logger = DummyLogger()
+    args = SimpleNamespace(
+        export_videos=True,
+        run_video_tag="run-123",
+        video_fps=20,
+    )
+    saved_output_paths: list[Path] = []
+
+    def fake_save_match_video(_policy, _args, *, output_path, **_kwargs):
+        saved_output_paths.append(Path(str(output_path)))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"video")
+        return output_path
+
+    retained = [
+        train_pufferl.PeriodicPolicySnapshot(epoch=5, state_dict={"weight": torch.zeros(1)}),
+        train_pufferl.PeriodicPolicySnapshot(epoch=10, state_dict={"weight": torch.ones(1)}),
+    ]
+
+    with patch.object(
+        train_pufferl,
+        "save_match_video",
+        side_effect=fake_save_match_video,
+    ):
+        saved_paths = train_pufferl.log_periodic_eval_match_videos(
+            object(),
+            args,
+            logger=logger,
+            current_epoch=15,
+            global_step=1500,
+            retained_checkpoints=retained,
+            latest_baseline_epoch=10,
+            latest_baseline_state_dict={"weight": torch.ones(1)},
+            best_opponent={"weight": torch.full((1,), 2.0)},
+        )
+
+    assert saved_paths == saved_output_paths
+    assert saved_output_paths == [
+        Path("experiments/run-123/video/evals/epoch_000015/vs_latest_prior_epoch_000010.mp4"),
+        Path("experiments/run-123/video/evals/epoch_000015/vs_past_epoch_000005.mp4"),
+        Path("experiments/run-123/video/evals/epoch_000015/vs_best_checkpoint.mp4"),
+    ]
+    logged_payloads = [payload for payload, _step in logger.wandb.logged]
+    assert logged_payloads[0][
+        "video/evals/epoch_000015/vs_latest_prior_epoch_000010/baseline_label"
+    ] == "latest_prior"
+    assert logged_payloads[1][
+        "video/evals/epoch_000015/vs_past_epoch_000005/baseline_label"
+    ] == "past"
+    assert logged_payloads[2][
+        "video/evals/epoch_000015/vs_best_checkpoint/baseline_label"
+    ] == "best_checkpoint"
 
 
 def test_build_run_video_tag_uses_timestamp_and_optional_run_id():
@@ -873,6 +1017,8 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
     eval_calls: list[tuple[int, int]] = []
     video_calls: list[tuple[int, int, int, int]] = []
     video_output_paths: list[Path] = []
+    eval_video_output_paths: list[Path] = []
+    eval_video_keys: list[str] = []
     best_video_output_paths: list[Path] = []
     run_summaries: list[dict[str, object]] = []
     fake_policy = FakePolicy()
@@ -910,7 +1056,7 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
 
     def fake_log_video_artifact(
         _logger,
-        _video_key,
+        video_key,
         _video_path,
         _fps,
         step,
@@ -919,14 +1065,17 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         """Capture periodic video metadata instead of sending anything to W&B."""
 
         assert extra_payload is not None
-        video_calls.append(
-            (
-                int(extra_payload["video/self_play/current_epoch"]),
-                int(extra_payload["video/self_play/baseline_epoch"]),
-                int(extra_payload["video/self_play/eval_epochs_interval"]),
-                step,
+        if video_key == "self_play_video":
+            video_calls.append(
+                (
+                    int(extra_payload["video/self_play/current_epoch"]),
+                    int(extra_payload["video/self_play/baseline_epoch"]),
+                    int(extra_payload["video/self_play/eval_epochs_interval"]),
+                    step,
+                )
             )
-        )
+            return
+        eval_video_keys.append(video_key)
 
     def fake_maybe_write_run_summary(_path, payload):
         """Capture the emitted run summary so the cadence fields can be asserted."""
@@ -939,6 +1088,12 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         assert overwrite_existing is True
         video_output_paths.append(Path(str(args.video_output)))
         return tmp_path / "self_play.mp4"
+
+    def fake_save_match_video(_policy, _args, *, output_path, **_kwargs):
+        """Capture the resolved periodic eval replay path without writing a real video."""
+
+        eval_video_output_paths.append(Path(str(output_path)))
+        return output_path
 
     def fake_save_best_checkpoint_video(_policy, _best_state_dict, args):
         """Capture the resolved best-checkpoint path used near the end of training."""
@@ -975,6 +1130,10 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         "save_self_play_video",
         side_effect=fake_save_self_play_video,
     ), patch.object(
+        train_pufferl,
+        "save_match_video",
+        side_effect=fake_save_match_video,
+    ), patch.object(
         train_pufferl, "log_video_artifact", side_effect=fake_log_video_artifact
     ), patch.object(
         train_pufferl, "read_json_record", return_value=None
@@ -1003,13 +1162,45 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
             train_pufferl.main()
 
     expected_epochs = list(range(5, 101, 5))
-    expected_eval_calls = [(epoch, epoch - 5) for epoch in expected_epochs]
+    expected_eval_calls = []
+    for epoch in expected_epochs:
+        latest_checkpoint = epoch - 5
+        expected_eval_calls.append((epoch, latest_checkpoint))
+        if latest_checkpoint > 0:
+            for baseline_epoch in range(5, latest_checkpoint, 5):
+                expected_eval_calls.append((epoch, baseline_epoch))
     expected_video_calls = [
         (epoch, epoch - 5, 5, epoch * 100) for epoch in expected_epochs
+    ]
+    eval_payloads = [
+        payload
+        for payload, _step in logger.wandb.logged
+        if "evaluation/past_iterate/current_epoch" in payload
     ]
 
     assert eval_calls == expected_eval_calls
     assert video_calls == expected_video_calls
+    assert len(eval_video_output_paths) == sum(range(len(expected_epochs)))
+    assert eval_video_output_paths[0] == Path(
+        "experiments/2026-03-22_10-28-13_run-123/video/evals/epoch_000010/vs_latest_prior_epoch_000005.mp4"
+    )
+    assert eval_video_output_paths[1] == Path(
+        "experiments/2026-03-22_10-28-13_run-123/video/evals/epoch_000015/vs_latest_prior_epoch_000010.mp4"
+    )
+    assert eval_video_output_paths[2] == Path(
+        "experiments/2026-03-22_10-28-13_run-123/video/evals/epoch_000015/vs_past_epoch_000005.mp4"
+    )
+    assert (
+        "video/evals/epoch_000010/vs_latest_prior_epoch_000005/replay"
+        in eval_video_keys
+    )
+    assert (
+        "evaluation/past_checkpoints/epoch_000005/win_rate" not in eval_payloads[0]
+    )
+    assert eval_payloads[1]["evaluation/past_checkpoints/epoch_000005/current_epoch"] == 10.0
+    assert eval_payloads[1]["evaluation/past_checkpoints/epoch_000005/baseline_epoch"] == 5.0
+    assert eval_payloads[2]["evaluation/past_checkpoints/epoch_000005/current_epoch"] == 15.0
+    assert eval_payloads[2]["evaluation/past_checkpoints/epoch_000010/current_epoch"] == 15.0
     assert video_output_paths == [
         Path("experiments/2026-03-22_10-28-13_run-123/video/self_play.mp4")
     ] * len(expected_epochs)
@@ -1017,10 +1208,35 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         Path("experiments/2026-03-22_10-28-13_run-123/video/best_checkpoint.mp4")
     ]
     assert run_summaries[0]["past_iterate_eval_interval_epochs"] == 5
+    assert run_summaries[0]["retained_past_checkpoint_epochs"] == expected_epochs
+    assert (
+        "per-goal +1/-1 rewards cancel"
+        in run_summaries[0]["training_metric_notes"]["environment_episode_return"]
+    )
     assert (
         run_summaries[0]["effective_hyperparameters"]["past_iterate_eval_fractions"]
         == 20
     )
+
+
+def test_train_automode_sbatch_sets_final_best_eval_defaults():
+    """Verify the default batch launcher always reaches the final best-baseline decision path.
+
+    A strong run is not useful as the canonical baseline if the launcher never requests the
+    final best-checkpoint evaluation. This test keeps the shell script honest by checking that
+    it exports explicit defaults for the final best eval and promotion gate and forwards them
+    into the training command line.
+    """
+
+    script_text = (
+        Path(__file__).resolve().parents[1] / "sbatch" / "train_automode.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert 'TRAIN_AUTOMODE_FINAL_BEST_EVAL_GAMES="${TRAIN_AUTOMODE_FINAL_BEST_EVAL_GAMES:-256}"' in script_text
+    assert "--final-best-eval-games" in script_text
+    assert "--best-checkpoint-promotion-confidence" in script_text
+    assert "--best-checkpoint-promotion-min-batches" in script_text
+    assert "--best-checkpoint-promotion-max-batches" in script_text
 
 
 def test_main_does_not_promote_mid_run_before_final_check(tmp_path):

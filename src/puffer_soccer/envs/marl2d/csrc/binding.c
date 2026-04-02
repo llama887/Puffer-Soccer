@@ -13,6 +13,8 @@
 typedef struct {
     float score;
     float episode_return;
+    float blue_team_episode_return;
+    float red_team_episode_return;
     float episode_length;
     float wins_blue;
     float wins_red;
@@ -43,6 +45,8 @@ typedef struct {
     int game_length;
     int num_steps;
     float cumulative_episode_return;
+    float cumulative_blue_team_episode_return;
+    float cumulative_red_team_episode_return;
     int do_team_switch;
     int opponents_enabled;
     int blue_left;
@@ -227,6 +231,8 @@ static void reset_field(Env* env) {
 static void full_reset(Env* env, int hard_reset_score) {
     env->num_steps = 0;
     env->cumulative_episode_return = 0.0f;
+    env->cumulative_blue_team_episode_return = 0.0f;
+    env->cumulative_red_team_episode_return = 0.0f;
     if (hard_reset_score) {
         env->goals_blue = 0;
         env->goals_red = 0;
@@ -535,6 +541,8 @@ static void c_reset(Env* env, int seed) {
 static void c_step(Env* env) {
     int np = env->num_players;
     float step_reward_sum = 0.0f;
+    float step_reward_sum_blue = 0.0f;
+    float step_reward_sum_red = 0.0f;
     clear_terminal_render_state(env);
     env->num_steps += 1;
     clear_outputs(env);
@@ -635,8 +643,12 @@ static void c_step(Env* env) {
     compute_observations(env, goal_scored);
     for (int i = 0; i < np; i++) {
         step_reward_sum += env->rewards[i];
+        if (env->agents[i].team == 0) step_reward_sum_blue += env->rewards[i];
+        else step_reward_sum_red += env->rewards[i];
     }
     env->cumulative_episode_return += step_reward_sum;
+    env->cumulative_blue_team_episode_return += step_reward_sum_blue;
+    env->cumulative_red_team_episode_return += step_reward_sum_red;
 
     if (done) {
         int score_diff;
@@ -652,6 +664,8 @@ static void c_step(Env* env) {
         else if (score_diff < 0) env->log.wins_red += 1.0f;
         else env->log.draws += 1.0f;
         env->log.episode_return += env->cumulative_episode_return;
+        env->log.blue_team_episode_return += env->cumulative_blue_team_episode_return;
+        env->log.red_team_episode_return += env->cumulative_red_team_episode_return;
         env->log.episode_length += env->num_steps;
         env->log.n += 1.0f;
         capture_terminal_render_state(env);
@@ -730,6 +744,8 @@ static int assign_log_dict(PyObject* d, const Log* log) {
     if (PyDict_SetItemString(d, "score", PyFloat_FromDouble(log->score / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "score_diff", PyFloat_FromDouble(log->score / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "episode_return", PyFloat_FromDouble(log->episode_return / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "blue_team_episode_return", PyFloat_FromDouble(log->blue_team_episode_return / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "red_team_episode_return", PyFloat_FromDouble(log->red_team_episode_return / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "episode_length", PyFloat_FromDouble(log->episode_length / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "wins_blue", PyFloat_FromDouble(log->wins_blue)) < 0) return -1;
     if (PyDict_SetItemString(d, "wins_red", PyFloat_FromDouble(log->wins_red)) < 0) return -1;
@@ -1167,6 +1183,8 @@ static PyObject* py_vec_log(PyObject* self, PyObject* args) {
         Log* log = &vec->envs[i].log;
         aggregate.score += log->score;
         aggregate.episode_return += log->episode_return;
+        aggregate.blue_team_episode_return += log->blue_team_episode_return;
+        aggregate.red_team_episode_return += log->red_team_episode_return;
         aggregate.episode_length += log->episode_length;
         aggregate.wins_blue += log->wins_blue;
         aggregate.wins_red += log->wins_red;

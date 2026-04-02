@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 import math
@@ -113,6 +113,7 @@ RUN_VIDEO_FILENAMES = {
     "no_opponent": "self_play_no_opponent.mp4",
     "best_checkpoint": "best_checkpoint.mp4",
 }
+PERIODIC_EVAL_VIDEO_NAMESPACE = "video/evals"
 
 
 class Policy(torch.nn.Module):
@@ -144,6 +145,46 @@ class Policy(torch.nn.Module):
 
     def forward_eval(self, observations, state=None):
         return self.forward(observations, state=state)
+
+
+@dataclass(frozen=True)
+class PeriodicPolicySnapshot:
+    """Retain one periodic policy snapshot for long-horizon progress logging.
+
+    The training loop already keeps one rolling baseline so it can measure whether the latest
+    interval improved over the immediately preceding saved iterate. The user also wants a second
+    view that answers a broader question: when we compare the current policy against every older
+    periodic checkpoint, do all of those curves keep moving upward over time?
+
+    Each instance stores the epoch label that should appear in metric names together with an
+    immutable CPU clone of the corresponding policy weights. We only retain snapshots taken at the
+    shared periodic event boundary so these labels line up exactly with the saved-checkpoint
+    cadence the user reasons about when reading the plots.
+    """
+
+    epoch: int
+    state_dict: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class PeriodicEvalVideoTarget:
+    """Describe one replay video that should be exported for a periodic eval matchup.
+
+    Periodic numeric eval now answers three related questions at the same training event:
+    did we beat the latest retained iterate, did we beat all earlier retained iterates, and
+    did we beat the current best baseline? The replay export path should mirror those exact
+    matchups so the user can inspect behavior for any surprising datapoint without guessing
+    which opponent a saved video used.
+
+    Each target stores the opponent payload together with the filesystem slug and the W&B
+    metadata label that identify that matchup. Keeping those values together avoids duplicate
+    naming logic across the video writer and the metadata logger.
+    """
+
+    opponent: Mapping[str, torch.Tensor] | Any
+    baseline_label: str
+    filename_stem: str
+    baseline_epoch: int | None = None
 
 
 def forward_policy_eval(
@@ -2469,11 +2510,17 @@ def evaluate_against_past_iterate(
     games: int,
     seed: int,
 ) -> dict[str, float]:
-    """Evaluate the current policy against the immediately previous policy snapshot.
+    """Evaluate the current policy against the previously retained periodic snapshot.
 
     The wrapper keeps the main training loop readable while routing all of the actual match
     execution through the reusable evaluator. That lets past-iterate eval and best-checkpoint
     eval share the same environment setup and side-balancing logic.
+
+    The training loop refreshes ``previous_state_dict`` only after each periodic logging event.
+    That means this helper usually compares the live policy to the snapshot from one evaluation
+    interval ago rather than to the literal last gradient update. Keeping that meaning explicit
+    matters because the logged baseline epoch is intended to line up with the retained snapshot
+    used for videos and for the next progress comparison.
     """
 
     return evaluator.evaluate(
@@ -2482,6 +2529,67 @@ def evaluate_against_past_iterate(
         num_games=games,
         seed=seed,
     )
+
+
+def periodic_checkpoint_metric_prefix(epoch: int) -> str:
+    """Return the W&B metric prefix used for one retained periodic checkpoint curve.
+
+    We want one stable metric namespace per saved periodic checkpoint so W&B renders a separate
+    line for "current policy versus checkpoint taken at epoch X". Zero-padding the epoch keeps
+    the metric names sorted naturally in dashboards and makes it easier to visually scan many
+    retained checkpoints once a long training run has accumulated them.
+    """
+
+    if epoch <= 0:
+        raise ValueError("periodic checkpoint epoch must be positive")
+    return f"evaluation/past_checkpoints/epoch_{epoch:06d}"
+
+
+def add_past_checkpoint_eval_logs(
+    *,
+    log_payload: dict[str, float],
+    current_policy: Policy,
+    retained_checkpoints: Sequence[PeriodicPolicySnapshot],
+    latest_baseline_epoch: int,
+    latest_baseline_metrics: Mapping[str, float],
+    evaluator: HeadToHeadEvaluator,
+    games: int,
+    seed: int,
+    current_epoch: int,
+    eval_interval_epochs: int,
+) -> None:
+    """Extend one logging payload with results against every retained periodic checkpoint.
+
+    The existing ``evaluation/past_iterate/*`` metrics only answer whether the policy beat the
+    most recently retained snapshot. For league-style progress tracking we also want one curve per
+    older checkpoint so we can see whether the current policy continues to dominate the entire
+    retained history instead of only the latest baseline.
+
+    The newest retained checkpoint is the same opponent already used by the rolling prior-iterate
+    evaluation, so this helper reuses those metrics instead of replaying the exact same match a
+    second time. Older retained checkpoints receive deterministic seed offsets based on their
+    epoch label so repeated runs stay reproducible while each baseline still gets an independent
+    matchup.
+    """
+
+    for checkpoint in retained_checkpoints:
+        if checkpoint.epoch == latest_baseline_epoch:
+            checkpoint_metrics = latest_baseline_metrics
+        else:
+            checkpoint_metrics = evaluate_against_past_iterate(
+                current_policy,
+                checkpoint.state_dict,
+                evaluator=evaluator,
+                games=games,
+                seed=seed + 1_000_000 + checkpoint.epoch,
+            )
+        metric_prefix = periodic_checkpoint_metric_prefix(checkpoint.epoch)
+        log_payload[f"{metric_prefix}/win_rate"] = float(checkpoint_metrics["win_rate"])
+        log_payload[f"{metric_prefix}/score_diff"] = float(checkpoint_metrics["score_diff"])
+        log_payload[f"{metric_prefix}/games"] = float(checkpoint_metrics["games"])
+        log_payload[f"{metric_prefix}/baseline_epoch"] = float(checkpoint.epoch)
+        log_payload[f"{metric_prefix}/current_epoch"] = float(current_epoch)
+        log_payload[f"{metric_prefix}/eval_epochs_interval"] = float(eval_interval_epochs)
 
 
 def should_attempt_promotion(metrics: Mapping[str, float]) -> bool:
@@ -3182,6 +3290,51 @@ def canonical_run_video_path(run_tag: str, video_kind: str) -> Path:
     return run_video_directory(run_tag) / filename
 
 
+def periodic_eval_video_directory(run_tag: str, epoch: int) -> Path:
+    """Return the run-scoped folder that stores replay videos for one eval epoch.
+
+    Periodic replay exports can grow quickly during long training runs, so they should live
+    in a dedicated `video/evals/epoch_<N>/` directory instead of competing with the rolling
+    self-play and best-checkpoint files. Grouping by current epoch makes it obvious which
+    evaluation event produced a replay even when many baseline matchups were exported.
+    """
+
+    return run_video_directory(run_tag) / "evals" / f"epoch_{epoch:06d}"
+
+
+def periodic_eval_video_path(
+    run_tag: str,
+    *,
+    current_epoch: int,
+    filename_stem: str,
+) -> Path:
+    """Return the canonical local path for one periodic eval replay video.
+
+    The training loop writes one clearly labeled replay per evaluated opponent. The caller
+    provides a stable filename stem so the resulting path is human-readable, predictable, and
+    easy to match against the numeric metric namespace for the same baseline.
+    """
+
+    return periodic_eval_video_directory(run_tag, current_epoch) / f"{filename_stem}.mp4"
+
+
+def periodic_eval_video_metric_prefix(
+    *,
+    current_epoch: int,
+    filename_stem: str,
+) -> str:
+    """Return the W&B metric prefix used for one periodic eval replay artifact.
+
+    Numeric eval curves already use stable namespaces so the dashboard renders one line per
+    retained baseline. Replay videos should follow the same pattern. This helper keeps those
+    metric keys deterministic and makes tests independent of any call-site string assembly.
+    """
+
+    return (
+        f"{PERIODIC_EVAL_VIDEO_NAMESPACE}/epoch_{current_epoch:06d}/{filename_stem}"
+    )
+
+
 def configure_run_video_outputs(args, *, logger, run_start_time: float) -> None:
     """Resolve default video outputs for this run while preserving explicit CLI overrides.
 
@@ -3219,7 +3372,7 @@ def log_video_artifact(
     video_path: Path,
     fps: int,
     step: int,
-    extra_payload: Mapping[str, float] | None = None,
+    extra_payload: Mapping[str, Any] | None = None,
 ) -> None:
     """Upload one generated video to W&B together with any cadence metadata.
 
@@ -3241,6 +3394,135 @@ def log_video_artifact(
         format=video_format,
     )
     logger.wandb.log(payload, step=step)
+
+
+def build_periodic_eval_video_targets(
+    *,
+    retained_checkpoints: Sequence[PeriodicPolicySnapshot],
+    latest_baseline_epoch: int,
+    latest_baseline_state_dict: Mapping[str, torch.Tensor] | None,
+    best_opponent: Mapping[str, torch.Tensor] | Any | None,
+) -> list[PeriodicEvalVideoTarget]:
+    """Build the replay matchup list that mirrors the current periodic numeric eval set.
+
+    The replay export should answer the same questions as the logged metrics, no more and no
+    less. This helper therefore takes the retained periodic snapshots that already drive the
+    numeric plots and converts them into a deduplicated list of replay targets. The latest
+    prior iterate gets its own label because the user still wants that direct graph, while
+    older retained checkpoints use the broader `past` label and the current best baseline
+    receives its dedicated `best_checkpoint` label.
+    """
+
+    targets: list[PeriodicEvalVideoTarget] = []
+    if latest_baseline_epoch > 0 and latest_baseline_state_dict is not None:
+        targets.append(
+            PeriodicEvalVideoTarget(
+                opponent=latest_baseline_state_dict,
+                baseline_label="latest_prior",
+                filename_stem=(
+                    f"vs_latest_prior_epoch_{latest_baseline_epoch:06d}"
+                ),
+                baseline_epoch=latest_baseline_epoch,
+            )
+        )
+
+    for checkpoint in retained_checkpoints:
+        if checkpoint.epoch == latest_baseline_epoch:
+            continue
+        targets.append(
+            PeriodicEvalVideoTarget(
+                opponent=checkpoint.state_dict,
+                baseline_label="past",
+                filename_stem=f"vs_past_epoch_{checkpoint.epoch:06d}",
+                baseline_epoch=checkpoint.epoch,
+            )
+        )
+
+    if best_opponent is not None:
+        targets.append(
+            PeriodicEvalVideoTarget(
+                opponent=best_opponent,
+                baseline_label="best_checkpoint",
+                filename_stem="vs_best_checkpoint",
+                baseline_epoch=None,
+            )
+        )
+    return targets
+
+
+def log_periodic_eval_match_videos(
+    policy: Policy,
+    args,
+    *,
+    logger,
+    current_epoch: int,
+    global_step: int,
+    retained_checkpoints: Sequence[PeriodicPolicySnapshot],
+    latest_baseline_epoch: int,
+    latest_baseline_state_dict: Mapping[str, torch.Tensor] | None,
+    best_opponent: Mapping[str, torch.Tensor] | Any | None,
+) -> list[Path]:
+    """Render and log one replay for each opponent used by periodic progress evaluation.
+
+    Numeric head-to-head curves are useful, but they do not show *how* the behavior changed.
+    This helper exports a short replay for every periodic eval opponent so the user can inspect
+    the exact matchup behind any surprising win-rate shift. Reusing the retained checkpoint list
+    keeps the replay set perfectly aligned with the numeric "all past iterates" view.
+    """
+
+    if not args.export_videos:
+        return []
+
+    run_tag = getattr(args, "run_video_tag", build_run_video_tag(time.time()))
+    saved_paths: list[Path] = []
+    for target in build_periodic_eval_video_targets(
+        retained_checkpoints=retained_checkpoints,
+        latest_baseline_epoch=latest_baseline_epoch,
+        latest_baseline_state_dict=latest_baseline_state_dict,
+        best_opponent=best_opponent,
+    ):
+        video_path = save_match_video(
+            policy,
+            args,
+            output_path=periodic_eval_video_path(
+                run_tag,
+                current_epoch=current_epoch,
+                filename_stem=target.filename_stem,
+            ),
+            label=f"periodic eval video ({target.filename_stem})",
+            opponents_enabled=True,
+            opponent_state_dict=target.opponent
+            if isinstance(target.opponent, Mapping)
+            else None,
+            opponent_policy_runner=None
+            if isinstance(target.opponent, Mapping)
+            else target.opponent,
+            overwrite_existing=True,
+        )
+        if video_path is None:
+            continue
+
+        metric_prefix = periodic_eval_video_metric_prefix(
+            current_epoch=current_epoch,
+            filename_stem=target.filename_stem,
+        )
+        log_video_artifact(
+            logger,
+            f"{metric_prefix}/replay",
+            video_path,
+            args.video_fps,
+            global_step,
+            extra_payload={
+                "video/progress_step": float(global_step),
+                f"{metric_prefix}/current_epoch": float(current_epoch),
+                f"{metric_prefix}/baseline_epoch": -1.0
+                if target.baseline_epoch is None
+                else float(target.baseline_epoch),
+                f"{metric_prefix}/baseline_label": target.baseline_label,
+            },
+        )
+        saved_paths.append(video_path)
+    return saved_paths
 
 
 def log_periodic_self_play_video(
@@ -3355,6 +3637,7 @@ def _build_run_summary(
     latest_no_opponent_metrics: Mapping[str, float] | None,
     final_no_opponent_metrics: Mapping[str, float] | None,
     model_path: Path,
+    retained_past_checkpoint_epochs: Sequence[int],
 ) -> dict[str, object]:
     """Build the machine-readable summary emitted at the end of one training run.
 
@@ -3396,6 +3679,9 @@ def _build_run_summary(
             args,
         ),
         "past_iterate_eval_interval_epochs": int(eval_interval_epochs),
+        "retained_past_checkpoint_epochs": [
+            int(epoch) for epoch in retained_past_checkpoint_epochs
+        ],
         "objective_metrics": objective_metrics,
         "latest_best_checkpoint_metrics": None
         if latest_best_metrics is None
@@ -3426,6 +3712,16 @@ def _build_run_summary(
         "eval_vec_config": None
         if eval_vec_config is None
         else serialize_vec_config(eval_vec_config),
+        "training_metric_notes": {
+            "environment_episode_return": (
+                "In symmetric self-play this metric sums rewards across both teams, so the "
+                "per-goal +1/-1 rewards cancel and the curve stays near zero even when play "
+                "quality improves. Use environment/current_team_episode_return or "
+                "environment/blue_team_episode_return for a one-team training reward view, "
+                "and use environment/score plus head-to-head eval win rates as the primary "
+                "strength signals."
+            )
+        },
     }
 
 
@@ -3487,6 +3783,7 @@ def main():
     current_policy: Policy | None = None
     self_play_initial_state: dict[str, torch.Tensor] | None = None
     remaining_total_timesteps = args.total_timesteps
+    retained_periodic_checkpoints: list[PeriodicPolicySnapshot] = []
 
     warm_start_budget, _ = split_phase_iterations(
         int(args.ppo_iterations), no_opponent_phase
@@ -3878,7 +4175,6 @@ def main():
 
         past_iterate_state_dict = clone_state_dict(current_policy)
         past_iterate_epoch = 0
-
         while trainer.epoch < trainer.total_epochs:
             trainer.evaluate()
             trainer.train()
@@ -3906,6 +4202,18 @@ def main():
                     "evaluation/past_iterate/baseline_epoch": float(past_iterate_epoch),
                     "evaluation/past_iterate/current_epoch": trainer.epoch,
                 }
+                add_past_checkpoint_eval_logs(
+                    log_payload=log_payload,
+                    current_policy=current_policy,
+                    retained_checkpoints=retained_periodic_checkpoints,
+                    latest_baseline_epoch=past_iterate_epoch,
+                    latest_baseline_metrics=eval_metrics,
+                    evaluator=evaluator,
+                    games=args.past_iterate_eval_games,
+                    seed=eval_seed,
+                    current_epoch=trainer.epoch,
+                    eval_interval_epochs=eval_interval_epochs,
+                )
                 print_match_summary("Past iterate eval", trainer.epoch, eval_metrics)
 
                 if best_opponent is not None:
@@ -3932,6 +4240,19 @@ def main():
 
                 if logger is not None:
                     logger.wandb.log(log_payload, step=trainer.global_step)
+                log_periodic_eval_match_videos(
+                    current_policy,
+                    args,
+                    logger=logger,
+                    current_epoch=trainer.epoch,
+                    global_step=trainer.global_step,
+                    retained_checkpoints=retained_periodic_checkpoints,
+                    latest_baseline_epoch=past_iterate_epoch,
+                    latest_baseline_state_dict=past_iterate_state_dict
+                    if past_iterate_epoch > 0
+                    else None,
+                    best_opponent=best_opponent,
+                )
 
             if should_run_periodic_event:
                 log_periodic_self_play_video(
@@ -3945,6 +4266,12 @@ def main():
                 )
                 past_iterate_state_dict = snapshot_policy_state(current_policy)
                 past_iterate_epoch = trainer.epoch
+                retained_periodic_checkpoints.append(
+                    PeriodicPolicySnapshot(
+                        epoch=trainer.epoch,
+                        state_dict=past_iterate_state_dict,
+                    )
+                )
 
         trainer.print_dashboard()
         model_path = Path(trainer.close())
@@ -4159,6 +4486,9 @@ def main():
         latest_no_opponent_metrics=latest_no_opponent_metrics,
         final_no_opponent_metrics=final_no_opponent_metrics,
         model_path=model_path,
+        retained_past_checkpoint_epochs=[
+            checkpoint.epoch for checkpoint in retained_periodic_checkpoints
+        ],
     )
     maybe_write_run_summary(run_summary_path, run_summary)
     if logger is not None:
