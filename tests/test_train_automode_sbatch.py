@@ -1,7 +1,9 @@
 """Regression tests for the autoresearch Slurm launch script.
 
 The autoresearch loop depends on `sbatch/train_automode.sbatch` to create repo-local
-logs and temporary outputs before the containerized training command starts. A recent
+logs and temporary outputs before the containerized training command starts. The
+current launch flow also mirrors the checked-out repository into `sbatch-tmp/` so a
+running batch job uses a private snapshot instead of the live working tree. A recent
 failed launch showed that Slurm may execute the batch script from an internal spool
 directory such as `/opt/slurm/data/slurmd/sbatch`. In that environment, shell features
 like `${BASH_SOURCE[0]}` point at the staged copy rather than the repository checkout,
@@ -30,9 +32,11 @@ def test_train_automode_resolves_repo_root_from_working_directory() -> None:
     Slurm can stage the submitted script under an internal directory that the job cannot
     write to, which makes `${BASH_SOURCE[0]}` an unreliable way to find the repository
     root. The durable fix is to launch the job with `#SBATCH --chdir=<repo root>` and to
-    derive `REPO_ROOT` from `pwd`. This test exercises the debug escape hatch while
-    deliberately setting `SLURM_SUBMIT_DIR` to the bad internal path to confirm that the
-    shell still reports the real repository root.
+    derive `REPO_ROOT` from `pwd`. The production job then copies that checkout into an
+    isolated `sbatch-tmp/<job id>/...` workspace before training starts. This test
+    exercises the debug escape hatch while deliberately setting `SLURM_SUBMIT_DIR` to
+    the bad internal path to confirm that the shell still reports the real repository
+    root and the derived private workspace path.
     """
 
     env = dict(os.environ)
@@ -49,7 +53,10 @@ def test_train_automode_resolves_repo_root_from_working_directory() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == str(REPO_ROOT)
+    assert completed.stdout == (
+        f"REPO_ROOT={REPO_ROOT}\n"
+        f"JOB_WORKSPACE_ROOT={REPO_ROOT / 'sbatch-tmp' / 'local' / REPO_ROOT.name}\n"
+    )
 
 
 def test_train_automode_uses_standardized_hyperparameter_file() -> None:
@@ -64,6 +71,15 @@ def test_train_automode_uses_standardized_hyperparameter_file() -> None:
 
     assert "#SBATCH --chdir=/scratch/fyy2003/repos/Puffer-Soccer" in contents
     assert 'REPO_ROOT="$(pwd -P)"' in contents
+    assert 'JOB_COPY_BASE="$REPO_ROOT/sbatch-tmp"' in contents
+    assert 'JOB_COPY_ROOT="$JOB_COPY_BASE/${SLURM_JOB_ID:-local}"' in contents
+    assert 'JOB_WORKSPACE_ROOT="$JOB_COPY_ROOT/$(basename "$REPO_ROOT")"' in contents
+    assert (
+        'rsync -a --delete --exclude \'sbatch-tmp/\' "$REPO_ROOT/" '
+        '"$JOB_WORKSPACE_ROOT/"'
+        in contents
+    )
+    assert '--bind "$JOB_WORKSPACE_ROOT:/workspace"' in contents
     assert (
         'TRAIN_AUTOMODE_HYPERPARAMETERS_PATH="${TRAIN_AUTOMODE_HYPERPARAMETERS_PATH:-'
         'experiments/autoload_hyperparameters.json}"'

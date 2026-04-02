@@ -16,12 +16,16 @@
 set -euo pipefail
 
 REPO_ROOT="$(pwd -P)"
+JOB_COPY_BASE="$REPO_ROOT/sbatch-tmp"
+JOB_COPY_ROOT="$JOB_COPY_BASE/${SLURM_JOB_ID:-local}"
+JOB_WORKSPACE_ROOT="$JOB_COPY_ROOT/$(basename "$REPO_ROOT")"
 SCRATCH_BASE="/scratch/$USER"
 LOCAL_TMP_BASE="/tmp/$USER"
 APPTAINER_IMAGE="docker://quay.io/pypa/manylinux_2_28_x86_64"
 
 if [ "${TRAIN_AUTOMODE_PRINT_ROOT_ONLY:-0}" = "1" ]; then
-    printf '%s\n' "$REPO_ROOT"
+    printf 'REPO_ROOT=%s\n' "$REPO_ROOT"
+    printf 'JOB_WORKSPACE_ROOT=%s\n' "$JOB_WORKSPACE_ROOT"
     exit 0
 fi
 
@@ -39,16 +43,22 @@ mkdir -p \
     "$UV_CACHE_DIR" \
     "$TMPDIR" \
     "$(dirname "$UV_PROJECT_ENVIRONMENT")" \
-    "$REPO_ROOT/sbatch/logs"
+    "$REPO_ROOT/sbatch/logs" \
+    "$JOB_COPY_BASE"
+
+rm -rf "$JOB_COPY_ROOT"
+mkdir -p "$JOB_COPY_ROOT"
+rsync -a --delete --exclude 'sbatch-tmp/' "$REPO_ROOT/" "$JOB_WORKSPACE_ROOT/"
 
 printf 'REPO_ROOT=%s\n' "$REPO_ROOT"
+printf 'JOB_WORKSPACE_ROOT=%s\n' "$JOB_WORKSPACE_ROOT"
 printf 'APPTAINER_CACHEDIR=%s\n' "$APPTAINER_CACHEDIR"
 printf 'APPTAINER_TMPDIR=%s\n' "$APPTAINER_TMPDIR"
 
 module purge
 
 apptainer exec --nv \
-    --bind "$REPO_ROOT:/workspace" \
+    --bind "$JOB_WORKSPACE_ROOT:/workspace" \
     --pwd /workspace \
     "$APPTAINER_IMAGE" \
     bash -lc '

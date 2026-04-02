@@ -218,6 +218,7 @@ __marimo__/
 build/
 dist/
 .pytest_cache/
+sbatch-tmp/
 .venv/
 venv/
 experiments/
