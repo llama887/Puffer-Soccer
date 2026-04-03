@@ -60,7 +60,23 @@ def test_multiprocessing_configs_for_total_envs_respect_constraints() -> None:
         assert 12 % config.num_shards == 0
         assert config.shard_num_envs * config.num_shards == 12
         assert config.batch_size is not None
-        assert config.num_shards % config.batch_size == 0
+        assert 12 % config.batch_size == 0
+        assert config.batch_size % config.shard_num_envs == 0
+
+
+def test_multiprocessing_configs_avoid_invalid_single_worker_batch_sizes() -> None:
+    configs = multiprocessing_configs_for_total_envs(total_envs=8, max_num_shards=4)
+
+    observed = {
+        (config.shard_num_envs, config.num_shards, config.batch_size)
+        for config in configs
+    }
+
+    assert (8, 1, 1) not in observed
+    assert (4, 2, 1) not in observed
+    assert (4, 2, 2) not in observed
+    assert (8, 1, 8) in observed
+    assert (4, 2, 4) in observed
 
 
 def test_should_stop_autotune_waits_for_saturation_before_plateau_stop() -> None:

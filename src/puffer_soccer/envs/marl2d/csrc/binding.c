@@ -13,6 +13,8 @@
 typedef struct {
     float score;
     float episode_return;
+    float blue_team_episode_return;
+    float red_team_episode_return;
     float episode_length;
     float wins_blue;
     float wins_red;
@@ -42,7 +44,11 @@ typedef struct {
     int num_players;
     int game_length;
     int num_steps;
+    float cumulative_episode_return;
+    float cumulative_blue_team_episode_return;
+    float cumulative_red_team_episode_return;
     int do_team_switch;
+    int opponents_enabled;
     int blue_left;
     int reset_setup;
     int action_mode;
@@ -64,6 +70,12 @@ typedef struct {
     float ball_vy;
     int goals_blue;
     int goals_red;
+    float field_scale;
+    float base_x_out_start;
+    float base_x_out_end;
+    float base_y_out_start;
+    float base_y_out_end;
+    float base_goal_half_h;
     int obs_size;
     int state_size;
     uint32_t rng;
@@ -136,11 +148,54 @@ static int team_on_left(const Env* env, int team) {
     return !env->blue_left;
 }
 
+static int is_inactive_opponent(const Env* env, int player_idx) {
+    return !env->opponents_enabled && env->agents[player_idx].team != 0;
+}
+
+static float field_half_width(const Env* env) {
+    return fmaxf(fabsf(env->x_out_start), fabsf(env->x_out_end));
+}
+
+static float field_half_height(const Env* env) {
+    return fmaxf(fabsf(env->y_out_start), fabsf(env->y_out_end));
+}
+
+static void clamp_live_state_to_field(Env* env) {
+    for (int i = 0; i < env->num_players; i++) {
+        Agent* a = &env->agents[i];
+        a->x = clampf(a->x, env->x_out_start, env->x_out_end);
+        a->y = clampf(a->y, env->y_out_start, env->y_out_end);
+    }
+    env->ball_x = clampf(env->ball_x, env->x_out_start, env->x_out_end);
+    env->ball_y = clampf(env->ball_y, env->y_out_start, env->y_out_end);
+}
+
+static void apply_field_scale(Env* env, float scale) {
+    float clamped = clampf(scale, 0.1f, 1.0f);
+    env->field_scale = clamped;
+    env->x_out_start = env->base_x_out_start * clamped;
+    env->x_out_end = env->base_x_out_end * clamped;
+    env->y_out_start = env->base_y_out_start * clamped;
+    env->y_out_end = env->base_y_out_end * clamped;
+    env->goal_half_h = fminf(env->base_goal_half_h, fabsf(env->y_out_end));
+    clamp_live_state_to_field(env);
+}
+
 static void reset_field(Env* env) {
     float pos_noise = 0.05f;
     for (int i = 0; i < env->num_players; i++) {
         Agent* a = &env->agents[i];
         int place_left = team_on_left(env, a->team);
+
+        if (is_inactive_opponent(env, i)) {
+            a->x = env->x_out_end;
+            a->y = ((float)(i - env->players_per_team) + 0.5f) * 4.0f;
+            a->y = clampf(a->y, env->y_out_start, env->y_out_end);
+            a->rot = (float)M_PI;
+            a->last_move = 0.0f;
+            a->last_rot = 0.0f;
+            continue;
+        }
 
         if (env->reset_setup == 0 && env->num_players == 22) {
             int pidx = i % 11;
@@ -175,6 +230,9 @@ static void reset_field(Env* env) {
 
 static void full_reset(Env* env, int hard_reset_score) {
     env->num_steps = 0;
+    env->cumulative_episode_return = 0.0f;
+    env->cumulative_blue_team_episode_return = 0.0f;
+    env->cumulative_red_team_episode_return = 0.0f;
     if (hard_reset_score) {
         env->goals_blue = 0;
         env->goals_red = 0;
@@ -227,6 +285,7 @@ static void ball_check_hit(Env* env) {
 
     for (int i = 0; i < env->num_players; i++) {
         Agent* a = &env->agents[i];
+        if (is_inactive_opponent(env, i)) continue;
         float d = dist2(env->ball_x, env->ball_y, a->x, a->y);
         if (d < ball_radius + agent_radius) {
             float x_diff = env->ball_x - a->x;
@@ -277,7 +336,7 @@ static void rel_obs_agent(const Env* env, const Agent* focus, const Agent* other
         return;
     }
 
-    float max_dist = dist2(0, 0, 100.0f, 70.0f);
+    float max_dist = dist2(0, 0, field_half_width(env), field_half_height(env));
     out7[0] = 1.0f;
     out7[1] = dist2(focus->x, focus->y, other->x, other->y) / max_dist;
     out7[2] = obj_view / (env->vision_range / 2.0f);
@@ -303,7 +362,7 @@ static void rel_obs_ball(const Env* env, const Agent* focus, float* out5) {
         return;
     }
 
-    float max_dist = dist2(0, 0, 100.0f, 70.0f);
+    float max_dist = dist2(0, 0, field_half_width(env), field_half_height(env));
     out5[0] = 1.0f;
     out5[1] = dist2(focus->x, focus->y, env->ball_x, env->ball_y) / max_dist;
     out5[2] = obj_view / (env->vision_range / 2.0f);
@@ -319,22 +378,28 @@ static void rel_obs_ball(const Env* env, const Agent* focus, float* out5) {
 static void compute_observations(Env* env, int goal_scored_team) {
     int np = env->num_players;
     float sign_state = team_on_left(env, 0) ? 1.0f : -1.0f;
+    float half_width = field_half_width(env);
+    float half_height = field_half_height(env);
     float* state = env->global_states;
     float time_left = 1.0f - ((float)env->num_steps / (float)env->game_length);
     float* state_base = state;
     state_base[0] = time_left;
-    state_base[1] = sign_state * env->ball_x / 50.0f;
-    state_base[2] = sign_state * env->ball_y / 50.0f;
+    state_base[1] = sign_state * env->ball_x / half_width;
+    state_base[2] = sign_state * env->ball_y / half_height;
     state_base[3] = sign_state * env->ball_vx / MAX_BALL_SPEED;
     state_base[4] = sign_state * env->ball_vy / MAX_BALL_SPEED;
 
     int sidx = 5;
     for (int i = 0; i < np; i++) {
         Agent* a = &env->agents[i];
+        if (is_inactive_opponent(env, i)) {
+            for (int k = 0; k < 17; k++) state_base[sidx++] = 0.0f;
+            continue;
+        }
         float onehot[11];
         get_one_hot(i, onehot);
-        state_base[sidx++] = sign_state * a->x / 50.0f;
-        state_base[sidx++] = sign_state * a->y / 50.0f;
+        state_base[sidx++] = sign_state * a->x / half_width;
+        state_base[sidx++] = sign_state * a->y / half_height;
         state_base[sidx++] = sign_state * cosf(a->rot);
         state_base[sidx++] = sign_state * sinf(a->rot);
         state_base[sidx++] = a->last_move;
@@ -353,8 +418,8 @@ static void compute_observations(Env* env, int goal_scored_team) {
         int o = 0;
 
         out[o++] = time_left;
-        out[o++] = sign * focus->x / 50.0f;
-        out[o++] = sign * focus->y / 50.0f;
+        out[o++] = sign * focus->x / half_width;
+        out[o++] = sign * focus->y / half_height;
         out[o++] = sign * cosf(focus->rot);
         out[o++] = sign * sinf(focus->rot);
         out[o++] = focus->last_move;
@@ -378,13 +443,25 @@ static void compute_observations(Env* env, int goal_scored_team) {
         for (int j = 0; j < np; j++) {
             if (env->agents[j].team == focus->team) continue;
             float aobs[7];
-            rel_obs_agent(env, focus, &env->agents[j], aobs);
+            if (is_inactive_opponent(env, j)) {
+                memset(aobs, 0, sizeof(float) * 7);
+            } else {
+                rel_obs_agent(env, focus, &env->agents[j], aobs);
+            }
             for (int k = 0; k < 7; k++) out[o++] = aobs[k];
         }
 
         float r = 0.0f;
         if (goal_scored_team >= 0) {
-            r = (focus->team == goal_scored_team) ? 1.0f : -1.0f;
+            if (!env->opponents_enabled) {
+                if (focus->team == 0) {
+                    r = (goal_scored_team == 0) ? 1.0f : -1.0f;
+                } else {
+                    r = 0.0f;
+                }
+            } else {
+                r = (focus->team == goal_scored_team) ? 1.0f : -1.0f;
+            }
         }
         env->rewards[i] = r;
     }
@@ -405,6 +482,7 @@ static void init_env_common(
     int game_length,
     int action_mode,
     int do_team_switch,
+    int opponents_enabled,
     float vision_range,
     int reset_setup
 ) {
@@ -413,6 +491,7 @@ static void init_env_common(
     env->num_players = players_per_team * 2;
     env->game_length = game_length;
     env->do_team_switch = do_team_switch;
+    env->opponents_enabled = opponents_enabled;
     env->blue_left = 1;
     env->reset_setup = reset_setup;
     env->vision_range = vision_range;
@@ -423,11 +502,16 @@ static void init_env_common(
     env->last_goals_red = 0;
     env->last_done = 0;
     env->has_terminal_render_state = 0;
-    env->x_out_start = -50.0f;
-    env->x_out_end = 50.0f;
-    env->y_out_start = -35.0f;
-    env->y_out_end = 35.0f;
-    env->goal_half_h = 20.0f;
+    env->base_x_out_start = -50.0f;
+    env->base_x_out_end = 50.0f;
+    env->base_y_out_start = -35.0f;
+    env->base_y_out_end = 35.0f;
+    env->base_goal_half_h = 20.0f;
+    env->x_out_start = env->base_x_out_start;
+    env->x_out_end = env->base_x_out_end;
+    env->y_out_start = env->base_y_out_start;
+    env->y_out_end = env->base_y_out_end;
+    env->goal_half_h = env->base_goal_half_h;
     env->rot_speed = 0.4f;
     env->move_speed = 1.0f;
     env->rng = (uint32_t)(seed + 1);
@@ -436,6 +520,7 @@ static void init_env_common(
         env->agents[a].team = (a < players_per_team) ? 0 : 1;
     }
 
+    apply_field_scale(env, 1.0f);
     full_reset(env, 1);
     clear_outputs(env);
     compute_observations(env, -1);
@@ -455,6 +540,9 @@ static void c_reset(Env* env, int seed) {
 
 static void c_step(Env* env) {
     int np = env->num_players;
+    float step_reward_sum = 0.0f;
+    float step_reward_sum_blue = 0.0f;
+    float step_reward_sum_red = 0.0f;
     clear_terminal_render_state(env);
     env->num_steps += 1;
     clear_outputs(env);
@@ -463,6 +551,12 @@ static void c_step(Env* env) {
         Agent* a = &env->agents[i];
         float move = 0.0f;
         float rot = 0.0f;
+
+        if (is_inactive_opponent(env, i)) {
+            a->last_move = 0.0f;
+            a->last_rot = 0.0f;
+            continue;
+        }
 
         if (env->action_mode == 0) {
             int* atn = (int*)env->actions;
@@ -507,7 +601,7 @@ static void c_step(Env* env) {
     int goal_scored = -1;
     if (fabsf(env->ball_y) <= env->goal_half_h) {
         if (env->ball_x < env->x_out_start) {
-            goal_scored = team_on_left(env, 1) ? 1 : 0;
+            goal_scored = team_on_left(env, 0) ? 1 : 0;
             if (goal_scored == 0) env->goals_blue += 1;
             else env->goals_red += 1;
         } else if (env->ball_x > env->x_out_end) {
@@ -547,13 +641,19 @@ static void c_step(Env* env) {
 
     int done = (env->num_steps >= env->game_length);
     compute_observations(env, goal_scored);
+    for (int i = 0; i < np; i++) {
+        step_reward_sum += env->rewards[i];
+        if (env->agents[i].team == 0) step_reward_sum_blue += env->rewards[i];
+        else step_reward_sum_red += env->rewards[i];
+    }
+    env->cumulative_episode_return += step_reward_sum;
+    env->cumulative_blue_team_episode_return += step_reward_sum_blue;
+    env->cumulative_red_team_episode_return += step_reward_sum_red;
 
     if (done) {
-        float ret = 0.0f;
         int score_diff;
         for (int i = 0; i < np; i++) {
             env->terminals[i] = 1;
-            ret += env->rewards[i];
         }
         env->last_goals_blue = env->goals_blue;
         env->last_goals_red = env->goals_red;
@@ -563,7 +663,9 @@ static void c_step(Env* env) {
         if (score_diff > 0) env->log.wins_blue += 1.0f;
         else if (score_diff < 0) env->log.wins_red += 1.0f;
         else env->log.draws += 1.0f;
-        env->log.episode_return += ret;
+        env->log.episode_return += env->cumulative_episode_return;
+        env->log.blue_team_episode_return += env->cumulative_blue_team_episode_return;
+        env->log.red_team_episode_return += env->cumulative_red_team_episode_return;
         env->log.episode_length += env->num_steps;
         env->log.n += 1.0f;
         capture_terminal_render_state(env);
@@ -597,6 +699,7 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
     PyObject* d = PyDict_New();
     PyObject* num_steps_obj = PyLong_FromLong(num_steps);
     PyObject* blue_left_obj = PyBool_FromLong(blue_left);
+    PyObject* field_scale_obj = PyFloat_FromDouble(env->field_scale);
     if (!ball || !goals || !d || !num_steps_obj || !blue_left_obj) {
         Py_XDECREF(pos);
         Py_XDECREF(rot);
@@ -605,6 +708,7 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         Py_XDECREF(d);
         Py_XDECREF(num_steps_obj);
         Py_XDECREF(blue_left_obj);
+        Py_XDECREF(field_scale_obj);
         return NULL;
     }
 
@@ -613,7 +717,8 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         PyDict_SetItemString(d, "ball", ball) < 0 ||
         PyDict_SetItemString(d, "goals", goals) < 0 ||
         PyDict_SetItemString(d, "num_steps", num_steps_obj) < 0 ||
-        PyDict_SetItemString(d, "blue_left", blue_left_obj) < 0) {
+        PyDict_SetItemString(d, "blue_left", blue_left_obj) < 0 ||
+        PyDict_SetItemString(d, "field_scale", field_scale_obj) < 0) {
         Py_DECREF(pos);
         Py_DECREF(rot);
         Py_DECREF(ball);
@@ -621,6 +726,7 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         Py_DECREF(d);
         Py_DECREF(num_steps_obj);
         Py_DECREF(blue_left_obj);
+        Py_DECREF(field_scale_obj);
         return NULL;
     }
 
@@ -630,6 +736,7 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
     Py_DECREF(goals);
     Py_DECREF(num_steps_obj);
     Py_DECREF(blue_left_obj);
+    Py_DECREF(field_scale_obj);
     return d;
 }
 
@@ -637,6 +744,8 @@ static int assign_log_dict(PyObject* d, const Log* log) {
     if (PyDict_SetItemString(d, "score", PyFloat_FromDouble(log->score / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "score_diff", PyFloat_FromDouble(log->score / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "episode_return", PyFloat_FromDouble(log->episode_return / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "blue_team_episode_return", PyFloat_FromDouble(log->blue_team_episode_return / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "red_team_episode_return", PyFloat_FromDouble(log->red_team_episode_return / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "episode_length", PyFloat_FromDouble(log->episode_length / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "wins_blue", PyFloat_FromDouble(log->wins_blue)) < 0) return -1;
     if (PyDict_SetItemString(d, "wins_red", PyFloat_FromDouble(log->wins_red)) < 0) return -1;
@@ -762,19 +871,19 @@ static int validate_vector_arrays(
 
 static PyObject* py_env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyObject *obs_obj, *act_obj, *rew_obj, *term_obj, *trunc_obj, *state_obj;
-    int seed, players_per_team, game_length, action_mode, do_team_switch, reset_setup;
+    int seed, players_per_team, game_length, action_mode, do_team_switch, opponents_enabled, reset_setup;
     float vision_range;
 
     static char* kwlist[] = {
         "observations", "actions", "rewards", "terminals", "truncations", "global_states",
         "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
-        "vision_range", "reset_setup", NULL
+        "opponents_enabled", "vision_range", "reset_setup", NULL
     };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiifi", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiifi", kwlist,
             &obs_obj, &act_obj, &rew_obj, &term_obj, &trunc_obj, &state_obj,
             &seed, &players_per_team, &game_length, &action_mode,
-            &do_team_switch, &vision_range, &reset_setup)) {
+            &do_team_switch, &opponents_enabled, &vision_range, &reset_setup)) {
         return NULL;
     }
 
@@ -812,7 +921,17 @@ static PyObject* py_env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     env->terminals = (unsigned char*)PyArray_DATA(term);
     env->truncations = (unsigned char*)PyArray_DATA(trunc);
     env->global_states = (float*)PyArray_DATA(gst);
-    init_env_common(env, seed, players_per_team, game_length, action_mode, do_team_switch, vision_range, reset_setup);
+    init_env_common(
+        env,
+        seed,
+        players_per_team,
+        game_length,
+        action_mode,
+        do_team_switch,
+        opponents_enabled,
+        vision_range,
+        reset_setup
+    );
 
     Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
     return PyLong_FromVoidPtr((void*)env);
@@ -838,6 +957,19 @@ static PyObject* py_env_step(PyObject* self, PyObject* args) {
     Env* env = unpack_env_handle(handle_obj);
     if (!env) return NULL;
     c_step(env);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_env_set_field_scale(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    float scale;
+    if (!PyArg_ParseTuple(args, "Of", &handle_obj, &scale)) {
+        return NULL;
+    }
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    apply_field_scale(env, scale);
+    compute_observations(env, -1);
     Py_RETURN_NONE;
 }
 
@@ -909,19 +1041,19 @@ static PyObject* py_env_close(PyObject* self, PyObject* args) {
 
 static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyObject *obs_obj, *act_obj, *rew_obj, *term_obj, *trunc_obj, *state_obj;
-    int num_envs, seed, players_per_team, game_length, action_mode, do_team_switch, reset_setup;
+    int num_envs, seed, players_per_team, game_length, action_mode, do_team_switch, opponents_enabled, reset_setup;
     float vision_range;
 
     static char* kwlist[] = {
         "observations", "actions", "rewards", "terminals", "truncations", "global_states",
         "num_envs", "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
-        "vision_range", "reset_setup", NULL
+        "opponents_enabled", "vision_range", "reset_setup", NULL
     };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiifi", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiiifi", kwlist,
             &obs_obj, &act_obj, &rew_obj, &term_obj, &trunc_obj, &state_obj,
             &num_envs, &seed, &players_per_team, &game_length, &action_mode,
-            &do_team_switch, &vision_range, &reset_setup)) {
+            &do_team_switch, &opponents_enabled, &vision_range, &reset_setup)) {
         return NULL;
     }
 
@@ -981,7 +1113,17 @@ static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         env->terminals = (unsigned char*)((char*)PyArray_DATA(term) + i * term_stride);
         env->truncations = (unsigned char*)((char*)PyArray_DATA(trunc) + i * trunc_stride);
         env->global_states = (float*)((char*)PyArray_DATA(gst) + i * state_stride);
-        init_env_common(env, seed + i*7919, players_per_team, game_length, action_mode, do_team_switch, vision_range, reset_setup);
+        init_env_common(
+            env,
+            seed + i*7919,
+            players_per_team,
+            game_length,
+            action_mode,
+            do_team_switch,
+            opponents_enabled,
+            vision_range,
+            reset_setup
+        );
     }
 
     Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
@@ -1015,6 +1157,21 @@ static PyObject* py_vec_step(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* py_vec_set_field_scale(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    float scale;
+    if (!PyArg_ParseTuple(args, "Of", &handle_obj, &scale)) {
+        return NULL;
+    }
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++) {
+        apply_field_scale(&vec->envs[i], scale);
+        compute_observations(&vec->envs[i], -1);
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject* py_vec_log(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
@@ -1026,6 +1183,8 @@ static PyObject* py_vec_log(PyObject* self, PyObject* args) {
         Log* log = &vec->envs[i].log;
         aggregate.score += log->score;
         aggregate.episode_return += log->episode_return;
+        aggregate.blue_team_episode_return += log->blue_team_episode_return;
+        aggregate.red_team_episode_return += log->red_team_episode_return;
         aggregate.episode_length += log->episode_length;
         aggregate.wins_blue += log->wins_blue;
         aggregate.wins_red += log->wins_red;
@@ -1088,6 +1247,7 @@ static PyMethodDef Methods[] = {
     {"env_init", (PyCFunction)py_env_init, METH_VARARGS | METH_KEYWORDS, "Initialize one env"},
     {"env_reset", py_env_reset, METH_VARARGS, "Reset one env"},
     {"env_step", py_env_step, METH_VARARGS, "Step one env"},
+    {"env_set_field_scale", py_env_set_field_scale, METH_VARARGS, "Set one env field scale"},
     {"env_log", py_env_log, METH_VARARGS, "Get one env log"},
     {"env_get_last_scores", py_env_get_last_scores, METH_VARARGS, "Get last scalar env scores"},
     {"env_get_state", py_env_get_state, METH_VARARGS, "Get one env state"},
@@ -1095,6 +1255,7 @@ static PyMethodDef Methods[] = {
     {"vec_init", (PyCFunction)py_vec_init, METH_VARARGS | METH_KEYWORDS, "Initialize vector env"},
     {"vec_reset", py_vec_reset, METH_VARARGS, "Reset vector env"},
     {"vec_step", py_vec_step, METH_VARARGS, "Step vector env"},
+    {"vec_set_field_scale", py_vec_set_field_scale, METH_VARARGS, "Set vector env field scale"},
     {"vec_log", py_vec_log, METH_VARARGS, "Get vector log"},
     {"vec_get_last_scores", py_vec_get_last_scores, METH_VARARGS, "Get last vector env scores"},
     {"vec_get_state", py_vec_get_state, METH_VARARGS, "Get one env state from vector env"},

@@ -80,8 +80,26 @@ def refine_candidates(best_value: int, max_value: int) -> list[int]:
     return list(range(start, end + 1))
 
 
-def batch_candidates(num_shards: int) -> list[int]:
-    values = set()
+def batch_candidates(num_shards: int, shard_num_envs: int) -> list[int]:
+    """Return valid multiprocessing batch sizes measured in environments.
+
+    PufferLib's multiprocessing vectorizer groups whole worker payloads into a batch. In
+    this project each worker owns `shard_num_envs` logical environments, so a valid batch
+    size must be an integer number of workers times that shard size. Generating raw worker
+    counts here keeps the search focused on a few simple, high-value options while still
+    guaranteeing that every returned batch size is accepted by the runtime.
+
+    This helper is separate from the main search loop because the batch-size constraint is
+    easy to get subtly wrong: the value must divide the total number of environments and it
+    must also be divisible by the number of environments assigned to each worker. Encoding
+    those rules once prevents the autotuner from repeatedly probing impossible layouts.
+    """
+    if num_shards < 1:
+        raise ValueError("num_shards must be positive")
+    if shard_num_envs < 1:
+        raise ValueError("shard_num_envs must be positive")
+
+    worker_batch_sizes = set()
     for candidate in (
         1,
         2,
@@ -91,8 +109,9 @@ def batch_candidates(num_shards: int) -> list[int]:
         max(1, num_shards // 4),
     ):
         if candidate <= num_shards and num_shards % candidate == 0:
-            values.add(candidate)
-    return sorted(values)
+            worker_batch_sizes.add(candidate)
+
+    return sorted(worker_count * shard_num_envs for worker_count in worker_batch_sizes)
 
 
 def action_cache(cache: int, num_agents: int, action_mode: str) -> np.ndarray:
@@ -181,12 +200,15 @@ def run_benchmark(
     from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv
 
     if backend != "native":
+        total_envs = shard_num_envs * num_shards
         if batch_size is None:
             raise ValueError("batch_size must be set for multiprocessing benchmarks")
-        if batch_size > num_shards or num_shards % batch_size != 0:
+        if batch_size > total_envs or total_envs % batch_size != 0:
             raise ValueError(
-                "for zero_copy multiprocessing, num_shards must be divisible by batch_size"
+                "for zero_copy multiprocessing, total envs must be divisible by batch_size"
             )
+        if batch_size % shard_num_envs != 0:
+            raise ValueError("batch_size must be divisible by (num_envs / num_workers)")
 
     vecenv = make_soccer_vecenv(
         players_per_team=players_per_team,
@@ -273,7 +295,7 @@ def multiprocessing_configs_for_total_envs(
         if total_envs % num_shards != 0:
             continue
         shard_num_envs = total_envs // num_shards
-        for batch_size in batch_candidates(num_shards):
+        for batch_size in batch_candidates(num_shards, shard_num_envs):
             configs.append(
                 SearchConfig(
                     backend="multiprocessing",
@@ -327,7 +349,7 @@ def _evaluate_search_space(
     def evaluate_levels(
         stage: str, levels: list[tuple[int, list[SearchConfig]]], allow_early_stop: bool
     ) -> None:
-        best_sps_so_far = 0
+        best_sps_so_far = 0.0
         plateau_count = 0
         saturated_seen = False
         for total_envs, configs in levels:

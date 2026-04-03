@@ -218,6 +218,7 @@ __marimo__/
 build/
 dist/
 .pytest_cache/
+sbatch-tmp/
 .venv/
 venv/
 experiments/
@@ -226,3 +227,7 @@ wandb/
 .axon/
 .opencode/
 AGENTS.md
+*.err
+*.out
+tmp
+srun-logs

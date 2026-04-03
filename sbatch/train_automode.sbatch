@@ -1,0 +1,176 @@
+#!/bin/bash
+#
+#SBATCH --job-name=puffer_soccer_auto
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=48:00:00
+#SBATCH --account=torch_pr_45_tandon_advanced
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=fyy2003@nyu.edu
+#SBATCH --chdir=/scratch/fyy2003/repos/Puffer-Soccer
+#SBATCH --output=/scratch/fyy2003/repos/Puffer-Soccer/sbatch/logs/%x-%j.out
+#SBATCH --error=/scratch/fyy2003/repos/Puffer-Soccer/sbatch/logs/%x-%j.err
+
+set -euo pipefail
+
+REPO_ROOT="$(pwd -P)"
+JOB_COPY_BASE="$REPO_ROOT/sbatch-tmp"
+JOB_COPY_ROOT="$JOB_COPY_BASE/${SLURM_JOB_ID:-local}"
+JOB_WORKSPACE_ROOT="$JOB_COPY_ROOT/$(basename "$REPO_ROOT")"
+SCRATCH_BASE="/scratch/$USER"
+LOCAL_TMP_BASE="/tmp/$USER"
+APPTAINER_IMAGE="docker://quay.io/pypa/manylinux_2_28_x86_64"
+
+if [ "${TRAIN_AUTOMODE_PRINT_ROOT_ONLY:-0}" = "1" ]; then
+    printf 'REPO_ROOT=%s\n' "$REPO_ROOT"
+    printf 'JOB_WORKSPACE_ROOT=%s\n' "$JOB_WORKSPACE_ROOT"
+    exit 0
+fi
+
+export APPTAINER_CACHEDIR="${TRAIN_AUTOMODE_APPTAINER_CACHEDIR:-$SCRATCH_BASE/.cache/apptainer}"
+export SINGULARITY_CACHEDIR="$APPTAINER_CACHEDIR"
+export APPTAINER_TMPDIR="${TRAIN_AUTOMODE_APPTAINER_TMPDIR:-$LOCAL_TMP_BASE/apptainer-tmp-${SLURM_JOB_ID:-local}}"
+export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$SCRATCH_BASE/.cache/uv}"
+export TMPDIR="${TMPDIR:-$SCRATCH_BASE/tmp}"
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$SCRATCH_BASE/.venvs/puffer-soccer-${SLURM_JOB_ID:-local}}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+mkdir -p \
+    "$APPTAINER_CACHEDIR" \
+    "$APPTAINER_TMPDIR" \
+    "$UV_CACHE_DIR" \
+    "$TMPDIR" \
+    "$(dirname "$UV_PROJECT_ENVIRONMENT")" \
+    "$REPO_ROOT/sbatch/logs" \
+    "$JOB_COPY_BASE"
+
+rm -rf "$JOB_COPY_ROOT"
+mkdir -p "$JOB_COPY_ROOT"
+rsync -a --delete --exclude 'sbatch-tmp/' "$REPO_ROOT/" "$JOB_WORKSPACE_ROOT/"
+
+printf 'REPO_ROOT=%s\n' "$REPO_ROOT"
+printf 'JOB_WORKSPACE_ROOT=%s\n' "$JOB_WORKSPACE_ROOT"
+printf 'APPTAINER_CACHEDIR=%s\n' "$APPTAINER_CACHEDIR"
+printf 'APPTAINER_TMPDIR=%s\n' "$APPTAINER_TMPDIR"
+
+module purge
+
+apptainer exec --nv \
+    --bind "$JOB_WORKSPACE_ROOT:/workspace" \
+    --pwd /workspace \
+    "$APPTAINER_IMAGE" \
+    bash -lc '
+set -euo pipefail
+
+cd /workspace
+
+export APPTAINER_CACHEDIR="'"$APPTAINER_CACHEDIR"'"
+export SINGULARITY_CACHEDIR="$APPTAINER_CACHEDIR"
+export APPTAINER_TMPDIR="'"$APPTAINER_TMPDIR"'"
+export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
+export UV_CACHE_DIR="'"$UV_CACHE_DIR"'"
+export TMPDIR="'"$TMPDIR"'"
+export UV_PROJECT_ENVIRONMENT="'"$UV_PROJECT_ENVIRONMENT"'"
+export PYTHONUNBUFFERED="'"$PYTHONUNBUFFERED"'"
+
+# Keep native extension builds from fanning out across many compiler workers.
+export MAX_JOBS="${MAX_JOBS:-1}"
+
+# Tune these per GPU if needed. The defaults target low-priority top-up work
+# that keeps scheduler-visible utilization near 70% without trying to fully
+# saturate the device.
+export GPU_HEARTBEAT_TARGET_UTILIZATION="${GPU_HEARTBEAT_TARGET_UTILIZATION:-70}"
+export GPU_HEARTBEAT_CHECK_INTERVAL="${GPU_HEARTBEAT_CHECK_INTERVAL:-0.2}"
+export GPU_HEARTBEAT_MATRIX_SIZE="${GPU_HEARTBEAT_MATRIX_SIZE:-6144}"
+export GPU_HEARTBEAT_UTILIZATION_TOLERANCE="${GPU_HEARTBEAT_UTILIZATION_TOLERANCE:-3}"
+export GPU_HEARTBEAT_MIN_COMPUTE_SECONDS="${GPU_HEARTBEAT_MIN_COMPUTE_SECONDS:-0.10}"
+export GPU_HEARTBEAT_MAX_COMPUTE_SECONDS="${GPU_HEARTBEAT_MAX_COMPUTE_SECONDS:-1.20}"
+export GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS="${GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS:-0.03}"
+export GPU_HEARTBEAT_MATMULS_PER_CHUNK="${GPU_HEARTBEAT_MATMULS_PER_CHUNK:-8}"
+export GPU_HEARTBEAT_DTYPE="${GPU_HEARTBEAT_DTYPE:-bfloat16}"
+export TRAIN_AUTOMODE_HYPERPARAMETERS_PATH="${TRAIN_AUTOMODE_HYPERPARAMETERS_PATH:-experiments/autoload_hyperparameters.json}"
+export TRAIN_AUTOMODE_PPO_ITERATIONS="${TRAIN_AUTOMODE_PPO_ITERATIONS:-100000}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS="${TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS:-8}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS="${TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS:-$TRAIN_AUTOMODE_PPO_ITERATIONS}"
+export TRAIN_AUTOMODE_NO_OPPONENT_EVAL_INTERVAL="${TRAIN_AUTOMODE_NO_OPPONENT_EVAL_INTERVAL:-4}"
+export TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD="${TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD:-0.80}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD="${TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD:-0.0}"
+export TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES="${TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES:-100}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER="${TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER:-0.2,0.4,0.6,0.8,1.0}"
+export TRAIN_AUTOMODE_PRETUNE_VECENV="${TRAIN_AUTOMODE_PRETUNE_VECENV:-1}"
+export TRAIN_AUTOMODE_PRETUNE_VECENV_BACKEND="${TRAIN_AUTOMODE_PRETUNE_VECENV_BACKEND:-auto}"
+export TRAIN_AUTOMODE_PRETUNE_AUTOTUNE_SECONDS="${TRAIN_AUTOMODE_PRETUNE_AUTOTUNE_SECONDS:-1.0}"
+export TRAIN_AUTOMODE_PRETUNE_MAX_NUM_ENVS="${TRAIN_AUTOMODE_PRETUNE_MAX_NUM_ENVS:-}"
+export TRAIN_AUTOMODE_PRETUNE_MAX_NUM_SHARDS="${TRAIN_AUTOMODE_PRETUNE_MAX_NUM_SHARDS:-}"
+export TRAIN_AUTOMODE_PRETUNE_SELECTION_MODE="${TRAIN_AUTOMODE_PRETUNE_SELECTION_MODE:-training_like}"
+export TRAIN_AUTOMODE_PRETUNE_DEVICE="${TRAIN_AUTOMODE_PRETUNE_DEVICE:-auto}"
+export TRAIN_AUTOMODE_PRETUNE_TRAINING_SECONDS="${TRAIN_AUTOMODE_PRETUNE_TRAINING_SECONDS:-6.0}"
+export TRAIN_AUTOMODE_PRETUNE_SHORTLIST_PER_BACKEND="${TRAIN_AUTOMODE_PRETUNE_SHORTLIST_PER_BACKEND:-3}"
+export TRAIN_AUTOMODE_FINAL_BEST_EVAL_GAMES="${TRAIN_AUTOMODE_FINAL_BEST_EVAL_GAMES:-256}"
+export TRAIN_AUTOMODE_BEST_PROMOTION_CONFIDENCE="${TRAIN_AUTOMODE_BEST_PROMOTION_CONFIDENCE:-0.95}"
+export TRAIN_AUTOMODE_BEST_PROMOTION_MIN_BATCHES="${TRAIN_AUTOMODE_BEST_PROMOTION_MIN_BATCHES:-4}"
+export TRAIN_AUTOMODE_BEST_PROMOTION_MAX_BATCHES="${TRAIN_AUTOMODE_BEST_PROMOTION_MAX_BATCHES:-64}"
+export TRAIN_AUTOMODE_EXTRA_ARGS="${TRAIN_AUTOMODE_EXTRA_ARGS:-}"
+
+uv sync --python /opt/python/cp312-cp312/bin/python
+
+cleanup() {
+    if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
+        kill "$HEARTBEAT_PID"
+        wait "$HEARTBEAT_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+nice -n 19 uv run python -u sbatch/gpu_heartbeat.py &
+HEARTBEAT_PID=$!
+echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
+
+if [ "$TRAIN_AUTOMODE_PRETUNE_VECENV" = "1" ]; then
+    PRETUNE_ARGS=(
+        uv run python -u scripts/pretune_train_automode_sps.py
+        --output-path "$TRAIN_AUTOMODE_HYPERPARAMETERS_PATH"
+        --players-per-team 5
+        --vec-backend "$TRAIN_AUTOMODE_PRETUNE_VECENV_BACKEND"
+        --autotune-seconds "$TRAIN_AUTOMODE_PRETUNE_AUTOTUNE_SECONDS"
+        --selection-mode "$TRAIN_AUTOMODE_PRETUNE_SELECTION_MODE"
+        --device "$TRAIN_AUTOMODE_PRETUNE_DEVICE"
+        --training-benchmark-seconds "$TRAIN_AUTOMODE_PRETUNE_TRAINING_SECONDS"
+        --training-shortlist-per-backend "$TRAIN_AUTOMODE_PRETUNE_SHORTLIST_PER_BACKEND"
+    )
+    if [ -n "$TRAIN_AUTOMODE_PRETUNE_MAX_NUM_ENVS" ]; then
+        PRETUNE_ARGS+=(
+            --autotune-max-num-envs "$TRAIN_AUTOMODE_PRETUNE_MAX_NUM_ENVS"
+        )
+    fi
+    if [ -n "$TRAIN_AUTOMODE_PRETUNE_MAX_NUM_SHARDS" ]; then
+        PRETUNE_ARGS+=(
+            --autotune-max-num-shards "$TRAIN_AUTOMODE_PRETUNE_MAX_NUM_SHARDS"
+        )
+    fi
+
+    echo "Pretuning self-play vecenv layout before training"
+    "${PRETUNE_ARGS[@]}"
+fi
+
+uv run python -u scripts/train_pufferl.py \
+    --hyperparameters-path "$TRAIN_AUTOMODE_HYPERPARAMETERS_PATH" \
+    --device cuda \
+    --wandb \
+    --wandb-project robot-soccer \
+    --ppo-iterations "$TRAIN_AUTOMODE_PPO_ITERATIONS" \
+    --no-opponent-phase-min-iterations "$TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS" \
+    --no-opponent-phase-max-iterations "$TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS" \
+    --no-opponent-phase-eval-interval "$TRAIN_AUTOMODE_NO_OPPONENT_EVAL_INTERVAL" \
+    --no-opponent-phase-goal-rate-threshold "$TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD" \
+    --no-opponent-phase-multi-goal-rate-threshold "$TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD" \
+    --no-opponent-eval-games "$TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES" \
+    --no-opponent-map-scale-ladder "$TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER" \
+    --final-best-eval-games "$TRAIN_AUTOMODE_FINAL_BEST_EVAL_GAMES" \
+    --best-checkpoint-promotion-confidence "$TRAIN_AUTOMODE_BEST_PROMOTION_CONFIDENCE" \
+    --best-checkpoint-promotion-min-batches "$TRAIN_AUTOMODE_BEST_PROMOTION_MIN_BATCHES" \
+    --best-checkpoint-promotion-max-batches "$TRAIN_AUTOMODE_BEST_PROMOTION_MAX_BATCHES" \
+    $TRAIN_AUTOMODE_EXTRA_ARGS
+'
