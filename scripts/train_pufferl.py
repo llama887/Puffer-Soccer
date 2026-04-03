@@ -30,6 +30,12 @@ from puffer_soccer.autotune import (
     vec_config_from_benchmark,
 )
 from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.league import (
+    LeagueConfig,
+    LeagueEntry,
+    LeagueManager,
+    league_assignment_histogram,
+)
 from puffer_soccer.torch_loader import import_torch
 from puffer_soccer.vector_env import (
     VecEnvConfig,
@@ -114,6 +120,12 @@ RUN_VIDEO_FILENAMES = {
     "best_checkpoint": "best_checkpoint.mp4",
 }
 PERIODIC_EVAL_VIDEO_NAMESPACE = "video/evals"
+RL_ALG_SELF_PLAY = "self_play"
+RL_ALG_LEAGUE = "league"
+RL_ALG_MARLODONNA = "marlodonna"
+KL_REGULARIZATION_AUTO = "auto"
+KL_REGULARIZATION_ON = "on"
+KL_REGULARIZATION_OFF = "off"
 
 
 class Policy(torch.nn.Module):
@@ -137,14 +149,14 @@ class Policy(torch.nn.Module):
         )
         self.value_head = torch.nn.Linear(256, 1)
 
-    def forward(self, observations, state=None):
+    def forward(self, observations, _state=None):
         hidden = self.net(observations)
         logits = self.action_head(hidden)
         values = self.value_head(hidden)
         return logits, values
 
-    def forward_eval(self, observations, state=None):
-        return self.forward(observations, state=state)
+    def forward_eval(self, observations, _state=None):
+        return self.forward(observations, _state=_state)
 
 
 @dataclass(frozen=True)
@@ -185,6 +197,39 @@ class PeriodicEvalVideoTarget:
     baseline_label: str
     filename_stem: str
     baseline_epoch: int | None = None
+
+
+@dataclass(frozen=True)
+class LeagueEvaluationSummary:
+    """Store one aggregated league evaluation result for logging and promotion.
+
+    League-style training changes the meaning of progress from "did we beat one old model?"
+    to "how well do we perform against the whole retained opponent pool?" This dataclass keeps
+    the aggregate metrics and the per-opponent breakdown together so stdout, W&B, summaries,
+    and promotion logic all read from the same source of truth.
+    """
+
+    aggregate_win_rate: float
+    aggregate_score_diff: float
+    opponent_count: int
+    per_opponent: dict[int, dict[str, float]]
+
+
+@dataclass(frozen=True)
+class StandardizedLeagueEvalSummary:
+    """Describe one fixed-opponent standardized evaluation used by MARLadona mode.
+
+    The MARLadona-style path wants a stable behavioral yardstick in addition to the changing
+    full-league aggregate. In our environment we do not have the paper's scripted bot, so we
+    standardize on a fixed retained league opponent instead. This summary keeps that signal
+    explicit and easy to serialize.
+    """
+
+    opponent_entry_id: int
+    opponent_epoch: int
+    win_rate: float
+    score_diff: float
+    games: float
 
 
 def forward_policy_eval(
@@ -714,6 +759,283 @@ class HeadToHeadEvaluator:
         self.eval_env.close()
 
 
+class LeagueTrainingWrapper(pufferlib.PufferEnv):
+    """Expose only learner-controlled agents while frozen league opponents act internally.
+
+    Ordinary self-play lets the live policy control every active agent, but league training
+    needs a different data-collection contract: PPO should update only the learner side, while
+    the opposing side is filled by frozen snapshots sampled from a capped policy pool. This
+    wrapper keeps that behavior local to one place instead of spreading hidden-opponent action
+    assembly across the trainer loop.
+
+    The wrapper also supports side balancing. Half of the environments expose the blue team as
+    the learner side and the other half expose the red team. That keeps the training data from
+    collapsing onto one field orientation while still preserving the simple "one policy per
+    whole opponent team" rule requested by the MARLadona comparison.
+    """
+
+    def __init__(
+        self,
+        env: pufferlib.PufferEnv,
+        *,
+        players_per_team: int,
+        device: str,
+        league_manager: LeagueManager,
+    ) -> None:
+        """Wrap one vector environment and hide the frozen opponent-controlled agents.
+
+        The active soccer environment always orders agents blue-first then red-second inside
+        each environment shard. We rely on that invariant to build static learner/opponent
+        index maps once and then reuse them throughout training.
+        """
+
+        if not getattr(env, "opponents_enabled", True):
+            raise ValueError("LeagueTrainingWrapper requires opponents_enabled=True")
+        if players_per_team < 1:
+            raise ValueError("players_per_team must be positive")
+
+        self.env = env
+        self.players_per_team = players_per_team
+        self.device = device
+        self.league_manager = league_manager
+        self.num_envs = int(getattr(env, "num_envs", 1))
+        self.num_players = players_per_team * 2
+        self.current_on_blue = make_side_assignment(self.num_envs)
+        self.single_observation_space = env.single_observation_space
+        self.single_action_space = env.single_action_space
+        self.opponents_enabled = True
+        self._full_action_template = np.zeros_like(env.actions)
+        self._learner_indices = self._build_flat_indices(current_side=True)
+        self._opponent_indices = self._build_flat_indices(current_side=False)
+        self.num_agents = int(self._learner_indices.size)
+        self._opponent_policy_cache: dict[int, Policy] = {}
+        self._active_opponent_entry_ids = np.zeros((self.num_envs,), dtype=np.int64)
+        self._latest_opponent_histogram: dict[int, int] = {}
+
+        super().__init__()
+
+    def _build_flat_indices(self, *, current_side: bool) -> np.ndarray:
+        """Build flat agent indices for either the learner side or the hidden opponents.
+
+        Keeping the mapping deterministic and precomputed avoids repeated per-step index
+        construction in the rollout loop, which matters because training calls ``step`` many
+        thousands of times.
+        """
+
+        result = np.empty((self.num_envs * self.players_per_team,), dtype=np.int32)
+        write_ptr = 0
+        for env_idx in range(self.num_envs):
+            env_start = env_idx * self.num_players
+            blue_slice = np.arange(env_start, env_start + self.players_per_team)
+            red_slice = np.arange(
+                env_start + self.players_per_team, env_start + self.num_players
+            )
+            if self.current_on_blue[env_idx] == current_side:
+                chosen = blue_slice
+            else:
+                chosen = red_slice
+            result[write_ptr : write_ptr + self.players_per_team] = chosen
+            write_ptr += self.players_per_team
+        return result
+
+    def _copy_learner_outputs(self) -> None:
+        """Mirror only learner-facing rows from the wrapped env into PPO-facing buffers.
+
+        PPO should update only the learner-controlled agents. Slicing the wrapped buffers here
+        keeps that contract explicit and consistent across reset, step, and curriculum updates.
+        """
+
+        # `pufferlib.PufferEnv` allocates these buffers dynamically during `super().__init__`.
+        # pylint: disable=no-member
+        self.observations[:] = self.env.observations[self._learner_indices]
+        self.rewards[:] = self.env.rewards[self._learner_indices]
+        self.terminals[:] = self.env.terminals[self._learner_indices]
+        self.truncations[:] = self.env.truncations[self._learner_indices]
+        self.masks[:] = self.env.masks[self._learner_indices]
+
+    def _policy_for_entry(self, entry_id: int) -> Policy:
+        """Return a cached frozen policy module for one league entry id.
+
+        Reloading a model on every environment step would be unnecessarily expensive. The
+        wrapper therefore caches one policy module per retained league entry and only rebuilds
+        it when the trainer adds a new snapshot to the league.
+        """
+
+        cached = self._opponent_policy_cache.get(entry_id)
+        if cached is not None:
+            return cached
+        entry = self.league_manager.resolve_entry(entry_id)
+        policy = Policy(self.env).to(self.device)
+        policy.load_state_dict(entry.state_dict, strict=True)
+        policy.eval()
+        self._opponent_policy_cache[entry_id] = policy
+        return policy
+
+    def refresh_league(self) -> None:
+        """Refresh cached opponent policies and resample env assignments after promotion.
+
+        When the trainer promotes a new snapshot into the league, the wrapper should start
+        using it for future hidden-opponent assignments immediately. Clearing the stale-cache
+        entries keeps memory bounded and ensures every resampled environment can see the new
+        pool.
+        """
+
+        active_ids = {entry.entry_id for entry in self.league_manager.entries}
+        stale_ids = [
+            entry_id
+            for entry_id in self._opponent_policy_cache
+            if entry_id not in active_ids
+        ]
+        for entry_id in stale_ids:
+            del self._opponent_policy_cache[entry_id]
+        self._active_opponent_entry_ids[:] = np.asarray(
+            self.league_manager.sample_entry_ids(self.num_envs), dtype=np.int64
+        )
+        self._latest_opponent_histogram = league_assignment_histogram(
+            self._active_opponent_entry_ids.tolist()
+        )
+
+    def latest_opponent_histogram(self) -> dict[int, int]:
+        """Return the most recent per-opponent environment assignment counts.
+
+        This signal is primarily for logging and debugging. It gives a quick check that uniform
+        sampling is actually exercising the current pool instead of accidentally collapsing onto
+        one retained opponent.
+        """
+
+        return dict(self._latest_opponent_histogram)
+
+    def sampled_preview_entry_id(self) -> int:
+        """Return one currently assigned opponent id for replay export and logging.
+
+        The training loop periodically writes one video against a sampled active league
+        opponent. Exposing a stable accessor keeps that choice explicit without leaking the
+        wrapper's internal assignment array shape into the caller.
+        """
+
+        return int(self._active_opponent_entry_ids[0])
+
+    def _compute_hidden_opponent_actions(self, full_obs: np.ndarray) -> np.ndarray:
+        """Run frozen league opponents and return their actions for the current full state.
+
+        Each environment reuses one sampled frozen policy for its whole opponent team, matching
+        the MARLadona "same policy per team" rule. We batch environments that share the same
+        opponent entry id so the hidden-opponent inference path stays efficient even when many
+        environments are running in parallel.
+        """
+
+        opponent_actions = np.zeros((self._opponent_indices.size,), dtype=np.int32)
+        write_blocks: dict[int, list[int]] = {}
+        for env_idx, entry_id in enumerate(self._active_opponent_entry_ids.tolist()):
+            write_blocks.setdefault(int(entry_id), []).append(env_idx)
+        with torch.no_grad():
+            for entry_id, env_list in write_blocks.items():
+                row_indices: list[int] = []
+                action_positions: list[int] = []
+                for env_idx in env_list:
+                    block_start = env_idx * self.players_per_team
+                    row_indices.extend(
+                        self._opponent_indices[
+                            block_start : block_start + self.players_per_team
+                        ].tolist()
+                    )
+                    action_positions.extend(
+                        range(block_start, block_start + self.players_per_team)
+                    )
+                obs_tensor = torch.as_tensor(
+                    full_obs[np.asarray(row_indices, dtype=np.int32)],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                logits, _ = forward_policy_eval(
+                    self._policy_for_entry(int(entry_id)), obs_tensor
+                )
+                predicted_actions = (
+                    torch.argmax(logits, dim=-1)
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32, copy=False)
+                )
+                opponent_actions[np.asarray(action_positions, dtype=np.int32)] = (
+                    predicted_actions
+                )
+        return opponent_actions
+
+    def _resample_completed_envs(
+        self,
+        terminals: np.ndarray,
+        truncations: np.ndarray,
+    ) -> None:
+        """Resample hidden-opponent assignments for environments that just finished.
+
+        The same frozen policy should stay attached to an environment for the duration of one
+        episode. Once that episode ends, the next reset gets a freshly sampled opponent from the
+        current league.
+        """
+
+        done_envs = np.flatnonzero(
+            terminals.reshape(self.num_envs, self.num_players).all(axis=1)
+            | truncations.reshape(self.num_envs, self.num_players).all(axis=1)
+        )
+        if done_envs.size == 0:
+            return
+        replacement_ids = self.league_manager.sample_entry_ids(int(done_envs.size))
+        self._active_opponent_entry_ids[done_envs] = np.asarray(
+            replacement_ids, dtype=np.int64
+        )
+        self._latest_opponent_histogram = league_assignment_histogram(
+            self._active_opponent_entry_ids.tolist()
+        )
+
+    def reset(self, seed: int | None = None):
+        """Reset the wrapped environment and sample one frozen opponent per environment.
+
+        League training only makes sense when the hidden-opponent pool is populated, so the
+        wrapper refreshes its per-environment assignments on every reset before surfacing the
+        learner-only observations to PPO.
+        """
+
+        _obs, info = self.env.reset(seed=seed)
+        self.refresh_league()
+        self._copy_learner_outputs()
+        # `pufferlib.PufferEnv` allocates this buffer dynamically during `super().__init__`.
+        # pylint: disable=no-member
+        return self.observations, info
+
+    def step(self, actions: np.ndarray):
+        """Inject learner and hidden-opponent actions into the wrapped environment step.
+
+        PPO passes actions only for the learner side. This method expands them into the full
+        action array expected by the wrapped environment, fills the opposing side with frozen
+        league actions, steps the environment, and then slices the resulting transition back
+        down to learner-controlled rows.
+        """
+
+        if actions.shape[0] != self.num_agents:
+            raise ValueError(
+                "LeagueTrainingWrapper expected "
+                f"{self.num_agents} learner actions, received {actions.shape[0]}"
+            )
+        expanded_actions = self._full_action_template
+        expanded_actions.fill(0)
+        expanded_actions[self._learner_indices] = actions
+        expanded_actions[self._opponent_indices] = self._compute_hidden_opponent_actions(
+            self.env.observations
+        )
+        _, _, _, _, info = self.env.step(expanded_actions)
+        self._resample_completed_envs(self.env.terminals, self.env.truncations)
+        self._copy_learner_outputs()
+        # `pufferlib.PufferEnv` allocates these buffers dynamically during `super().__init__`.
+        # pylint: disable=no-member
+        return self.observations, self.rewards, self.terminals, self.truncations, info
+
+    def close(self) -> None:
+        """Close the wrapped environment and release the cached frozen policies."""
+
+        self._opponent_policy_cache.clear()
+        self.env.close()
+
+
 class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
     """Expose only blue-team trajectories while preserving the native no-opponent simulator.
 
@@ -791,6 +1113,8 @@ class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
         consumes trajectories for the agents that can actually influence the warm-start task.
         """
 
+        # `pufferlib.PufferEnv` allocates these buffers dynamically during `super().__init__`.
+        # pylint: disable=no-member
         self.observations[:] = self.env.observations[self._blue_indices]
         self.rewards[:] = self.env.rewards[self._blue_indices]
         self.terminals[:] = self.env.terminals[self._blue_indices]
@@ -815,6 +1139,8 @@ class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
 
         self.env.reset(seed=seed)
         self._copy_blue_outputs()
+        # `pufferlib.PufferEnv` allocates this buffer dynamically during `super().__init__`.
+        # pylint: disable=no-member
         return self.observations, []
 
     def step(self, actions: np.ndarray):
@@ -828,6 +1154,8 @@ class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
         expanded_actions = self._expand_blue_actions(actions)
         _, _, _, _, infos = self.env.step(expanded_actions)
         self._copy_blue_outputs()
+        # `pufferlib.PufferEnv` allocates these buffers dynamically during `super().__init__`.
+        # pylint: disable=no-member
         return self.observations, self.rewards, self.terminals, self.truncations, infos
 
     def set_field_scale(self, scale: float) -> None:
@@ -1609,6 +1937,8 @@ def build_phase_train_config(
     max_minibatch_size = config.get("max_minibatch_size")
     requested_batch_size = phase_args.train_batch_size
     requested_minibatch_size = phase_args.minibatch_size
+    # This one gate intentionally checks the full autoload applicability contract in one place.
+    # pylint: disable=too-many-boolean-expressions
     if (
         phase_args._autoload_source_num_agents is not None
         and phase_args._autoload_batch_multiple is not None
@@ -2272,6 +2602,38 @@ def build_training_parser(
     parser.add_argument("--prio-alpha", type=float, default=0.8)
     parser.add_argument("--prio-beta0", type=float, default=0.2)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
+    parser.add_argument(
+        "--rl-alg",
+        type=str,
+        default=RL_ALG_SELF_PLAY,
+        choices=[RL_ALG_SELF_PLAY, RL_ALG_LEAGUE, RL_ALG_MARLODONNA],
+    )
+    parser.add_argument("--league-max-size", type=int, default=8)
+    parser.add_argument(
+        "--league-promotion-win-rate-threshold",
+        type=float,
+        default=0.75,
+    )
+    parser.add_argument(
+        "--marlodonna-eval-ratio",
+        type=float,
+        default=0.15,
+    )
+    parser.add_argument(
+        "--marlodonna-standardized-eval-games",
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
+        "--kl-regularization-mode",
+        type=str,
+        default=KL_REGULARIZATION_AUTO,
+        choices=[
+            KL_REGULARIZATION_AUTO,
+            KL_REGULARIZATION_ON,
+            KL_REGULARIZATION_OFF,
+        ],
+    )
     parser.add_argument("--no-regularization", action="store_true")
     parser.add_argument("--no-opponent-phase-min-iterations", type=int, default=8)
     parser.add_argument("--no-opponent-phase-max-iterations", type=int, default=128)
@@ -2365,6 +2727,21 @@ def build_training_parser(
         type=int,
         default=64,
     )
+    parser.add_argument(
+        "--cached-warm-start-path",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--reuse-cached-warm-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--save-cached-warm-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     if default_overrides:
         parser.set_defaults(**default_overrides)
     return parser
@@ -2413,6 +2790,88 @@ def parse_training_args(argv: list[str] | None = None):
             f"{Path(args.hyperparameters_path)}"
         )
     return args
+
+
+def resolve_kl_regularization_enabled(args) -> bool:
+    """Resolve the effective KL-regularization toggle from old and new CLI controls.
+
+    The project wants KL regularization to be an orthogonal comparison axis without breaking
+    older scripts that still rely on ``--no-regularization``. The new high-level mode flag is
+    therefore authoritative when it is set to ``on`` or ``off``. In ``auto`` mode we preserve
+    the legacy behavior exactly so existing runs remain reproducible.
+    """
+
+    if args.kl_regularization_mode == KL_REGULARIZATION_ON:
+        return True
+    if args.kl_regularization_mode == KL_REGULARIZATION_OFF:
+        return False
+    return not bool(args.no_regularization)
+
+
+def kl_regularization_summary(args) -> dict[str, object]:
+    """Return a compact description of how KL regularization is configured for this run.
+
+    The user wants every RL algorithm to be runnable with and without KL regularization. A
+    summary payload makes that comparison explicit in run metadata instead of requiring the
+    user to infer the effective setting from a mix of old and new flags later.
+    """
+
+    enabled = resolve_kl_regularization_enabled(args)
+    return {
+        "mode": str(args.kl_regularization_mode),
+        "enabled": bool(enabled),
+        "legacy_no_regularization_flag": bool(args.no_regularization),
+        "past_kl_coef": float(args.past_kl_coef),
+        "uniform_kl_base_coef": float(args.uniform_kl_base_coef),
+        "uniform_kl_power": float(args.uniform_kl_power),
+    }
+
+
+def build_league_config(args) -> LeagueConfig | None:
+    """Translate CLI flags into the league behavior used by the selected RL algorithm.
+
+    Ordinary self-play does not need league state, so this helper returns ``None`` for that
+    mode. The two league-style modes share most knobs, but MARLadona additionally enables a
+    standardized evaluation path and uses the paper-style league defaults.
+    """
+
+    if args.rl_alg == RL_ALG_SELF_PLAY:
+        return None
+    standardized_eval_enabled = args.rl_alg == RL_ALG_MARLODONNA
+    return LeagueConfig(
+        rl_alg=str(args.rl_alg),
+        max_size=int(args.league_max_size),
+        promotion_win_rate_threshold=float(
+            args.league_promotion_win_rate_threshold
+        ),
+        standardized_eval_ratio=float(args.marlodonna_eval_ratio)
+        if standardized_eval_enabled
+        else 0.0,
+        standardized_eval_enabled=standardized_eval_enabled,
+        side_balance=True,
+        opponent_sampling="uniform",
+        same_policy_per_team=True,
+    )
+
+
+def validate_rl_algorithm_args(args) -> None:
+    """Validate argument combinations introduced by the new RL algorithm modes.
+
+    The league-style modes add new configuration dimensions and it is easier to debug mistakes
+    when they fail fast with one clear message. Centralizing those checks also keeps the main
+    entrypoint focused on training flow rather than argument edge cases.
+    """
+
+    if args.league_max_size < 1:
+        raise ValueError("league-max-size must be positive")
+    if not 0.0 <= args.league_promotion_win_rate_threshold <= 1.0:
+        raise ValueError(
+            "league-promotion-win-rate-threshold must be in [0.0, 1.0]"
+        )
+    if not 0.0 <= args.marlodonna_eval_ratio < 1.0:
+        raise ValueError("marlodonna-eval-ratio must be in [0.0, 1.0)")
+    if args.marlodonna_standardized_eval_games < 1:
+        raise ValueError("marlodonna-standardized-eval-games must be positive")
 
 
 def make_side_assignment(num_envs: int) -> np.ndarray:
@@ -2469,6 +2928,82 @@ def summarize_match_results(
         "score_diff": float(np.mean(score_diffs[:games])),
         "games": float(games),
     }
+
+
+def evaluate_against_league(
+    *,
+    current_policy: Policy,
+    league_manager: LeagueManager,
+    evaluator: HeadToHeadEvaluator,
+    games_per_opponent: int,
+    seed: int,
+) -> LeagueEvaluationSummary:
+    """Evaluate the current policy against every retained league opponent snapshot.
+
+    League promotion is defined against the whole retained opponent pool rather than a single
+    past iterate. This helper centralizes that sweep so promotion, periodic logging, and final
+    summaries all use the same aggregate and per-opponent numbers.
+    """
+
+    if league_manager.size() < 1:
+        raise ValueError("cannot evaluate against an empty league")
+
+    per_opponent: dict[int, dict[str, float]] = {}
+    aggregate_win_rates: list[float] = []
+    aggregate_score_diffs: list[float] = []
+    for offset, entry in enumerate(league_manager.entries):
+        metrics = evaluator.evaluate(
+            current_policy,
+            entry.state_dict,
+            num_games=games_per_opponent,
+            seed=seed + offset * 1_000,
+        )
+        per_opponent[entry.entry_id] = {
+            "entry_id": float(entry.entry_id),
+            "source_epoch": float(entry.source_epoch),
+            "games": float(metrics["games"]),
+            "win_rate": float(metrics["win_rate"]),
+            "score_diff": float(metrics["score_diff"]),
+        }
+        aggregate_win_rates.append(float(metrics["win_rate"]))
+        aggregate_score_diffs.append(float(metrics["score_diff"]))
+
+    return LeagueEvaluationSummary(
+        aggregate_win_rate=float(np.mean(aggregate_win_rates)),
+        aggregate_score_diff=float(np.mean(aggregate_score_diffs)),
+        opponent_count=len(per_opponent),
+        per_opponent=per_opponent,
+    )
+
+
+def evaluate_standardized_league_opponent(
+    *,
+    current_policy: Policy,
+    standardized_entry: LeagueEntry,
+    evaluator: HeadToHeadEvaluator,
+    games: int,
+    seed: int,
+) -> StandardizedLeagueEvalSummary:
+    """Evaluate against one fixed retained opponent for MARLadona-style tracking.
+
+    The public MARLadona setup uses a separate standardized evaluation slice to make long-range
+    behavioral comparisons easier. Our environment does not expose their scripted bot baseline,
+    so we pin the standardized comparison to one fixed retained league snapshot instead.
+    """
+
+    metrics = evaluator.evaluate(
+        current_policy,
+        standardized_entry.state_dict,
+        num_games=games,
+        seed=seed,
+    )
+    return StandardizedLeagueEvalSummary(
+        opponent_entry_id=int(standardized_entry.entry_id),
+        opponent_epoch=int(standardized_entry.source_epoch),
+        win_rate=float(metrics["win_rate"]),
+        score_diff=float(metrics["score_diff"]),
+        games=float(metrics["games"]),
+    )
 
 
 def resolve_eval_vec_config(
@@ -2712,7 +3247,13 @@ def append_jsonl_record(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def serialize_vec_config(vec_config: VecEnvConfig) -> dict[str, object]:
-    """Convert a vector-layout choice into JSON-safe metadata."""
+    """Convert a vector-layout choice into JSON-safe metadata.
+
+    Several longer-running utilities now want to cache the exact environment layout that won
+    a prior autotune pass and reuse it in later jobs. Serializing the dataclass through one
+    helper keeps that on-disk representation stable across the trainer, the RL tuner, and the
+    small Slurm helper scripts that inspect those cache files.
+    """
 
     return {
         "backend": vec_config.backend,
@@ -2723,6 +3264,120 @@ def serialize_vec_config(vec_config: VecEnvConfig) -> dict[str, object]:
         "zero_copy": vec_config.zero_copy,
         "overwork": vec_config.overwork,
     }
+
+
+def deserialize_vec_config(payload: Mapping[str, object]) -> VecEnvConfig:
+    """Rebuild a ``VecEnvConfig`` from a cached JSON metadata record.
+
+    The tuning workflow now persists the chosen runtime layout so later sweeps do not have to
+    rerun the expensive vector-layout benchmark every time. Reconstructing the dataclass in one
+    helper keeps validation local, gives clear error messages when a cache file is malformed,
+    and guarantees every caller interprets the saved JSON fields the same way.
+    """
+
+    backend = payload.get("backend")
+    shard_num_envs = payload.get("shard_num_envs")
+    num_shards = payload.get("num_shards")
+    if not isinstance(backend, str) or not backend:
+        raise ValueError("vec_config payload is missing a valid backend")
+    if not isinstance(shard_num_envs, int) or shard_num_envs < 1:
+        raise ValueError("vec_config payload is missing a valid shard_num_envs")
+    if not isinstance(num_shards, int) or num_shards < 1:
+        raise ValueError("vec_config payload is missing a valid num_shards")
+
+    num_workers = payload.get("num_workers")
+    batch_size = payload.get("batch_size")
+    zero_copy = payload.get("zero_copy", True)
+    overwork = payload.get("overwork", False)
+    if num_workers is not None and not isinstance(num_workers, int):
+        raise ValueError("vec_config payload has a non-integer num_workers")
+    if batch_size is not None and not isinstance(batch_size, int):
+        raise ValueError("vec_config payload has a non-integer batch_size")
+    if not isinstance(zero_copy, bool):
+        raise ValueError("vec_config payload has a non-boolean zero_copy")
+    if not isinstance(overwork, bool):
+        raise ValueError("vec_config payload has a non-boolean overwork")
+
+    return VecEnvConfig(
+        backend=backend,
+        shard_num_envs=shard_num_envs,
+        num_shards=num_shards,
+        num_workers=num_workers,
+        batch_size=batch_size,
+        zero_copy=zero_copy,
+        overwork=overwork,
+    )
+
+
+def save_cached_warm_start(
+    path: Path,
+    *,
+    state_dict: Mapping[str, torch.Tensor],
+    epoch: int,
+    global_step: int,
+    final_metrics: Mapping[str, float] | None,
+    args,
+) -> None:
+    """Persist one completed warm-start snapshot for reuse in later runs.
+
+    The no-opponent warm-start is deterministic enough that rerunning it for every tuning
+    candidate wastes cluster time. This cache stores the exact policy snapshot plus the amount
+    of PPO budget and environment steps already consumed to produce it. Later runs can then
+    skip the warm-start phase while still preserving the same effective self-play budget they
+    would have had after a fresh warm-start.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "created_at_utc": current_timestamp(),
+        "players_per_team": int(args.players_per_team),
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "rl_alg": RL_ALG_SELF_PLAY,
+        "no_opponent_task_config": {
+            "goal_rate_threshold": float(args.no_opponent_phase_goal_rate_threshold),
+            "multi_goal_rate_threshold": float(
+                args.no_opponent_phase_multi_goal_rate_threshold
+            ),
+            "eval_games": int(args.no_opponent_eval_games),
+            "eval_max_steps": int(args.no_opponent_eval_max_steps),
+            "map_scale_ladder": str(args.no_opponent_map_scale_ladder),
+        },
+        "final_metrics": None if final_metrics is None else dict(final_metrics),
+        "state_dict": snapshot_policy_state(state_dict)
+        if isinstance(state_dict, torch.nn.Module)
+        else {
+            str(name): tensor.detach().cpu().clone()
+            for name, tensor in state_dict.items()
+        },
+    }
+    torch.save(payload, path)
+
+
+def load_cached_warm_start(path: Path) -> dict[str, object]:
+    """Load one previously saved warm-start cache file and validate its structure.
+
+    Reusing a warm-start is only safe when the cache contains the exact pieces the trainer
+    needs to emulate a finished warm-start phase: the policy tensors, the consumed iteration
+    count, and the consumed global-step count. This helper validates those fields up front so
+    later training code can stay simple and fail with one clear message if the cache is stale
+    or malformed.
+    """
+
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a dict warm-start payload in {path}")
+    state_dict = payload.get("state_dict")
+    epoch = payload.get("epoch")
+    global_step = payload.get("global_step")
+    if not isinstance(state_dict, dict) or not state_dict:
+        raise ValueError(f"Warm-start cache {path} is missing a valid state_dict")
+    if not isinstance(epoch, int) or epoch < 0:
+        raise ValueError(f"Warm-start cache {path} is missing a valid epoch")
+    if not isinstance(global_step, int) or global_step < 0:
+        raise ValueError(f"Warm-start cache {path} is missing a valid global_step")
+    return payload
 
 
 def build_best_artifact_name(run_id: str, epoch: int) -> str:
@@ -3366,6 +4021,26 @@ def print_match_summary(label: str, epoch: int, metrics: Mapping[str, float]) ->
     )
 
 
+def print_league_summary(
+    label: str,
+    epoch: int,
+    summary: LeagueEvaluationSummary,
+) -> None:
+    """Print one compact aggregate summary for the current retained league pool.
+
+    League training produces one extra level of hierarchy compared with ordinary head-to-head
+    evaluation: aggregate metrics over the full pool and per-opponent details underneath. The
+    stdout view should stay compact, so this helper prints only the aggregate line while the
+    detailed per-opponent numbers go to structured logs.
+    """
+
+    print(
+        f"{label} (epoch={epoch}, opponents={summary.opponent_count}): "
+        f"win_rate={summary.aggregate_win_rate:.3f}, "
+        f"score_diff={summary.aggregate_score_diff:.3f}"
+    )
+
+
 def log_video_artifact(
     logger,
     video_key: str,
@@ -3394,6 +4069,44 @@ def log_video_artifact(
         format=video_format,
     )
     logger.wandb.log(payload, step=step)
+
+
+def add_league_eval_logs(
+    *,
+    log_payload: dict[str, float],
+    summary: LeagueEvaluationSummary,
+    current_epoch: int,
+    current_size: int,
+    promotion_threshold: float,
+    opponent_histogram: Mapping[int, int],
+) -> None:
+    """Extend one W&B payload with aggregate and per-opponent league evaluation metrics.
+
+    The new league modes are only useful if we can tell whether the policy is improving against
+    the whole retained pool rather than overfitting to the latest snapshot. This helper records
+    both the aggregate signal and one metric namespace per retained opponent.
+    """
+
+    log_payload.update(
+        {
+            "evaluation/league/win_rate": float(summary.aggregate_win_rate),
+            "evaluation/league/score_diff": float(summary.aggregate_score_diff),
+            "evaluation/league/opponent_count": float(summary.opponent_count),
+            "evaluation/league/current_epoch": float(current_epoch),
+            "evaluation/league/current_size": float(current_size),
+            "evaluation/league/promotion_threshold": float(promotion_threshold),
+        }
+    )
+    for opponent_id, metrics in summary.per_opponent.items():
+        prefix = f"evaluation/league/opponent_{opponent_id:06d}"
+        log_payload[f"{prefix}/win_rate"] = float(metrics["win_rate"])
+        log_payload[f"{prefix}/score_diff"] = float(metrics["score_diff"])
+        log_payload[f"{prefix}/games"] = float(metrics["games"])
+        log_payload[f"{prefix}/source_epoch"] = float(metrics["source_epoch"])
+    for opponent_id, count in opponent_histogram.items():
+        log_payload[
+            f"evaluation/league/opponent_assignment_count_{int(opponent_id):06d}"
+        ] = float(count)
 
 
 def build_periodic_eval_video_targets(
@@ -3502,6 +4215,103 @@ def log_periodic_eval_match_videos(
         if video_path is None:
             continue
 
+        metric_prefix = periodic_eval_video_metric_prefix(
+            current_epoch=current_epoch,
+            filename_stem=target.filename_stem,
+        )
+        log_video_artifact(
+            logger,
+            f"{metric_prefix}/replay",
+            video_path,
+            args.video_fps,
+            global_step,
+            extra_payload={
+                "video/progress_step": float(global_step),
+                f"{metric_prefix}/current_epoch": float(current_epoch),
+                f"{metric_prefix}/baseline_epoch": -1.0
+                if target.baseline_epoch is None
+                else float(target.baseline_epoch),
+                f"{metric_prefix}/baseline_label": target.baseline_label,
+            },
+        )
+        saved_paths.append(video_path)
+    return saved_paths
+
+
+def log_periodic_league_match_videos(
+    policy: Policy,
+    args,
+    *,
+    logger,
+    current_epoch: int,
+    global_step: int,
+    league_manager: LeagueManager,
+    sampled_entry_id: int,
+) -> list[Path]:
+    """Render league-specific replay videos for sampled, oldest, and newest opponents.
+
+    The league modes add a new kind of behavioral question that ordinary self-play videos do
+    not answer: what does the current policy look like against the actual opponent pool it is
+    being trained on? Exporting one sampled matchup plus oldest/newest retained opponents makes
+    it easier to diagnose forgetting and strategy drift without overwhelming the run with many
+    redundant videos.
+    """
+
+    if not args.export_videos or league_manager.size() < 1:
+        return []
+
+    targets: list[PeriodicEvalVideoTarget] = []
+    sampled_entry = league_manager.resolve_entry(sampled_entry_id)
+    targets.append(
+        PeriodicEvalVideoTarget(
+            opponent=sampled_entry.state_dict,
+            baseline_label="league_sampled",
+            filename_stem=f"vs_league_sampled_entry_{sampled_entry.entry_id:06d}",
+            baseline_epoch=sampled_entry.source_epoch,
+        )
+    )
+    oldest_entry = league_manager.oldest()
+    if oldest_entry is not None and oldest_entry.entry_id != sampled_entry.entry_id:
+        targets.append(
+            PeriodicEvalVideoTarget(
+                opponent=oldest_entry.state_dict,
+                baseline_label="league_oldest",
+                filename_stem=f"vs_league_oldest_entry_{oldest_entry.entry_id:06d}",
+                baseline_epoch=oldest_entry.source_epoch,
+            )
+        )
+    newest_entry = league_manager.newest()
+    if newest_entry is not None and newest_entry.entry_id not in {
+        sampled_entry.entry_id,
+        -1 if oldest_entry is None else oldest_entry.entry_id,
+    }:
+        targets.append(
+            PeriodicEvalVideoTarget(
+                opponent=newest_entry.state_dict,
+                baseline_label="league_newest",
+                filename_stem=f"vs_league_newest_entry_{newest_entry.entry_id:06d}",
+                baseline_epoch=newest_entry.source_epoch,
+            )
+        )
+
+    run_tag = getattr(args, "run_video_tag", build_run_video_tag(time.time()))
+    saved_paths: list[Path] = []
+    for target in targets:
+        video_path = save_match_video(
+            policy,
+            args,
+            output_path=periodic_eval_video_path(
+                run_tag,
+                current_epoch=current_epoch,
+                filename_stem=target.filename_stem,
+            ),
+            label=f"league eval video ({target.filename_stem})",
+            opponents_enabled=True,
+            opponent_state_dict=target.opponent,
+            overwrite_existing=True,
+        )
+        if video_path is None:
+            continue
         metric_prefix = periodic_eval_video_metric_prefix(
             current_epoch=current_epoch,
             filename_stem=target.filename_stem,
@@ -3636,6 +4446,12 @@ def _build_run_summary(
     final_best_metrics: Mapping[str, float] | None,
     latest_no_opponent_metrics: Mapping[str, float] | None,
     final_no_opponent_metrics: Mapping[str, float] | None,
+    league_config: LeagueConfig | None,
+    league_manager: LeagueManager | None,
+    latest_league_metrics: LeagueEvaluationSummary | None,
+    final_league_metrics: LeagueEvaluationSummary | None,
+    latest_standardized_league_metrics: StandardizedLeagueEvalSummary | None,
+    final_standardized_league_metrics: StandardizedLeagueEvalSummary | None,
     model_path: Path,
     retained_past_checkpoint_epochs: Sequence[int],
 ) -> dict[str, object]:
@@ -3662,6 +4478,21 @@ def _build_run_summary(
             else None
             if latest_no_opponent_metrics is None
             else dict(latest_no_opponent_metrics)
+        )
+    if objective_metrics is None:
+        league_objective = (
+            final_league_metrics
+            if final_league_metrics is not None
+            else latest_league_metrics
+        )
+        objective_metrics = (
+            None
+            if league_objective is None
+            else {
+                "win_rate": float(league_objective.aggregate_win_rate),
+                "score_diff": float(league_objective.aggregate_score_diff),
+                "games": 0.0,
+            }
         )
     no_opponent_stage_scales = list(
         parse_no_opponent_scale_ladder(str(args.no_opponent_map_scale_ladder))
@@ -3695,6 +4526,36 @@ def _build_run_summary(
         "final_no_opponent_metrics": None
         if final_no_opponent_metrics is None
         else dict(final_no_opponent_metrics),
+        "rl_alg": str(args.rl_alg),
+        "league_config": None
+        if league_config is None
+        else league_config.__dict__.copy(),
+        "league_summary": None
+        if league_manager is None
+        else league_manager.summary(),
+        "latest_league_metrics": None
+        if latest_league_metrics is None
+        else {
+            "aggregate_win_rate": latest_league_metrics.aggregate_win_rate,
+            "aggregate_score_diff": latest_league_metrics.aggregate_score_diff,
+            "opponent_count": latest_league_metrics.opponent_count,
+            "per_opponent": latest_league_metrics.per_opponent,
+        },
+        "final_league_metrics": None
+        if final_league_metrics is None
+        else {
+            "aggregate_win_rate": final_league_metrics.aggregate_win_rate,
+            "aggregate_score_diff": final_league_metrics.aggregate_score_diff,
+            "opponent_count": final_league_metrics.opponent_count,
+            "per_opponent": final_league_metrics.per_opponent,
+        },
+        "latest_standardized_league_metrics": None
+        if latest_standardized_league_metrics is None
+        else latest_standardized_league_metrics.__dict__.copy(),
+        "final_standardized_league_metrics": None
+        if final_standardized_league_metrics is None
+        else final_standardized_league_metrics.__dict__.copy(),
+        "kl_mode_summary": kl_regularization_summary(args),
         "no_opponent_task_config": {
             "training_game_length": int(
                 resolve_no_opponent_game_length(args.no_opponent_eval_max_steps)
@@ -3737,6 +4598,9 @@ def main():
     args = parse_training_args()
     load_env_file(".env")
     run_start_time = time.time()
+    validate_rl_algorithm_args(args)
+    league_config = build_league_config(args)
+    effective_kl_regularization = resolve_kl_regularization_enabled(args)
 
     no_opponent_curriculum = NoOpponentCurriculumConfig.from_args(args)
     no_opponent_curriculum.validate()
@@ -3783,12 +4647,66 @@ def main():
     current_policy: Policy | None = None
     self_play_initial_state: dict[str, torch.Tensor] | None = None
     remaining_total_timesteps = args.total_timesteps
+    consumed_warm_start_epochs = 0
+    consumed_warm_start_global_steps = 0
     retained_periodic_checkpoints: list[PeriodicPolicySnapshot] = []
+    league_manager: LeagueManager | None = None
+    league_wrapper: LeagueTrainingWrapper | None = None
+    latest_league_metrics: LeagueEvaluationSummary | None = None
+    final_league_metrics: LeagueEvaluationSummary | None = None
+    latest_standardized_league_metrics: StandardizedLeagueEvalSummary | None = None
+    final_standardized_league_metrics: StandardizedLeagueEvalSummary | None = None
+    standardized_league_entry: LeagueEntry | None = None
+    cached_warm_start_path = (
+        None
+        if args.cached_warm_start_path is None
+        else Path(args.cached_warm_start_path)
+    )
+
+    if args.reuse_cached_warm_start and cached_warm_start_path is not None:
+        if cached_warm_start_path.exists():
+            cached_warm_start = load_cached_warm_start(cached_warm_start_path)
+            cached_players_per_team = cached_warm_start.get("players_per_team")
+            if cached_players_per_team is not None and cached_players_per_team != int(
+                args.players_per_team
+            ):
+                raise ValueError(
+                    "Cached warm-start policy was created for a different players-per-team "
+                    f"setting ({cached_players_per_team} != {args.players_per_team})"
+                )
+            cached_state_dict = cached_warm_start["state_dict"]
+            assert isinstance(cached_state_dict, dict)
+            self_play_initial_state = {
+                str(name): tensor.detach().cpu().clone()
+                for name, tensor in cached_state_dict.items()
+            }
+            consumed_warm_start_epochs = int(cached_warm_start["epoch"])
+            consumed_warm_start_global_steps = int(cached_warm_start["global_step"])
+            cached_final_metrics = cached_warm_start.get("final_metrics")
+            if isinstance(cached_final_metrics, Mapping):
+                final_no_opponent_metrics = dict(cached_final_metrics)
+                latest_no_opponent_metrics = dict(cached_final_metrics)
+            remaining_total_timesteps = (
+                None
+                if args.total_timesteps is None
+                else max(0, int(args.total_timesteps) - consumed_warm_start_global_steps)
+            )
+            print(
+                "Loaded cached warm-start snapshot: "
+                f"path={cached_warm_start_path}, "
+                f"epoch={consumed_warm_start_epochs}, "
+                f"global_step={consumed_warm_start_global_steps}"
+            )
+        else:
+            print(
+                "Cached warm-start path does not exist, running warm-start normally: "
+                f"{cached_warm_start_path}"
+            )
 
     warm_start_budget, _ = split_phase_iterations(
         int(args.ppo_iterations), no_opponent_phase
     )
-    if warm_start_budget > 0:
+    if warm_start_budget > 0 and self_play_initial_state is None:
         warm_start_num_envs = resolve_no_opponent_num_envs(args)
         warm_start_vec_config = VecEnvConfig(
             backend="native",
@@ -4021,10 +4939,12 @@ def main():
                 step=warm_start_trainer.global_step,
             )
         self_play_initial_state = snapshot_policy_state(current_policy)
+        consumed_warm_start_epochs = int(warm_start_trainer.epoch)
+        consumed_warm_start_global_steps = int(warm_start_trainer.global_step)
         remaining_total_timesteps = (
             None
             if args.total_timesteps is None
-            else max(0, int(args.total_timesteps) - int(warm_start_trainer.global_step))
+            else max(0, int(args.total_timesteps) - consumed_warm_start_global_steps)
         )
         effective_train_config = warm_start_train_config
         effective_vec_config = warm_start_vec_config
@@ -4032,9 +4952,20 @@ def main():
         final_trainer = warm_start_trainer
         warm_start_trainer.print_dashboard()
         model_path = Path(warm_start_trainer.close())
+        if args.save_cached_warm_start and cached_warm_start_path is not None:
+            save_cached_warm_start(
+                cached_warm_start_path,
+                state_dict=self_play_initial_state,
+                epoch=consumed_warm_start_epochs,
+                global_step=consumed_warm_start_global_steps,
+                final_metrics=final_no_opponent_metrics,
+                args=args,
+            )
+            print(f"Saved cached warm-start snapshot: {cached_warm_start_path}")
 
-    self_play_iterations = int(args.ppo_iterations) - (
-        0 if final_trainer is None else int(final_trainer.epoch)
+    self_play_iterations = max(
+        0,
+        int(args.ppo_iterations) - consumed_warm_start_epochs,
     )
     if self_play_iterations > 0:
         vec_config, autotune_result = resolve_training_vec_config(args)
@@ -4064,9 +4995,40 @@ def main():
             f"num_agents={vecenv.num_agents}"
         )
 
+        trainer_env: pufferlib.PufferEnv = vecenv
+        current_policy = Policy(vecenv).to(device)
+        if self_play_initial_state is not None:
+            current_policy.load_state_dict(self_play_initial_state, strict=True)
+            print(
+                "Initialized self-play phase from no-opponent warm-start policy snapshot."
+            )
+
+        if league_config is not None:
+            league_manager = LeagueManager(league_config, seed=args.seed)
+            standardized_league_entry = league_manager.bootstrap(
+                snapshot_policy_state(current_policy),
+                label="bootstrap",
+                source_epoch=0 if final_trainer is None else int(final_trainer.epoch),
+            )
+            league_wrapper = LeagueTrainingWrapper(
+                vecenv,
+                players_per_team=args.players_per_team,
+                device=device,
+                league_manager=league_manager,
+            )
+            trainer_env = league_wrapper
+            print(
+                "League config: "
+                f"rl_alg={league_config.rl_alg}, "
+                f"max_size={league_config.max_size}, "
+                "promotion_win_rate_threshold="
+                f"{league_config.promotion_win_rate_threshold:.3f}, "
+                f"standardized_eval_enabled={league_config.standardized_eval_enabled}"
+            )
+
         train_config = build_phase_train_config(
             args,
-            vecenv,
+            trainer_env,
             device,
             ppo_iterations=self_play_iterations,
             total_timesteps=remaining_total_timesteps,
@@ -4083,19 +5045,12 @@ def main():
             f"ent_coef={train_config['ent_coef']:.6g}"
         )
 
-        current_policy = Policy(vecenv).to(device)
-        if self_play_initial_state is not None:
-            current_policy.load_state_dict(self_play_initial_state, strict=True)
-            print(
-                "Initialized self-play phase from no-opponent warm-start policy snapshot."
-            )
-
         trainer = RegularizedPuffeRL(
             train_config,
-            vecenv,
+            trainer_env,
             current_policy,
             logger=logger,
-            regularization_enabled=not args.no_regularization,
+            regularization_enabled=effective_kl_regularization,
             past_kl_coef=args.past_kl_coef,
             uniform_kl_base_coef=args.uniform_kl_base_coef,
             uniform_kl_power=args.uniform_kl_power,
@@ -4141,9 +5096,28 @@ def main():
                 "fixed-best-checkpoint mode requires a readable best checkpoint record"
             )
 
-        needs_evaluator = args.past_iterate_eval or args.final_best_eval_games > 0
+        needs_evaluator = (
+            args.past_iterate_eval
+            or args.final_best_eval_games > 0
+            or league_manager is not None
+        )
+        eval_env_override = args.past_iterate_eval_envs
+        if (
+            eval_env_override is None
+            and league_config is not None
+            and league_config.standardized_eval_enabled
+        ):
+            eval_env_override = max(
+                1,
+                int(
+                    round(
+                        total_sim_envs(vec_config)
+                        * league_config.standardized_eval_ratio
+                    )
+                ),
+            )
         eval_vec_config = (
-            resolve_eval_vec_config(vec_config, args.past_iterate_eval_envs)
+            resolve_eval_vec_config(vec_config, eval_env_override)
             if needs_evaluator
             else None
         )
@@ -4183,38 +5157,45 @@ def main():
                 trainer.total_epochs,
                 eval_interval_epochs,
             )
-            should_eval = args.past_iterate_eval and should_run_periodic_event
+            should_eval = should_run_periodic_event and (
+                args.past_iterate_eval or league_manager is not None
+            )
             if should_eval and evaluator is not None:
                 eval_seed = args.seed + trainer.epoch * 10_000
-                eval_metrics = evaluate_against_past_iterate(
-                    current_policy,
-                    past_iterate_state_dict,
-                    evaluator=evaluator,
-                    games=args.past_iterate_eval_games,
-                    seed=eval_seed,
-                )
                 log_payload = {
                     "evaluation/progress_step": float(trainer.global_step),
-                    "evaluation/past_iterate/win_rate": eval_metrics["win_rate"],
-                    "evaluation/past_iterate/score_diff": eval_metrics["score_diff"],
-                    "evaluation/past_iterate/games": eval_metrics["games"],
-                    "evaluation/past_iterate/eval_epochs_interval": eval_interval_epochs,
-                    "evaluation/past_iterate/baseline_epoch": float(past_iterate_epoch),
-                    "evaluation/past_iterate/current_epoch": trainer.epoch,
                 }
-                add_past_checkpoint_eval_logs(
-                    log_payload=log_payload,
-                    current_policy=current_policy,
-                    retained_checkpoints=retained_periodic_checkpoints,
-                    latest_baseline_epoch=past_iterate_epoch,
-                    latest_baseline_metrics=eval_metrics,
-                    evaluator=evaluator,
-                    games=args.past_iterate_eval_games,
-                    seed=eval_seed,
-                    current_epoch=trainer.epoch,
-                    eval_interval_epochs=eval_interval_epochs,
-                )
-                print_match_summary("Past iterate eval", trainer.epoch, eval_metrics)
+                if args.past_iterate_eval:
+                    eval_metrics = evaluate_against_past_iterate(
+                        current_policy,
+                        past_iterate_state_dict,
+                        evaluator=evaluator,
+                        games=args.past_iterate_eval_games,
+                        seed=eval_seed,
+                    )
+                    log_payload.update(
+                        {
+                            "evaluation/past_iterate/win_rate": eval_metrics["win_rate"],
+                            "evaluation/past_iterate/score_diff": eval_metrics["score_diff"],
+                            "evaluation/past_iterate/games": eval_metrics["games"],
+                            "evaluation/past_iterate/eval_epochs_interval": eval_interval_epochs,
+                            "evaluation/past_iterate/baseline_epoch": float(past_iterate_epoch),
+                            "evaluation/past_iterate/current_epoch": trainer.epoch,
+                        }
+                    )
+                    add_past_checkpoint_eval_logs(
+                        log_payload=log_payload,
+                        current_policy=current_policy,
+                        retained_checkpoints=retained_periodic_checkpoints,
+                        latest_baseline_epoch=past_iterate_epoch,
+                        latest_baseline_metrics=eval_metrics,
+                        evaluator=evaluator,
+                        games=args.past_iterate_eval_games,
+                        seed=eval_seed,
+                        current_epoch=trainer.epoch,
+                        eval_interval_epochs=eval_interval_epochs,
+                    )
+                    print_match_summary("Past iterate eval", trainer.epoch, eval_metrics)
 
                 if best_opponent is not None:
                     best_metrics = evaluator.evaluate(
@@ -4238,21 +5219,117 @@ def main():
                     print_match_summary("Best checkpoint eval", trainer.epoch, best_metrics)
                     log_payload["evaluation/best_checkpoint/promotion_attempted"] = 0.0
 
+                if league_manager is not None:
+                    latest_league_metrics = evaluate_against_league(
+                        current_policy=current_policy,
+                        league_manager=league_manager,
+                        evaluator=evaluator,
+                        games_per_opponent=args.past_iterate_eval_games,
+                        seed=eval_seed + 2_000,
+                    )
+                    add_league_eval_logs(
+                        log_payload=log_payload,
+                        summary=latest_league_metrics,
+                        current_epoch=trainer.epoch,
+                        current_size=league_manager.size(),
+                        promotion_threshold=league_manager.config.promotion_win_rate_threshold,
+                        opponent_histogram={}
+                        if league_wrapper is None
+                        else league_wrapper.latest_opponent_histogram(),
+                    )
+                    print_league_summary(
+                        "League eval", trainer.epoch, latest_league_metrics
+                    )
+                    if (
+                        league_config is not None
+                        and league_config.standardized_eval_enabled
+                        and standardized_league_entry is not None
+                    ):
+                        latest_standardized_league_metrics = (
+                            evaluate_standardized_league_opponent(
+                                current_policy=current_policy,
+                                standardized_entry=standardized_league_entry,
+                                evaluator=evaluator,
+                                games=args.marlodonna_standardized_eval_games,
+                                seed=eval_seed + 3_000,
+                            )
+                        )
+                        log_payload.update(
+                            {
+                                "evaluation/marlodonna_standardized/win_rate": (
+                                    latest_standardized_league_metrics.win_rate
+                                ),
+                                "evaluation/marlodonna_standardized/score_diff": (
+                                    latest_standardized_league_metrics.score_diff
+                                ),
+                                "evaluation/marlodonna_standardized/games": (
+                                    latest_standardized_league_metrics.games
+                                ),
+                                "evaluation/marlodonna_standardized/opponent_entry_id": (
+                                    float(
+                                        latest_standardized_league_metrics.opponent_entry_id
+                                    )
+                                ),
+                                "evaluation/marlodonna_standardized/opponent_epoch": (
+                                    float(
+                                        latest_standardized_league_metrics.opponent_epoch
+                                    )
+                                ),
+                            }
+                        )
+                    promotion = league_manager.maybe_promote(
+                        aggregate_win_rate=latest_league_metrics.aggregate_win_rate,
+                        aggregate_score_diff=latest_league_metrics.aggregate_score_diff,
+                        snapshot_state_dict=snapshot_policy_state(current_policy),
+                        source_epoch=trainer.epoch,
+                        label=f"epoch_{trainer.epoch:06d}",
+                    )
+                    log_payload.update(
+                        {
+                            "evaluation/league/promotion_attempted": 1.0,
+                            "evaluation/league/promotion_promoted": float(
+                                promotion.promoted
+                            ),
+                            "evaluation/league/promotion_threshold": float(
+                                promotion.threshold
+                            ),
+                            "evaluation/league/promotion_margin": (
+                                promotion.aggregate_win_rate - promotion.threshold
+                            ),
+                            "evaluation/league/current_size_after_promotion": float(
+                                league_manager.size()
+                            ),
+                        }
+                    )
+                    if promotion.promoted and league_wrapper is not None:
+                        league_wrapper.refresh_league()
+
                 if logger is not None:
                     logger.wandb.log(log_payload, step=trainer.global_step)
-                log_periodic_eval_match_videos(
-                    current_policy,
-                    args,
-                    logger=logger,
-                    current_epoch=trainer.epoch,
-                    global_step=trainer.global_step,
-                    retained_checkpoints=retained_periodic_checkpoints,
-                    latest_baseline_epoch=past_iterate_epoch,
-                    latest_baseline_state_dict=past_iterate_state_dict
-                    if past_iterate_epoch > 0
-                    else None,
-                    best_opponent=best_opponent,
-                )
+                if args.past_iterate_eval:
+                    log_periodic_eval_match_videos(
+                        current_policy,
+                        args,
+                        logger=logger,
+                        current_epoch=trainer.epoch,
+                        global_step=trainer.global_step,
+                        retained_checkpoints=retained_periodic_checkpoints,
+                        latest_baseline_epoch=past_iterate_epoch,
+                        latest_baseline_state_dict=past_iterate_state_dict
+                        if past_iterate_epoch > 0
+                        else None,
+                        best_opponent=best_opponent,
+                    )
+                if league_manager is not None and league_wrapper is not None:
+                    log_periodic_league_match_videos(
+                        current_policy,
+                        args,
+                        logger=logger,
+                        current_epoch=trainer.epoch,
+                        global_step=trainer.global_step,
+                        league_manager=league_manager,
+                        sampled_entry_id=league_wrapper.sampled_preview_entry_id(),
+                    )
 
             if should_run_periodic_event:
                 log_periodic_self_play_video(
@@ -4280,6 +5357,62 @@ def main():
         effective_vec_config = vec_config
 
         final_promotion_metrics: dict[str, float] | None = None
+        if league_manager is not None and evaluator is not None:
+            final_league_metrics = evaluate_against_league(
+                current_policy=current_policy,
+                league_manager=league_manager,
+                evaluator=evaluator,
+                games_per_opponent=args.past_iterate_eval_games,
+                seed=args.seed + 40_000_000,
+            )
+            print_league_summary("Final league eval", trainer.epoch, final_league_metrics)
+            if (
+                league_config is not None
+                and league_config.standardized_eval_enabled
+                and standardized_league_entry is not None
+            ):
+                final_standardized_league_metrics = evaluate_standardized_league_opponent(
+                    current_policy=current_policy,
+                    standardized_entry=standardized_league_entry,
+                    evaluator=evaluator,
+                    games=args.marlodonna_standardized_eval_games,
+                    seed=args.seed + 41_000_000,
+                )
+            if logger is not None:
+                league_log_payload = {
+                    "evaluation/progress_step": float(trainer.global_step),
+                }
+                add_league_eval_logs(
+                    log_payload=league_log_payload,
+                    summary=final_league_metrics,
+                    current_epoch=trainer.epoch,
+                    current_size=league_manager.size(),
+                    promotion_threshold=league_manager.config.promotion_win_rate_threshold,
+                    opponent_histogram={}
+                    if league_wrapper is None
+                    else league_wrapper.latest_opponent_histogram(),
+                )
+                if final_standardized_league_metrics is not None:
+                    league_log_payload.update(
+                        {
+                            "evaluation/final_marlodonna_standardized/win_rate": (
+                                final_standardized_league_metrics.win_rate
+                            ),
+                            "evaluation/final_marlodonna_standardized/score_diff": (
+                                final_standardized_league_metrics.score_diff
+                            ),
+                            "evaluation/final_marlodonna_standardized/games": (
+                                final_standardized_league_metrics.games
+                            ),
+                            "evaluation/final_marlodonna_standardized/opponent_entry_id": (
+                                float(
+                                    final_standardized_league_metrics.opponent_entry_id
+                                )
+                            ),
+                        }
+                    )
+                logger.wandb.log(league_log_payload, step=trainer.global_step)
+
         if best_opponent is not None and args.final_best_eval_games > 0:
             if evaluator is None:
                 raise RuntimeError(
@@ -4485,6 +5618,12 @@ def main():
         final_best_metrics=final_best_metrics,
         latest_no_opponent_metrics=latest_no_opponent_metrics,
         final_no_opponent_metrics=final_no_opponent_metrics,
+        league_config=league_config,
+        league_manager=league_manager,
+        latest_league_metrics=latest_league_metrics,
+        final_league_metrics=final_league_metrics,
+        latest_standardized_league_metrics=latest_standardized_league_metrics,
+        final_standardized_league_metrics=final_standardized_league_metrics,
         model_path=model_path,
         retained_past_checkpoint_epochs=[
             checkpoint.epoch for checkpoint in retained_periodic_checkpoints

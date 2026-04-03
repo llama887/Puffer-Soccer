@@ -6,6 +6,8 @@ backend through native benchmarking whenever map scaling is active. Both behavio
 to break silently because they happen before the main training loop starts.
 """
 
+# pylint: disable=wrong-import-position
+
 from __future__ import annotations
 
 import json
@@ -15,6 +17,7 @@ import sys
 from typing import cast
 
 import numpy as np
+import torch
 
 from puffer_soccer.autotune import AutotuneOutcome, BenchmarkResult
 
@@ -187,6 +190,61 @@ def test_parse_training_args_repo_defaults_enable_no_opponent_curriculum() -> No
     assert train_pufferl.field_curriculum_enabled(args) is True
 
 
+def test_parse_training_args_defaults_to_self_play_rl_algorithm() -> None:
+    """Verify the new RL algorithm selector preserves current self-play by default.
+
+    The user wants league-based algorithms to be explicit experiments rather than a silent
+    change to everyday training. This test keeps that contract clear at the parser level.
+    """
+
+    args = train_pufferl.parse_training_args(["--no-autoload-hyperparameters"])
+
+    assert args.rl_alg == train_pufferl.RL_ALG_SELF_PLAY
+    assert args.kl_regularization_mode == train_pufferl.KL_REGULARIZATION_AUTO
+
+
+def test_parse_training_args_exposes_cached_warm_start_controls() -> None:
+    """Verify the trainer parser exposes the new warm-start reuse toggles cleanly.
+
+    The tuning jobs now rely on one persistent warm-start cache to avoid repeating the
+    no-opponent curriculum. This parser-level check keeps the new CLI surface explicit so
+    future refactors do not silently drop the cache path or flip the default reuse policy.
+    """
+
+    args = train_pufferl.parse_training_args(["--no-autoload-hyperparameters"])
+
+    assert args.cached_warm_start_path is None
+    assert args.reuse_cached_warm_start is False
+    assert args.save_cached_warm_start is False
+
+
+def test_resolve_kl_regularization_enabled_keeps_new_mode_orthogonal() -> None:
+    """Verify the new KL mode flag overrides the legacy toggle cleanly.
+
+    RL algorithm comparisons should not silently inherit KL behavior from the wrong CLI flag.
+    The new high-level switch is supposed to be authoritative whenever it is explicit.
+    """
+
+    args = train_pufferl.parse_training_args(
+        [
+            "--no-autoload-hyperparameters",
+            "--kl-regularization-mode",
+            "off",
+        ]
+    )
+    assert train_pufferl.resolve_kl_regularization_enabled(args) is False
+
+    args = train_pufferl.parse_training_args(
+        [
+            "--no-autoload-hyperparameters",
+            "--kl-regularization-mode",
+            "on",
+            "--no-regularization",
+        ]
+    )
+    assert train_pufferl.resolve_kl_regularization_enabled(args) is True
+
+
 def test_resolve_no_opponent_game_length_matches_eval_horizon_with_floor() -> None:
     """Verify the shared no-opponent task horizon keeps parity without going below 400.
 
@@ -198,6 +256,68 @@ def test_resolve_no_opponent_game_length_matches_eval_horizon_with_floor() -> No
 
     assert train_pufferl.resolve_no_opponent_game_length(250) == 400
     assert train_pufferl.resolve_no_opponent_game_length(600) == 600
+
+
+def test_vec_config_roundtrip_preserves_cached_runtime_fields() -> None:
+    """Verify runtime-cache JSON can round-trip back into the trainer dataclass.
+
+    The RL tuner now saves one chosen runtime layout to disk and later reloads it to skip
+    repeated environment autotuning. This test keeps the serialization contract stable by
+    checking the important fields survive a round-trip unchanged.
+    """
+
+    original = train_pufferl.VecEnvConfig(
+        backend="multiprocessing",
+        shard_num_envs=10,
+        num_shards=24,
+        num_workers=24,
+        batch_size=10,
+        zero_copy=False,
+        overwork=True,
+    )
+
+    restored = train_pufferl.deserialize_vec_config(
+        train_pufferl.serialize_vec_config(original)
+    )
+
+    assert restored == original
+
+
+def test_save_and_load_cached_warm_start_roundtrip(tmp_path: Path) -> None:
+    """Verify cached warm-start files preserve the policy tensors and consumed budget.
+
+    Reusing a warm-start only works when the saved file carries enough metadata to emulate a
+    finished warm-start phase. This regression test writes a tiny synthetic cache file and
+    confirms the loader recovers the same epoch, global-step, metrics, and tensor values.
+    """
+
+    cache_path = tmp_path / "cached_warm_start.pt"
+    state_dict = {"weight": torch.tensor([1.0, 2.0, 3.0])}
+    args = SimpleNamespace(
+        players_per_team=5,
+        no_opponent_phase_goal_rate_threshold=0.8,
+        no_opponent_phase_multi_goal_rate_threshold=0.0,
+        no_opponent_eval_games=100,
+        no_opponent_eval_max_steps=600,
+        no_opponent_map_scale_ladder="0.2,0.4,0.6,0.8,1.0",
+    )
+
+    train_pufferl.save_cached_warm_start(
+        cache_path,
+        state_dict=state_dict,
+        epoch=12,
+        global_step=3456,
+        final_metrics={"goal_rate": 0.9, "games": 100.0},
+        args=args,
+    )
+
+    loaded = train_pufferl.load_cached_warm_start(cache_path)
+
+    assert loaded["epoch"] == 12
+    assert loaded["global_step"] == 3456
+    assert cast(dict[str, float], loaded["final_metrics"])["goal_rate"] == 0.9
+    loaded_state = cast(dict[str, torch.Tensor], loaded["state_dict"])
+    assert torch.equal(loaded_state["weight"], state_dict["weight"])
 
 
 def test_build_train_config_adapts_autoloaded_rollout_sizes_to_new_agent_count(
@@ -307,7 +427,7 @@ def test_run_no_opponent_rollouts_uses_resolved_no_opponent_game_length(
     )
 
     train_pufferl.run_no_opponent_rollouts(
-        FakePolicy(),
+        cast(train_pufferl.Policy, FakePolicy()),
         players_per_team=1,
         seed=7,
         device="cpu",
@@ -504,7 +624,10 @@ def test_save_match_video_uses_resolved_no_opponent_game_length(
             )
 
         def forward_eval(self, obs):
-            return train_pufferl.torch.zeros((obs.shape[0], 9)), None
+            return (
+                train_pufferl.torch.zeros((obs.shape[0], 9)),
+                train_pufferl.torch.zeros((obs.shape[0], 1)),
+            )
 
     def fake_make_puffer_env(**kwargs):
         observed["game_length"] = int(kwargs["game_length"])
@@ -531,7 +654,7 @@ def test_save_match_video_uses_resolved_no_opponent_game_length(
     )
 
     result = train_pufferl.save_match_video(
-        FakeVideoPolicy(),
+        cast(train_pufferl.Policy, FakeVideoPolicy()),
         args,
         output_path=tmp_path / "no_opponent.mp4",
         label="test video",
@@ -605,7 +728,14 @@ def test_build_run_summary_records_no_opponent_task_config() -> None:
         final_best_metrics=None,
         latest_no_opponent_metrics=None,
         final_no_opponent_metrics=None,
+        league_config=None,
+        league_manager=None,
+        latest_league_metrics=None,
+        final_league_metrics=None,
+        latest_standardized_league_metrics=None,
+        final_standardized_league_metrics=None,
         model_path=Path("model.pt"),
+        retained_past_checkpoint_epochs=[],
     )
 
     task_config = cast(dict[str, object], summary["no_opponent_task_config"])
@@ -618,6 +748,7 @@ def test_build_run_summary_records_no_opponent_task_config() -> None:
     assert task_config["map_scale_ladder"] == [0.2, 0.4, 0.6, 0.8, 1.0]
     assert task_config["stage_count"] == 5
     assert effective_hyperparameters["no_opponent_training_game_length"] == 600
+    assert summary["rl_alg"] == train_pufferl.RL_ALG_SELF_PLAY
 
 
 def test_autotune_training_vec_config_keeps_auto_for_self_play_stage(
@@ -654,3 +785,74 @@ def test_autotune_training_vec_config_keeps_auto_for_self_play_stage(
     assert observed["backend"] == "auto"
     assert vec_config.backend == "native"
     assert benchmark.backend == "native"
+
+
+def test_build_run_summary_records_league_metadata() -> None:
+    """Verify the run summary includes league and KL comparison metadata.
+
+    The new RL algorithm modes are meant to be compared systematically, so the machine-readable
+    summary needs to record which opponent-generation algorithm and KL setting were active.
+    """
+
+    args = train_pufferl.parse_training_args(
+        [
+            "--no-autoload-hyperparameters",
+            "--rl-alg",
+            "league",
+            "--kl-regularization-mode",
+            "off",
+        ]
+    )
+    train_config = train_pufferl.build_train_config(
+        args,
+        SimpleNamespace(num_agents=30),
+        device="cpu",
+    )
+    league_config = train_pufferl.build_league_config(args)
+    assert league_config is not None
+    league_manager = train_pufferl.LeagueManager(league_config, seed=0)
+    league_manager.bootstrap(
+        {"weight": np.zeros((1,), dtype=np.float32)},
+        label="bootstrap",
+        source_epoch=0,
+    )
+    league_metrics = train_pufferl.LeagueEvaluationSummary(
+        aggregate_win_rate=0.75,
+        aggregate_score_diff=0.5,
+        opponent_count=1,
+        per_opponent={
+            0: {
+                "entry_id": 0.0,
+                "source_epoch": 0.0,
+                "games": 8.0,
+                "win_rate": 0.75,
+                "score_diff": 0.5,
+            }
+        },
+    )
+
+    summary = train_pufferl._build_run_summary(
+        args=args,
+        trainer=SimpleNamespace(start_time=0.0, global_step=50, epoch=3),
+        train_config=train_config,
+        eval_interval_epochs=1,
+        vec_config=train_pufferl.VecEnvConfig(),
+        eval_vec_config=None,
+        best_record=None,
+        latest_best_metrics=None,
+        final_best_metrics=None,
+        latest_no_opponent_metrics=None,
+        final_no_opponent_metrics=None,
+        league_config=league_config,
+        league_manager=league_manager,
+        latest_league_metrics=league_metrics,
+        final_league_metrics=None,
+        latest_standardized_league_metrics=None,
+        final_standardized_league_metrics=None,
+        model_path=Path("model.pt"),
+        retained_past_checkpoint_epochs=[],
+    )
+
+    assert summary["rl_alg"] == "league"
+    assert cast(dict[str, object], summary["league_summary"])["size"] == 1
+    assert cast(dict[str, object], summary["kl_mode_summary"])["enabled"] is False

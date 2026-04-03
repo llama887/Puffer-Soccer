@@ -1,0 +1,22 @@
+#!/bin/bash
+#
+#SBATCH --job-name=tune_lg_kl_off
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=48:00:00
+#SBATCH --account=torch_pr_45_tandon_advanced
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=fyy2003@nyu.edu
+#SBATCH --chdir=/scratch/fyy2003/repos/Puffer-Soccer
+#SBATCH --output=/scratch/fyy2003/repos/Puffer-Soccer/sbatch/logs/%x-%j.out
+#SBATCH --error=/scratch/fyy2003/repos/Puffer-Soccer/sbatch/logs/%x-%j.err
+
+set -euo pipefail
+
+export TUNE_MATRIX_LABEL="league__kl_off"
+export TUNE_RL_ALG="league"
+export TUNE_KL_MODE="off"
+
+bash sbatch/run_tune_self_play_variant.sh

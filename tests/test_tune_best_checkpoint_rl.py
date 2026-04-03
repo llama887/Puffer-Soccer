@@ -68,9 +68,14 @@ def test_build_trial_command_freezes_runtime_and_best_checkpoint_target(tmp_path
     args = SimpleNamespace(
         players_per_team=5,
         device="cpu",
+        rl_alg=TRAIN_MODULE.RL_ALG_LEAGUE,
+        kl_regularization_mode=TRAIN_MODULE.KL_REGULARIZATION_OFF,
         total_timesteps=30_000_000,
         final_eval_games=128,
         best_checkpoint_config_path="experiments/best_checkpoint.json",
+        cached_warm_start_path="experiments/cached_warm_start_policy.pt",
+        reuse_cached_warm_start=True,
+        save_cached_warm_start=True,
         total_agents=320,
     )
     command = TUNE_MODULE.build_trial_command(
@@ -114,3 +119,48 @@ def test_build_trial_command_freezes_runtime_and_best_checkpoint_target(tmp_path
     assert "--no-export-videos" in command
     assert "--vec-backend" in command
     assert command[command.index("--num-envs") + 1] == "32"
+    assert command[command.index("--rl-alg") + 1] == "league"
+    assert command[command.index("--kl-regularization-mode") + 1] == "off"
+    assert command[command.index("--cached-warm-start-path") + 1] == (
+        "experiments/cached_warm_start_policy.pt"
+    )
+    assert "--reuse-cached-warm-start" in command
+    assert "--save-cached-warm-start" in command
+
+
+def test_resolve_runtime_vec_config_reuses_cached_runtime_file(tmp_path):
+    runtime_path = tmp_path / "runtime_config.json"
+    TRAIN_MODULE.write_json_record(
+        runtime_path,
+        {
+            "vec_config": {
+                "backend": "multiprocessing",
+                "shard_num_envs": 10,
+                "num_shards": 24,
+                "num_workers": 24,
+                "batch_size": 10,
+                "zero_copy": True,
+                "overwork": False,
+            }
+        },
+    )
+    args = SimpleNamespace(
+        runtime_config_path=str(runtime_path),
+        reuse_runtime_config=True,
+        vec_backend="auto",
+        players_per_team=5,
+        num_envs=32,
+        vec_num_shards=None,
+        vec_batch_size=None,
+        autotune_seconds=1.5,
+        autotune_max_num_envs=None,
+        autotune_max_num_shards=None,
+    )
+
+    vec_config, autotune_result = TUNE_MODULE.resolve_runtime_vec_config(args)
+
+    assert vec_config.backend == "multiprocessing"
+    assert vec_config.shard_num_envs == 10
+    assert vec_config.num_shards == 24
+    assert vec_config.batch_size == 10
+    assert autotune_result is None

@@ -99,12 +99,62 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--autotune-max-num-shards", type=int, default=None)
     parser.add_argument("--autotune-seconds", type=float, default=1.5)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument(
+        "--rl-alg",
+        type=str,
+        default=train_pufferl.RL_ALG_SELF_PLAY,
+        choices=[
+            train_pufferl.RL_ALG_SELF_PLAY,
+            train_pufferl.RL_ALG_LEAGUE,
+            train_pufferl.RL_ALG_MARLODONNA,
+        ],
+    )
+    parser.add_argument(
+        "--kl-regularization-mode",
+        type=str,
+        default=train_pufferl.KL_REGULARIZATION_AUTO,
+        choices=[
+            train_pufferl.KL_REGULARIZATION_AUTO,
+            train_pufferl.KL_REGULARIZATION_ON,
+            train_pufferl.KL_REGULARIZATION_OFF,
+        ],
+    )
     parser.add_argument("--total-timesteps", type=int, default=30_000_000)
     parser.add_argument("--final-eval-games", type=int, default=128)
     parser.add_argument("--max-runs", type=int, default=8)
     parser.add_argument("--confirm-candidates", type=int, default=3)
     parser.add_argument("--candidate-total-seeds", type=int, default=3)
     parser.add_argument("--method", type=str, default="Protein")
+    parser.add_argument(
+        "--runtime-config-path",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--reuse-runtime-config",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--save-runtime-config",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--cached-warm-start-path",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--reuse-cached-warm-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--save-cached-warm-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--best-checkpoint-config-path",
         type=str,
@@ -298,6 +348,28 @@ def resolve_runtime_vec_config(
     sweep so the search does not accidentally tune vectorization.
     """
 
+    runtime_config_path = (
+        None if args.runtime_config_path is None else Path(args.runtime_config_path)
+    )
+    if (
+        args.reuse_runtime_config
+        and runtime_config_path is not None
+        and runtime_config_path.exists()
+    ):
+        payload = json.loads(runtime_config_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError(
+                f"Expected a JSON object in cached runtime config {runtime_config_path}"
+            )
+        vec_payload = payload.get("vec_config")
+        if not isinstance(vec_payload, Mapping):
+            raise ValueError(
+                f"Cached runtime config {runtime_config_path} is missing vec_config"
+            )
+        vec_config = train_pufferl.deserialize_vec_config(vec_payload)
+        print(f"Loaded cached runtime config: {runtime_config_path}")
+        return vec_config, None
+
     runtime_args = SimpleNamespace(
         vec_backend=args.vec_backend,
         players_per_team=args.players_per_team,
@@ -403,6 +475,10 @@ def build_trial_command(
         str(args.players_per_team),
         "--device",
         args.device,
+        "--rl-alg",
+        str(args.rl_alg),
+        "--kl-regularization-mode",
+        str(args.kl_regularization_mode),
         "--seed",
         str(seed),
         "--total-timesteps",
@@ -454,6 +530,19 @@ def build_trial_command(
         "--run-summary-path",
         str(summary_path),
     ]
+    if args.cached_warm_start_path is not None:
+        command.extend(
+            [
+                "--cached-warm-start-path",
+                str(args.cached_warm_start_path),
+                "--reuse-cached-warm-start"
+                if args.reuse_cached_warm_start
+                else "--no-reuse-cached-warm-start",
+                "--save-cached-warm-start"
+                if args.save_cached_warm_start
+                else "--no-save-cached-warm-start",
+            ]
+        )
     command.extend(render_vec_cli_args(vec_config))
     return command
 
@@ -730,6 +819,12 @@ def main() -> None:
         },
     }
     train_pufferl.write_json_record(output_dir / "runtime_config.json", runtime_payload)
+    runtime_config_path = (
+        None if args.runtime_config_path is None else Path(args.runtime_config_path)
+    )
+    if args.save_runtime_config and runtime_config_path is not None:
+        train_pufferl.write_json_record(runtime_config_path, runtime_payload)
+        print(f"Saved reusable runtime config: {runtime_config_path}")
     if autotune_result is not None:
         print(
             "Autotune selected fixed runtime: "
