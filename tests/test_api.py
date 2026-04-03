@@ -8,9 +8,14 @@ import pytest
 
 from puffer_soccer.envs.marl2d import make_puffer_env
 from puffer_soccer.envs.marl2d.core import (
+    DISCRETE_ACTION_COUNT,
+    DISCRETE_ACTION_MOVE_FORWARD,
+    DISCRETE_ACTION_NOOP,
+    DISCRETE_ACTION_ROTATE_LEFT,
     MAX_SIGNED_ENV_SEED,
     _accumulate_team_episode_returns,
     _merge_team_episode_return_log,
+    encode_discrete_kick_action,
     normalize_env_seed,
 )
 from puffer_soccer.vector_env import VecEnvConfig, make_soccer_vecenv
@@ -187,11 +192,51 @@ def _set_symmetric_egocentric_state(env, *, ball_x: float, agent_x: float) -> No
     native_env.agents[1].last_rot = 0.0
 
 
+def _set_discrete_control_state(
+    env,
+    *,
+    ball_x: float,
+    ball_y: float = 0.0,
+    ball_vx: float = 0.0,
+    ball_vy: float = 0.0,
+    agent_x: float = 0.0,
+    agent_y: float = 0.0,
+    agent_rot: float = 0.0,
+) -> _NativeEnv:
+    """Install a deterministic one-agent control state for discrete action tests.
+
+    The new discrete interface is defined by exact one-step semantics such as "rotate only"
+    and "kick only". Those assertions are easiest to express by writing a fixed state directly
+    into the native env and then applying one chosen action. This helper centralizes that setup
+    so the tests share one consistent, byte-accurate initialization path.
+
+    The helper returns the native env view so callers can read movement constants such as
+    `move_speed` and `rot_speed` when forming exact expectations. The red-side opponent is
+    disabled in these tests, so only agent `0` needs to be configured.
+    """
+
+    native_env = _native_env(env)
+    env.reset(seed=0)
+    native_env.blue_left = 1
+    native_env.num_steps = 0
+    native_env.ball_x = ball_x
+    native_env.ball_y = ball_y
+    native_env.ball_vx = ball_vx
+    native_env.ball_vy = ball_vy
+    native_env.agents[0].x = agent_x
+    native_env.agents[0].y = agent_y
+    native_env.agents[0].rot = agent_rot
+    native_env.agents[0].last_move = 0.0
+    native_env.agents[0].last_rot = 0.0
+    return native_env
+
+
 def test_scalar_puffer_env_shapes_discrete():
     env = make_puffer_env(players_per_team=3, action_mode="discrete")
     obs, _ = env.reset(seed=0)
     assert obs.shape == (6, 58)
     assert env.global_states.shape == (6, 107)
+    assert env.single_action_space.n == DISCRETE_ACTION_COUNT
 
     actions = np.zeros((6,), dtype=np.int32)
     obs, rewards, terminals, truncations, _ = env.step(actions)
@@ -200,6 +245,19 @@ def test_scalar_puffer_env_shapes_discrete():
     assert terminals.shape == (6,)
     assert truncations.shape == (6,)
     env.close()
+
+
+def test_only_discrete_action_mode_is_supported() -> None:
+    """Check that the public env API rejects the removed continuous action mode.
+
+    This branch intentionally standardizes on one discrete control interface so experiment
+    code, parity checks, and benchmark tooling do not need to maintain two behaviorally
+    different action contracts. The wrapper should therefore fail fast when older callers try
+    to request the removed continuous mode.
+    """
+
+    with pytest.raises(ValueError, match="action_mode must be discrete"):
+        make_puffer_env(players_per_team=2, action_mode="continuous")
 
 
 def test_scalar_puffer_env_roundtrip():
@@ -216,6 +274,116 @@ def test_scalar_puffer_env_roundtrip():
     assert truncs.shape == (4,)
     assert isinstance(infos, list)
     env.close()
+
+
+def test_discrete_noop_leaves_pose_and_ball_unchanged() -> None:
+    """Check that the new noop action really means the agent does nothing.
+
+    The competition API now exposes an explicit noop so agents can wait for the play to
+    develop instead of being forced to move, turn, or kick every step. This test uses a state
+    where the ball is far enough away that no incidental collision can occur and confirms one
+    noop step leaves both the agent pose and ball velocity unchanged.
+    """
+
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+
+    try:
+        _set_discrete_control_state(env, ball_x=10.0, agent_x=0.0, agent_rot=0.0)
+        env.step(np.full((2,), DISCRETE_ACTION_NOOP, dtype=np.int32))
+        state = env.get_state()
+    finally:
+        env.close()
+
+    assert state["ball"] == pytest.approx((10.0, 0.0, 0.0, 0.0))
+    assert tuple(state["positions"][0]) == (0.0, 0.0)
+    assert state["rotations"][0] == pytest.approx(0.0)
+
+
+def test_discrete_move_and_rotate_actions_change_only_one_control_channel() -> None:
+    """Check that movement and rotation intents no longer happen in the same discrete step.
+
+    The single-action control rewrite is only correct if each locomotion action touches exactly
+    one control channel. This regression test first applies a forward move and then a left
+    rotation from a simple state, confirming the move changes position without changing heading
+    while the rotation changes heading without moving the agent.
+    """
+
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+
+    try:
+        native_env = _set_discrete_control_state(env, ball_x=10.0, agent_x=0.0, agent_rot=0.0)
+        env.step(np.full((2,), DISCRETE_ACTION_MOVE_FORWARD, dtype=np.int32))
+        move_state = env.get_state()
+
+        native_env = _set_discrete_control_state(env, ball_x=10.0, agent_x=0.0, agent_rot=0.0)
+        env.step(np.full((2,), DISCRETE_ACTION_ROTATE_LEFT, dtype=np.int32))
+        rotate_state = env.get_state()
+    finally:
+        env.close()
+
+    assert tuple(move_state["positions"][0]) == pytest.approx((native_env.move_speed, 0.0))
+    assert move_state["rotations"][0] == pytest.approx(0.0)
+    assert tuple(rotate_state["positions"][0]) == pytest.approx((0.0, 0.0))
+    assert rotate_state["rotations"][0] == pytest.approx(native_env.rot_speed)
+
+
+def test_discrete_kick_strength_changes_ball_speed_without_moving_agent() -> None:
+    """Check that kick actions affect ball speed but do not translate the agent that step.
+
+    The new discrete contract says a kick step should be a pure kick intent. This test places
+    the ball inside the kickable zone, compares the weakest and strongest kick actions, and
+    confirms both that stronger kicks produce higher ball speed and that the agent remains in
+    place during the kick.
+    """
+
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+
+    def measure_kick(kick_strength: int) -> tuple[tuple[float, float], float]:
+        _set_discrete_control_state(env, ball_x=0.5, agent_x=0.0, agent_rot=0.0)
+        env.step(np.full((2,), encode_discrete_kick_action(kick_strength), dtype=np.int32))
+        state = env.get_state()
+        return tuple(state["positions"][0]), float(math.hypot(state["ball"][2], state["ball"][3]))
+
+    try:
+        weak_position, weakest_speed = measure_kick(kick_strength=0)
+        strong_position, strongest_speed = measure_kick(kick_strength=7)
+    finally:
+        env.close()
+
+    assert weak_position == pytest.approx((0.0, 0.0))
+    assert strong_position == pytest.approx((0.0, 0.0))
+    assert weakest_speed > 0.0
+    assert strongest_speed > weakest_speed
+
+
+def test_discrete_ball_decay_uses_the_new_slower_constant() -> None:
+    """Check that free ball motion now decays by the new 0.85 pacing constant.
+
+    The single-action control scheme reduces how much an agent can do per step, so the ball is
+    intentionally slowed slightly to preserve a similar overall feel. This test seeds a known
+    ball velocity, applies one noop step away from any collision, and verifies the resulting
+    speed matches the new decay constant rather than the old faster one.
+    """
+
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+
+    try:
+        _set_discrete_control_state(
+            env,
+            ball_x=10.0,
+            ball_vx=2.0,
+            ball_vy=0.0,
+            agent_x=0.0,
+            agent_rot=0.0,
+        )
+        env.step(np.full((2,), DISCRETE_ACTION_NOOP, dtype=np.int32))
+        state = env.get_state()
+    finally:
+        env.close()
+
+    assert state["ball"][0] == pytest.approx(12.0)
+    assert state["ball"][2] == pytest.approx(1.7)
+
 
 
 def test_scalar_puffer_env_rgb_array_render():

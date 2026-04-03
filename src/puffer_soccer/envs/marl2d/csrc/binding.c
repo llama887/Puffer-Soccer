@@ -9,6 +9,15 @@
 #define MAX_PLAYERS 22
 #define MAX_PER_TEAM 11
 #define MAX_BALL_SPEED 5.0f
+#define BALL_VELOCITY_DECAY 0.85f
+#define DISCRETE_ACTION_NOOP 0
+#define DISCRETE_ACTION_MOVE_FORWARD 1
+#define DISCRETE_ACTION_MOVE_BACKWARD 2
+#define DISCRETE_ACTION_ROTATE_LEFT 3
+#define DISCRETE_ACTION_ROTATE_RIGHT 4
+#define DISCRETE_KICK_ACTION_START 5
+#define DISCRETE_KICK_BUCKETS 8
+#define DISCRETE_ACTION_COUNT (DISCRETE_KICK_ACTION_START + DISCRETE_KICK_BUCKETS)
 
 typedef struct {
     float score;
@@ -276,7 +285,19 @@ static void calc_line_ball_stats(float angle, float circ_rad, float circ_x, floa
     *delta = circ_rad*circ_rad - D*D;
 }
 
-static void ball_check_hit(Env* env) {
+static float discrete_kick_scale(int action) {
+    static const float kick_scales[DISCRETE_KICK_BUCKETS] = {
+        0.1f, 0.22857143f, 0.35714287f, 0.4857143f,
+        0.6142857f, 0.74285716f, 0.87142855f, 1.0f
+    };
+    int kick_idx = action - DISCRETE_KICK_ACTION_START;
+    if (kick_idx < 0 || kick_idx >= DISCRETE_KICK_BUCKETS) {
+        return 0.0f;
+    }
+    return kick_scales[kick_idx];
+}
+
+static void ball_check_hit(Env* env, const float* kick_scales) {
     const float ball_radius = 1.0f;
     const float body_speed = 0.6f;
     const float leg_speed = 4.0f;
@@ -298,8 +319,8 @@ static void ball_check_hit(Env* env) {
             float delta, cc, ss;
             calc_line_ball_stats(a->rot, ball_radius, env->ball_x, env->ball_y, a->x, a->y, &delta, &cc, &ss);
             if (delta >= 0.0f && d < 2.0f * agent_radius + 2.0f * ball_radius) {
-                env->ball_vx += leg_speed * cc;
-                env->ball_vy += leg_speed * ss;
+                env->ball_vx += leg_speed * kick_scales[i] * cc;
+                env->ball_vy += leg_speed * kick_scales[i] * ss;
             }
         }
     }
@@ -540,6 +561,7 @@ static void c_reset(Env* env, int seed) {
 
 static void c_step(Env* env) {
     int np = env->num_players;
+    float kick_scales[MAX_PLAYERS];
     float step_reward_sum = 0.0f;
     float step_reward_sum_blue = 0.0f;
     float step_reward_sum_red = 0.0f;
@@ -555,6 +577,7 @@ static void c_step(Env* env) {
         if (is_inactive_opponent(env, i)) {
             a->last_move = 0.0f;
             a->last_rot = 0.0f;
+            kick_scales[i] = 0.0f;
             continue;
         }
 
@@ -562,14 +585,31 @@ static void c_step(Env* env) {
             int* atn = (int*)env->actions;
             int action = atn[i];
             if (action < 0) action = 0;
-            if (action > 8) action = 8;
-            move = (float)(action / 3) - 1.0f;
-            rot = (float)(action % 3) - 1.0f;
+            if (action >= DISCRETE_ACTION_COUNT) action = DISCRETE_ACTION_COUNT - 1;
+            kick_scales[i] = discrete_kick_scale(action);
+
+            switch (action) {
+                case DISCRETE_ACTION_MOVE_FORWARD:
+                    move = 1.0f;
+                    break;
+                case DISCRETE_ACTION_MOVE_BACKWARD:
+                    move = -1.0f;
+                    break;
+                case DISCRETE_ACTION_ROTATE_LEFT:
+                    rot = -1.0f;
+                    break;
+                case DISCRETE_ACTION_ROTATE_RIGHT:
+                    rot = 1.0f;
+                    break;
+                default:
+                    break;
+            }
         } else {
             float* atn = (float*)env->actions;
             float* arow = atn + (i * 2);
             move = clampf(arow[0], -1.0f, 1.0f);
             rot = clampf(arow[1], -1.0f, 1.0f);
+            kick_scales[i] = 1.0f;
         }
 
         a->last_move = move;
@@ -586,13 +626,13 @@ static void c_step(Env* env) {
         a->y = clampf(a->y + sin_comp, env->y_out_start, env->y_out_end);
     }
 
-    ball_check_hit(env);
+    ball_check_hit(env, kick_scales);
 
     env->ball_x += env->ball_vx;
     env->ball_y += env->ball_vy;
 
-    env->ball_vx *= 0.9f;
-    env->ball_vy *= 0.9f;
+    env->ball_vx *= BALL_VELOCITY_DECAY;
+    env->ball_vy *= BALL_VELOCITY_DECAY;
     if (speed2(env->ball_vx, env->ball_vy) < 0.01f) {
         env->ball_vx = 0.0f;
         env->ball_vy = 0.0f;
