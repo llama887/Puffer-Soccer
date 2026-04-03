@@ -1,3 +1,5 @@
+"""Python wrappers and discrete action helpers for the native MARL2D soccer env."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,9 +7,31 @@ from typing import Any
 
 import gymnasium
 import numpy as np
+import pufferlib
+
+from .csrc import binding
+from .constants import DEFAULT_GAME_LENGTH, DEFAULT_VISION_RANGE
+from .renderer import SoccerRenderer
 
 
 MAX_SIGNED_ENV_SEED = 2**31 - 1
+DISCRETE_ACTION_NOOP = 0
+DISCRETE_ACTION_MOVE_FORWARD = 1
+DISCRETE_ACTION_MOVE_BACKWARD = 2
+DISCRETE_ACTION_ROTATE_LEFT = 3
+DISCRETE_ACTION_ROTATE_RIGHT = 4
+DISCRETE_KICK_ACTION_START = 5
+DISCRETE_KICK_STRENGTHS = (
+    0.1,
+    0.22857143,
+    0.35714287,
+    0.4857143,
+    0.6142857,
+    0.74285716,
+    0.87142855,
+    1.0,
+)
+DISCRETE_ACTION_COUNT = DISCRETE_KICK_ACTION_START + len(DISCRETE_KICK_STRENGTHS)
 
 
 def normalize_env_seed(seed: int | None) -> int:
@@ -30,18 +54,29 @@ def normalize_env_seed(seed: int | None) -> int:
     return int(seed) % MAX_SIGNED_ENV_SEED
 
 
-import pufferlib
+def encode_discrete_kick_action(kick_strength: int) -> int:
+    """Return the discrete action id for one forward kick-strength choice.
 
-from .csrc import binding
-from .constants import DEFAULT_GAME_LENGTH, DEFAULT_VISION_RANGE
-from .renderer import SoccerRenderer
+    The competition-facing discrete API now allows exactly one intent per step. Kicks occupy a
+    contiguous action range after the locomotion actions so agents, tests, and future baseline
+    policies can refer to them with a simple helper instead of hand-written offsets. The helper
+    validates the kick-strength index against the canonical Python-side lookup table so the
+    action contract stays synchronized with the native C decoder.
+
+    The returned value is the public action id that should be sent into the environment. Kick
+    index `0` is the weakest dribble-like tap and the last index is the old full-strength kick.
+    """
+
+    if kick_strength < 0 or kick_strength >= len(DISCRETE_KICK_STRENGTHS):
+        raise ValueError("kick_strength must be in [0, 7]")
+    return DISCRETE_KICK_ACTION_START + kick_strength
 
 
 def _validate_args(players_per_team: int, action_mode: str, reset_setup: str) -> None:
     if players_per_team < 1 or players_per_team > 11:
         raise ValueError("players_per_team must be in [1, 11]")
-    if action_mode not in ("discrete", "continuous"):
-        raise ValueError("action_mode must be discrete or continuous")
+    if action_mode != "discrete":
+        raise ValueError("action_mode must be discrete")
     if reset_setup not in ("position", "random"):
         raise ValueError("reset_setup must be position or random")
 
@@ -182,17 +217,8 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
             dtype=np.float32,
         )
 
-        if action_mode == "discrete":
-            self.single_action_space = gymnasium.spaces.Discrete(9)
-            self._action_mode_i = 0
-        else:
-            self.single_action_space = gymnasium.spaces.Box(
-                low=np.array([-1.0, -1.0], dtype=np.float32),
-                high=np.array([1.0, 1.0], dtype=np.float32),
-                shape=(2,),
-                dtype=np.float32,
-            )
-            self._action_mode_i = 1
+        self.single_action_space = gymnasium.spaces.Discrete(DISCRETE_ACTION_COUNT)
+        self._action_mode_i = 0
 
         super().__init__(buf)
 
@@ -363,17 +389,8 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
             dtype=np.float32,
         )
 
-        if action_mode == "discrete":
-            self.single_action_space = gymnasium.spaces.Discrete(9)
-            self._action_mode_i = 0
-        else:
-            self.single_action_space = gymnasium.spaces.Box(
-                low=np.array([-1.0, -1.0], dtype=np.float32),
-                high=np.array([1.0, 1.0], dtype=np.float32),
-                shape=(2,),
-                dtype=np.float32,
-            )
-            self._action_mode_i = 1
+        self.single_action_space = gymnasium.spaces.Discrete(DISCRETE_ACTION_COUNT)
+        self._action_mode_i = 0
 
         super().__init__(buf)
 
