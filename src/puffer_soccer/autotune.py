@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from puffer_soccer.envs.marl2d.core import DISCRETE_ACTION_COUNT
 from puffer_soccer.utilization import UtilizationMonitor
 
 if TYPE_CHECKING:
@@ -115,9 +116,18 @@ def batch_candidates(num_shards: int, shard_num_envs: int) -> list[int]:
 
 
 def action_cache(cache: int, num_agents: int, action_mode: str) -> np.ndarray:
-    if action_mode == "discrete":
-        return np.random.randint(0, 9, size=(cache, num_agents), dtype=np.int32)
-    return np.random.uniform(-1, 1, size=(cache, num_agents, 2)).astype(np.float32)
+    """Pre-sample valid actions for rollout throughput benchmarks.
+
+    The benchmark runner should exercise the same public discrete action space that training
+    uses. After the dynamic-kicking change, that means sampling from the full action range
+    rather than the older 9-action subset.
+    """
+
+    if action_mode != "discrete":
+        raise ValueError("action_mode must be discrete")
+    return np.random.randint(
+        0, DISCRETE_ACTION_COUNT, size=(cache, num_agents), dtype=np.int32
+    )
 
 
 def is_cpu_saturated(
