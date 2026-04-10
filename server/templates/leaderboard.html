@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Puffer Soccer Leaderboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+    <div class="max-w-4xl mx-auto px-4 py-8">
+        <div class="text-center mb-8">
+            <h1 class="text-4xl font-bold mb-2">Puffer Soccer Leaderboard</h1>
+            <p class="text-gray-400">{{ players_per_team }}v{{ players_per_team }} Robot Soccer &middot; ELO Rankings</p>
+            <div class="mt-4 space-x-4">
+                <a href="/submit" class="inline-block bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition">Submit Policy</a>
+                <a href="/my-submissions" class="inline-block bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg transition">My Submissions</a>
+                <a href="/docs" class="inline-block bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg transition">API Docs</a>
+            </div>
+        </div>
+
+        {% if leaderboard %}
+        <div class="overflow-x-auto">
+            <table class="w-full border-collapse">
+                <thead>
+                    <tr class="border-b border-gray-700 text-left">
+                        <th class="px-4 py-3 text-gray-400 font-medium">Rank</th>
+                        <th class="px-4 py-3 text-gray-400 font-medium">Player</th>
+                        <th class="px-4 py-3 text-gray-400 font-medium text-right">ELO</th>
+                        <th class="px-4 py-3 text-gray-400 font-medium text-right">W</th>
+                        <th class="px-4 py-3 text-gray-400 font-medium text-right">L</th>
+                        <th class="px-4 py-3 text-gray-400 font-medium text-right">D</th>
+                        <th class="px-4 py-3 text-gray-400 font-medium text-right">Submitted</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for entry in leaderboard %}
+                    <tr class="border-b border-gray-800 hover:bg-gray-800/50 transition
+                        {% if entry.rank == 1 %} bg-yellow-900/20{% endif %}
+                        {% if entry.rank == 2 %} bg-gray-500/10{% endif %}
+                        {% if entry.rank == 3 %} bg-amber-900/10{% endif %}">
+                        <td class="px-4 py-3 font-mono">
+                            {% if entry.rank == 1 %}&#x1F947;{% elif entry.rank == 2 %}&#x1F948;{% elif entry.rank == 3 %}&#x1F949;{% else %}{{ entry.rank }}{% endif %}
+                        </td>
+                        <td class="px-4 py-3 font-medium">{{ entry.user_name }}</td>
+                        <td class="px-4 py-3 text-right font-mono font-bold text-green-400">{{ "%.0f"|format(entry.elo_rating) }}</td>
+                        <td class="px-4 py-3 text-right font-mono text-green-500">{{ entry.wins }}</td>
+                        <td class="px-4 py-3 text-right font-mono text-red-400">{{ entry.losses }}</td>
+                        <td class="px-4 py-3 text-right font-mono text-gray-400">{{ entry.draws }}</td>
+                        <td class="px-4 py-3 text-right text-sm text-gray-500">{{ entry.submitted_at[:10] }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="text-center py-16">
+            <p class="text-gray-500 text-lg">No policies submitted yet. Be the first!</p>
+            <a href="/submit" class="inline-block mt-4 bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg transition">Submit a Policy</a>
+        </div>
+        {% endif %}
+
+        <div class="mt-12 p-6 bg-gray-800 rounded-lg">
+            <h2 class="text-xl font-bold mb-4">How it works</h2>
+            <ol class="list-decimal list-inside space-y-2 text-gray-300">
+                <li>Train a soccer policy using the Puffer Soccer environment</li>
+                <li>Export your policy as a TorchScript module (<code class="bg-gray-700 px-1 rounded">.pt</code> file)</li>
+                <li>Upload it here &mdash; we run a round-robin tournament against all other policies</li>
+                <li>ELO ratings update based on head-to-head match results</li>
+            </ol>
+            <div class="mt-4 p-4 bg-gray-700/50 rounded">
+                <p class="text-sm text-gray-400">
+                    <strong>Policy format:</strong> Your <code>.pt</code> file must be a TorchScript module that
+                    takes observations of shape <code>(N, {{ 16 + 14 * players_per_team }})</code> and returns
+                    a <code>(logits, values)</code> tuple where logits has shape <code>(N, 13)</code>.
+                </p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

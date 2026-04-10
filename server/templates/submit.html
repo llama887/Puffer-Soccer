@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Submit Policy - Puffer Soccer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+    <div class="max-w-2xl mx-auto px-4 py-8">
+        <div class="mb-6">
+            <a href="/" class="text-blue-400 hover:text-blue-300">&larr; Back to Leaderboard</a>
+        </div>
+
+        <h1 class="text-3xl font-bold mb-6">Submit a Policy</h1>
+
+        <div class="bg-gray-800 rounded-lg p-6 mb-6">
+            <p class="text-gray-300 mb-4">
+                Upload a TorchScript policy module (<code class="bg-gray-700 px-1 rounded">.pt</code> file)
+                to compete on the leaderboard. Your policy will be evaluated against all other active
+                policies in a round-robin tournament.
+            </p>
+            <p class="text-gray-400 text-sm">
+                Each matchup plays {{ games_per_matchup if games_per_matchup is defined else 20 }} games
+                with side balancing (half as blue, half as red). ELO ratings are updated after each matchup.
+            </p>
+        </div>
+
+        <form id="submit-form" action="/submit" method="POST" enctype="multipart/form-data"
+              class="bg-gray-800 rounded-lg p-6 space-y-6">
+
+            <div>
+                <label for="api_key" class="block text-sm font-medium text-gray-300 mb-2">API Key</label>
+                <input type="text" id="api_key" name="api_key" required
+                       placeholder="sk_..."
+                       class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+
+            <div>
+                <label for="policy_file" class="block text-sm font-medium text-gray-300 mb-2">Policy File (.pt)</label>
+                <input type="file" id="policy_file" name="policy_file" accept=".pt" required
+                       class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white file:mr-4 file:py-1 file:px-4 file:rounded file:border-0 file:bg-blue-600 file:text-white file:cursor-pointer hover:file:bg-blue-700">
+            </div>
+
+            <button type="submit" id="submit-btn"
+                    class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-4 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed">
+                Submit Policy
+            </button>
+        </form>
+
+        <div id="status" class="hidden mt-6 bg-gray-800 rounded-lg p-6">
+            <div class="flex items-center space-x-3">
+                <svg class="animate-spin h-5 w-5 text-blue-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                </svg>
+                <span class="text-gray-300">Uploading and validating policy...</span>
+            </div>
+        </div>
+
+        <div class="mt-8 p-6 bg-gray-800 rounded-lg">
+            <h2 class="text-lg font-bold mb-3">How to export your policy</h2>
+            <pre class="bg-gray-900 rounded p-4 text-sm text-gray-300 overflow-x-auto"><code># After training with train_pufferl.py, export as TorchScript:
+import torch
+
+# Your trained policy
+policy = Policy(env)
+policy.load_state_dict(checkpoint)
+policy.eval()
+
+# Trace and save
+example_obs = torch.randn(1, obs_dim)
+traced = torch.jit.trace(policy, example_obs)
+torch.jit.save(traced, "my_policy.pt")</code></pre>
+        </div>
+    </div>
+
+    <script>
+    document.getElementById('submit-form').addEventListener('submit', function() {
+        document.getElementById('submit-btn').disabled = true;
+        document.getElementById('submit-btn').textContent = 'Uploading...';
+        document.getElementById('status').classList.remove('hidden');
+    });
+    </script>
+</body>
+</html>
