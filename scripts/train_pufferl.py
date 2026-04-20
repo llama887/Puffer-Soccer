@@ -387,7 +387,9 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
                 config["vtrace_rho_clip"],
                 config["vtrace_c_clip"],
             )
-            adv = mb_advantages
+            # Use the freshly recomputed minibatch advantage so the policy loss
+            # reflects the current importance ratios instead of falling back to
+            # the stale segment-level value from before the minibatch update.
             adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
 
             pg_loss1 = -adv * ratio
