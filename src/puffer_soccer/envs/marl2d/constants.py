@@ -11,6 +11,11 @@ IN_FIELD_SIZE = (100.0, 70.0)
 GOAL_SIZE = (3.0, 40.0)
 POS_NORM = IN_FIELD_SIZE[0] / 2.0
 
+STAT_SIGMA = 0.15
+WHEELBASE = 2.0
+MAX_STEER_ANGLE = 1.2
+STEER_RATE = 0.4
+
 # Goalie, defenders, midfielders, attackers.
 INIT_POSITION_11 = [
     (0.0, -0.45),

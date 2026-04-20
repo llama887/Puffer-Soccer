@@ -141,7 +141,6 @@ def main() -> None:
         game_length=400,
         render_mode=None,
         seed=0,
-        opponents_enabled=True,
         vec=VecEnvConfig(backend="native", shard_num_envs=1, num_shards=1),
     )
     try:

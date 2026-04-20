@@ -1,6 +1,6 @@
 """Tests for league training helpers and trainer-side league wiring.
 
-These tests focus on the new MARLadona-inspired opponent-pool behavior. The goal is to keep
+These tests focus on the opponent-pool behavior for league and fictitious play modes. The goal is to keep
 the league bookkeeping and wrapper contracts stable without having to run a full PPO training
 job in every test.
 """
@@ -89,8 +89,6 @@ def test_league_manager_caps_pool_and_promotes_on_threshold() -> None:
         rl_alg="league",
         max_size=2,
         promotion_win_rate_threshold=0.75,
-        standardized_eval_ratio=0.0,
-        standardized_eval_enabled=False,
     )
     manager = train_pufferl.LeagueManager(config, seed=0)
     manager.bootstrap({"a": 1}, label="bootstrap", source_epoch=0)
@@ -119,8 +117,6 @@ def test_league_manager_sampling_returns_known_entry_ids() -> None:
         rl_alg="league",
         max_size=8,
         promotion_win_rate_threshold=0.75,
-        standardized_eval_ratio=0.0,
-        standardized_eval_enabled=False,
     )
     manager = train_pufferl.LeagueManager(config, seed=123)
     manager.bootstrap({"a": 1}, label="bootstrap", source_epoch=0)
@@ -145,8 +141,6 @@ def test_league_training_wrapper_exposes_only_learner_rows_and_tracks_assignment
         rl_alg="league",
         max_size=8,
         promotion_win_rate_threshold=0.75,
-        standardized_eval_ratio=0.0,
-        standardized_eval_enabled=False,
     )
     manager = train_pufferl.LeagueManager(config, seed=0)
     manager.bootstrap(

@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wandb", action=argparse.BooleanOptionalAction, default=True
     )
-    parser.add_argument("--wandb-project", type=str, default="robot-soccer")
+    parser.add_argument("--wandb-project", type=str, default="robot-soccer-discrete")
     parser.add_argument("--wandb-group", type=str, default="manual-best-checkpoint")
     parser.add_argument("--wandb-tag", type=str, default=None)
     return parser
@@ -141,7 +141,6 @@ def register_existing_checkpoint(args: argparse.Namespace) -> dict[str, object]:
         game_length=400,
         render_mode=None,
         seed=0,
-        opponents_enabled=True,
         vec=vec_config,
     )
     policy = train_pufferl.Policy(vecenv).to(device)

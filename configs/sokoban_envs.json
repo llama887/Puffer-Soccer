@@ -1,0 +1,119 @@
+{
+  "description": "Sokoban environment sets for GEPA train/val evaluation. All games are solvable by A*, have multiple levels, similar grid sizes (5x5 to 10x10), and 5-10 objects.",
+  "train": [
+    {
+      "name": "sokoban_basic",
+      "levels": 2,
+      "objects": 5,
+      "grid": "6x7",
+      "notes": "Baseline sokoban, simple push mechanics"
+    },
+    {
+      "name": "Broken_Leg_Sokoban",
+      "levels": 20,
+      "objects": 6,
+      "grid": "6x7",
+      "notes": "Movement-restricted sokoban variant"
+    },
+    {
+      "name": "Collapsable_Sokoban",
+      "levels": 7,
+      "objects": 5,
+      "grid": "10x10",
+      "notes": "Floors collapse after stepping on them"
+    },
+    {
+      "name": "Pulling_Box_Sokoban",
+      "levels": 21,
+      "objects": 5,
+      "grid": "6x8",
+      "notes": "Pull boxes instead of push"
+    },
+    {
+      "name": "Swap_Sokoban",
+      "levels": 21,
+      "objects": 5,
+      "grid": "6x7",
+      "notes": "Swap positions with boxes"
+    },
+    {
+      "name": "Sokoban_Flipped",
+      "levels": 21,
+      "objects": 5,
+      "grid": "6x8",
+      "notes": "Reversed push direction"
+    },
+    {
+      "name": "Algorithm-Generated_Sokoban_Levels",
+      "levels": 40,
+      "objects": 7,
+      "grid": "6x6",
+      "notes": "Procedurally generated levels, good difficulty spread"
+    },
+    {
+      "name": "Tractor_Beam_Sokoban9",
+      "levels": 24,
+      "objects": 9,
+      "grid": "6x7",
+      "notes": "Remote push mechanics"
+    },
+    {
+      "name": "Muddy_Sokoban_Level_Set_I",
+      "levels": 7,
+      "objects": 8,
+      "grid": "7x7",
+      "notes": "Terrain-based sokoban variant"
+    },
+    {
+      "name": "Ultimate_Sokoban_Supreme",
+      "levels": 22,
+      "objects": 6,
+      "grid": "8x9",
+      "notes": "Challenging standard sokoban"
+    }
+  ],
+  "val": [
+    {
+      "name": "sokoban_sanity",
+      "levels": 3,
+      "objects": 5,
+      "grid": "6x7",
+      "notes": "Simple sanity-check levels"
+    },
+    {
+      "name": "No_Right_Turn_Sokoban",
+      "levels": 8,
+      "objects": 8,
+      "grid": "7x11",
+      "notes": "Directional movement constraint"
+    },
+    {
+      "name": "Cold_Feet_Sokoban",
+      "levels": 7,
+      "objects": 10,
+      "grid": "6x7",
+      "notes": "Ice/sliding mechanics, harder puzzles"
+    },
+    {
+      "name": "Soko-bine",
+      "levels": 9,
+      "objects": 7,
+      "grid": "6x7",
+      "notes": "Combine-and-push mechanics"
+    },
+    {
+      "name": "Remote_Control_Sokoban",
+      "levels": 7,
+      "objects": 6,
+      "grid": "9x9",
+      "notes": "Remote control variant"
+    },
+    {
+      "name": "Darkness_Sokoban",
+      "levels": 2,
+      "objects": 9,
+      "grid": "7x7",
+      "notes": "Limited visibility variant"
+    }
+  ]
+}

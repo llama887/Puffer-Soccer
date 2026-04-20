@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=tune_md_kl_off
+#SBATCH --job-name=tune_fp_kl_off
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-export TUNE_MATRIX_LABEL="marlodonna__kl_off"
-export TUNE_RL_ALG="marlodonna"
+export TUNE_MATRIX_LABEL="fictitious_play__kl_off"
+export TUNE_RL_ALG="fictitious_play"
 export TUNE_KL_MODE="off"
 
 bash sbatch/run_tune_self_play_variant.sh

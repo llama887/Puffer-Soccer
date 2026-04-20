@@ -231,3 +231,5 @@ AGENTS.md
 *.out
 tmp
 srun-logs
+videos
+.claude

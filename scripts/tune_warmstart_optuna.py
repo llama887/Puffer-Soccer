@@ -48,6 +48,7 @@ FINAL_EVAL_PATTERN = re.compile(
 INTERMEDIATE_EVAL_PATTERN = re.compile(
     r"No-opponent eval "
     r"\(epoch=(?P<epoch>\d+), games=(?P<games>\d+)\): "
+    r"(?:stage=\S+, )?"
     r"train_scale=(?P<train_scale>[0-9.]+), "
     r"goal_rate=(?P<goal_rate>[0-9.]+), "
     r"multi_goal_rate=(?P<multi_goal_rate>[0-9.]+), "
@@ -226,6 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--eval-max-steps", type=int, default=600)
     parser.add_argument("--goal-rate-threshold", type=float, default=0.80)
+    parser.add_argument("--stage-advancement-threshold", type=float, default=0.50)
     parser.add_argument("--multi-goal-rate-threshold", type=float, default=0.0)
     parser.add_argument(
         "--map-scale-ladder",
@@ -246,6 +248,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=REPO_ROOT / "experiments" / "warmstart_optuna",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        default=False,
+        help="Run trials directly without srun (use when GPU is already available).",
+    )
+    parser.add_argument(
+        "--trial-timeout",
+        type=int,
+        default=None,
+        help="Per-trial timeout in seconds. Kill trial if it hangs after completion.",
     )
     return parser
 
@@ -362,7 +376,7 @@ def sample_hyperparameters(trial, baseline: Mapping[str, object]) -> dict[str, o
     and warm-start budget that decide whether the fixed ladder can be cleared reliably.
     """
 
-    horizon = trial.suggest_categorical("bptt_horizon", [32, 64, 96, 128])
+    horizon = trial.suggest_categorical("bptt_horizon", [64, 96, 128])
     batch_multiple = trial.suggest_categorical("batch_multiple", [1, 2, 3, 4])
     minibatch_divisor = trial.suggest_categorical("minibatch_divisor", [2, 4, 8])
     train_batch_size = 10 * 8 * horizon * batch_multiple
@@ -371,27 +385,41 @@ def sample_hyperparameters(trial, baseline: Mapping[str, object]) -> dict[str, o
 
     return {
         "ppo_iterations": trial.suggest_categorical(
-            "ppo_iterations", [64, 96, 128, 160, 192]
+            "ppo_iterations", [2048, 3072, 4096, 6144]
         ),
         "train_batch_size": train_batch_size,
         "bptt_horizon": horizon,
         "minibatch_size": minibatch_size,
         "learning_rate": trial.suggest_float(
             "learning_rate",
-            0.5 * mapping_float(baseline, "learning_rate"),
-            2.0 * mapping_float(baseline, "learning_rate"),
+            3e-4,
+            8e-4,
             log=True,
         ),
-        "gamma": trial.suggest_float("gamma", 0.99, 0.9995),
-        "gae_lambda": trial.suggest_float("gae_lambda", 0.93, 0.99),
-        "update_epochs": trial.suggest_int("update_epochs", 3, 6),
-        "clip_coef": trial.suggest_float("clip_coef", 0.18, 0.30),
-        "vf_coef": trial.suggest_float("vf_coef", 0.6, 1.5),
-        "vf_clip_coef": trial.suggest_float("vf_clip_coef", 0.10, 0.30),
+        "gamma": trial.suggest_float("gamma", 0.982, 0.993),
+        "gae_lambda": trial.suggest_float("gae_lambda", 0.90, 0.98),
+        "update_epochs": trial.suggest_int("update_epochs", 4, 7),
+        "clip_coef": trial.suggest_float("clip_coef", 0.15, 0.30),
+        "vf_coef": trial.suggest_float("vf_coef", 0.5, 1.2),
+        "vf_clip_coef": trial.suggest_float("vf_clip_coef", 0.15, 0.45),
         "max_grad_norm": trial.suggest_float("max_grad_norm", 0.4, 1.2),
-        "ent_coef": trial.suggest_float("ent_coef", 1e-8, 1e-5, log=True),
-        "prio_alpha": trial.suggest_float("prio_alpha", 0.7, 0.99),
-        "prio_beta0": trial.suggest_float("prio_beta0", 0.4, 0.95),
+        "ent_coef": trial.suggest_float("ent_coef", 3e-4, 5e-3, log=True),
+        "prio_alpha": trial.suggest_float("prio_alpha", 0.5, 0.90),
+        "prio_beta0": trial.suggest_float("prio_beta0", 0.3, 0.70),
+        # Warm-start dense-shaping magnitudes. Ranges center on the original
+        # working defaults (distance 1e-3, touch 5e-2, velocity 1e-2) and
+        # span roughly half-to-double. Narrower ranges than the first
+        # attempt because the scaled-down values (~10x smaller) were shown
+        # empirically to stop blue from even reaching the ball.
+        "shaping_distance_penalty": trial.suggest_float(
+            "shaping_distance_penalty", 3e-4, 3e-3, log=True
+        ),
+        "shaping_touch_bonus": trial.suggest_float(
+            "shaping_touch_bonus", 2e-2, 1e-1, log=True
+        ),
+        "shaping_velocity_bonus": trial.suggest_float(
+            "shaping_velocity_bonus", 3e-3, 3e-2, log=True
+        ),
         "no_opponent_map_scale_ladder": str(
             baseline.get("no_opponent_map_scale_ladder", "0.2,0.4,0.6,0.8,1.0")
         ),
@@ -440,6 +468,8 @@ def build_training_command(
         "8",
         "--no-opponent-phase-goal-rate-threshold",
         str(args.goal_rate_threshold),
+        "--no-opponent-phase-stage-advancement-threshold",
+        str(getattr(args, "stage_advancement_threshold", args.goal_rate_threshold)),
         "--no-opponent-phase-multi-goal-rate-threshold",
         str(args.multi_goal_rate_threshold),
         "--train-batch-size",
@@ -470,19 +500,28 @@ def build_training_command(
         str(mapping_float(hyperparameters, "prio_alpha")),
         "--prio-beta0",
         str(mapping_float(hyperparameters, "prio_beta0")),
+        "--shaping-distance-penalty",
+        str(mapping_float(hyperparameters, "shaping_distance_penalty")),
+        "--shaping-touch-bonus",
+        str(mapping_float(hyperparameters, "shaping_touch_bonus")),
+        "--shaping-velocity-bonus",
+        str(mapping_float(hyperparameters, "shaping_velocity_bonus")),
         "--no-opponent-map-scale-ladder",
-        str(hyperparameters.get("no_opponent_map_scale_ladder", args.map_scale_ladder)),
+        str(args.map_scale_ladder),
         "--no-opponent-eval-games",
         str(args.eval_games),
         "--no-opponent-eval-max-steps",
         str(args.eval_max_steps),
         "--final-best-eval-games",
         "0",
+        # Save a checkpoint every 256 epochs so failed trials still leave a
+        # policy snapshot behind for trace inspection / video rendering.
         "--checkpoint-interval",
-        str(10**9),
+        "256",
         "--no-past-iterate-eval",
         "--no-export-videos",
         "--no-wandb",
+        "--no-reuse-cached-warm-start",
         "--run-summary-path",
         str(summary_path),
     ]
@@ -602,7 +641,7 @@ def load_trial_outcome(
         if isinstance(effective, Mapping):
             effective_hyperparameters = dict(effective)
 
-    log_text = artifacts.log_path.read_text(encoding="utf-8")
+    log_text = artifacts.log_path.read_text(encoding="utf-8", errors="replace")
     if metrics is None:
         metrics = extract_metrics_from_log(log_text)
 
@@ -623,7 +662,11 @@ def load_trial_outcome(
             + 4.0 * metrics.mean_goals_scored
             - 3.0 * metrics.own_goal_rate
             - 0.01 * metrics.mean_first_goal_step
-            - 0.02 * mapping_float(hyperparameters, "ppo_iterations")
+            # Budget penalty was 0.02 per iteration, which meant zero-goal
+            # small-budget trials could out-score moderate-goal large-budget
+            # trials. Reduced 4x so that any trial with goal_rate > ~0.4 on a
+            # 2048-iter run outscores a zero-goal 768-iter run.
+            - 0.005 * mapping_float(hyperparameters, "ppo_iterations")
         )
 
     return TrialOutcome(
@@ -662,24 +705,54 @@ def run_trial_subprocess(
         seed=seed,
         summary_path=summary_path,
     )
-    srun_command = build_srun_command(args=args, command=train_command)
+    if getattr(args, "local", False):
+        run_command = train_command
+    else:
+        run_command = build_srun_command(args=args, command=train_command)
     artifacts = TrialArtifacts(
         trial_number=trial.number,
         seed=seed,
         trial_dir=trial_dir,
         log_path=log_path,
         summary_path=summary_path,
-        command=tuple(srun_command),
+        command=tuple(run_command),
     )
 
+    import os
+    import signal
     start_time = time.time()
-    with log_path.open("w", encoding="utf-8") as handle:
-        completed = subprocess.run(
-            srun_command,
+    trial_timeout = getattr(args, "trial_timeout", None)
+
+    # Retry the file open on transient NFS/bind-mount errors (e.g. stale file
+    # handle errno 116) that can occur when output_dir is on a network filesystem.
+    _MAX_OPEN_RETRIES = 3
+    _handle = None
+    for _attempt in range(_MAX_OPEN_RETRIES):
+        try:
+            _handle = log_path.open("w", encoding="utf-8")
+            break
+        except OSError:
+            if _attempt == _MAX_OPEN_RETRIES - 1:
+                raise
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            time.sleep(1)
+
+    assert _handle is not None
+    with _handle as handle:
+        proc = subprocess.Popen(
+            run_command,
             cwd=REPO_ROOT,
             stdout=handle,
             stderr=subprocess.STDOUT,
-            check=False,
+            start_new_session=True,
+        )
+        try:
+            proc.wait(timeout=trial_timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait()
+        completed = subprocess.CompletedProcess(
+            args=run_command, returncode=proc.returncode
         )
     outcome = load_trial_outcome(
         args=args,
@@ -787,7 +860,14 @@ def main() -> None:  # pylint: disable=too-many-locals
         )
         return outcome.score
 
-    study.optimize(objective, n_trials=args.trials)
+    # Catch transient OSError (NFS stale file handle, etc.) and system-level
+    # failures so a single flaky trial doesn't abort the entire study. Optuna
+    # will mark the trial failed and move on to the next suggestion.
+    study.optimize(
+        objective,
+        n_trials=args.trials,
+        catch=(OSError, RuntimeError),
+    )
 
     best_trial = study.best_trial
     best_trial_record = load_recorded_trial_record(

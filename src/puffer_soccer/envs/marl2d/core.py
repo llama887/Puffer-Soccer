@@ -155,7 +155,10 @@ class EnvConfig:
     game_length: int = DEFAULT_GAME_LENGTH
     action_mode: str = "discrete"
     do_team_switch: bool = False
-    opponents_enabled: bool = True
+    warm_start_reward_shaping: bool = False
+    shaping_distance_penalty: float = -1.0
+    shaping_touch_bonus: float = -1.0
+    shaping_velocity_bonus: float = -1.0
     vision_range: float = DEFAULT_VISION_RANGE
     reset_setup: str = "position"
     log_interval: int = 128
@@ -165,16 +168,14 @@ class EnvConfig:
 
 
 class MARL2DPufferEnv(pufferlib.PufferEnv):
-    """Wrap one native soccer environment and expose the compiled no-opponent mode.
+    """Wrap one native soccer environment with optional warm-start reward shaping.
 
-    The training experiments in this project need a clean diagnostic where the blue team plays
-    in a truly opponent-free world. That should still use the normal native reset path and the
-    same PPO loop as standard training, just with the red team disabled inside the simulator.
-
-    This wrapper therefore forwards `opponents_enabled` directly into the native binding rather
-    than trying to emulate the behavior in Python. Keeping that control inside the C simulator
-    avoids ghost opponents in observations, keeps post-goal resets consistent, and lets both
-    scalar and native vector environments share the same semantics.
+    Both teams are always physically present in the simulator. During warm-start, the training
+    layer drives the red team with a scripted "always kick" policy so throw-ins and offside
+    resolve, and `warm_start_reward_shaping=True` enables the dense per-step shaping that only
+    rewards the learning team. During self-play, `warm_start_reward_shaping=False` keeps the
+    sparse +/-1 goal reward for both teams. Keeping opponents physically active throughout
+    makes every mechanic (throw-ins, offside, body collisions) identical across phases.
 
     The wrapper also reconstructs per-team episode returns from the step rewards. That gives
     training a meaningful PPO reward curve such as `environment/current_team_episode_return`
@@ -188,7 +189,10 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         game_length: int = DEFAULT_GAME_LENGTH,
         action_mode: str = "discrete",
         do_team_switch: bool = False,
-        opponents_enabled: bool = True,
+        warm_start_reward_shaping: bool = False,
+        shaping_distance_penalty: float = -1.0,
+        shaping_touch_bonus: float = -1.0,
+        shaping_velocity_bonus: float = -1.0,
         vision_range: float = DEFAULT_VISION_RANGE,
         reset_setup: str = "position",
         log_interval: int = 128,
@@ -200,15 +204,18 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
 
         self.render_mode = render_mode
         self.players_per_team = players_per_team
-        self.opponents_enabled = opponents_enabled
+        self.warm_start_reward_shaping = warm_start_reward_shaping
+        self.shaping_distance_penalty = shaping_distance_penalty
+        self.shaping_touch_bonus = shaping_touch_bonus
+        self.shaping_velocity_bonus = shaping_velocity_bonus
         self.num_players = players_per_team * 2
         self.num_envs = 1
         self.num_agents = self.num_players
         self.game_length = game_length
         self.log_interval = log_interval
 
-        self.obs_size = 16 + 14 * players_per_team
-        self.state_size = 5 + 34 * players_per_team
+        self.obs_size = 19 + 24 * players_per_team
+        self.state_size = 7 + 43 * players_per_team
 
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0,
@@ -245,9 +252,12 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
             game_length=game_length,
             action_mode=self._action_mode_i,
             do_team_switch=int(do_team_switch),
-            opponents_enabled=int(opponents_enabled),
+            warm_start_reward_shaping=int(warm_start_reward_shaping),
             vision_range=float(vision_range),
             reset_setup=0 if reset_setup == "position" else 1,
+            shaping_distance_penalty=float(shaping_distance_penalty),
+            shaping_touch_bonus=float(shaping_touch_bonus),
+            shaping_velocity_bonus=float(shaping_velocity_bonus),
         )
         self.tick = 0
 
@@ -299,6 +309,17 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
 
         binding.env_set_field_scale(self._handle, float(scale))
 
+    def set_red_in_formation(self, in_formation: bool) -> None:
+        """Toggle whether warm-start red uses formation (True) or corners (False).
+
+        The curriculum starts red at endline corners so blue has an open lane to goal.
+        After the field-scale ladder completes, the trainer flips this to True for a final
+        phase at scale 1.0 so blue sees the same red layout as self-play before the policy
+        is cached for the main run.
+        """
+
+        binding.env_set_red_in_formation(self._handle, 1 if in_formation else 0)
+
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         if env_idx != 0:
             raise ValueError("scalar env only has env_idx=0")
@@ -343,12 +364,11 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
 class MARL2DNativeVecEnv(pufferlib.PufferEnv):
     """Wrap the compiled native vector environment.
 
-    The native backend is the fastest way to collect rollouts, so the no-opponent baseline
-    should use it whenever the compiled extension supports that mode. Forwarding
-    `opponents_enabled` here keeps scalar and vector environments behaviorally aligned.
-    Like the scalar wrapper, it also reconstructs per-team episode returns in Python so
-    training can log a one-team PPO reward curve even when the native zero-sum aggregate is
-    uninformative.
+    The native backend is the fastest way to collect rollouts. Forwarding
+    `warm_start_reward_shaping` here keeps scalar and vector environments behaviorally
+    aligned. Like the scalar wrapper, it also reconstructs per-team episode returns in
+    Python so training can log a one-team PPO reward curve even when the native zero-sum
+    aggregate is uninformative.
     """
 
     def __init__(
@@ -358,7 +378,10 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         game_length: int = DEFAULT_GAME_LENGTH,
         action_mode: str = "discrete",
         do_team_switch: bool = False,
-        opponents_enabled: bool = True,
+        warm_start_reward_shaping: bool = False,
+        shaping_distance_penalty: float = -1.0,
+        shaping_touch_bonus: float = -1.0,
+        shaping_velocity_bonus: float = -1.0,
         vision_range: float = DEFAULT_VISION_RANGE,
         reset_setup: str = "position",
         log_interval: int = 128,
@@ -372,15 +395,18 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
 
         self.render_mode = render_mode
         self.players_per_team = players_per_team
-        self.opponents_enabled = opponents_enabled
+        self.warm_start_reward_shaping = warm_start_reward_shaping
+        self.shaping_distance_penalty = shaping_distance_penalty
+        self.shaping_touch_bonus = shaping_touch_bonus
+        self.shaping_velocity_bonus = shaping_velocity_bonus
         self.num_players = players_per_team * 2
         self.num_envs = num_envs
         self.num_agents = self.num_players * num_envs
         self.game_length = game_length
         self.log_interval = log_interval
 
-        self.obs_size = 16 + 14 * players_per_team
-        self.state_size = 5 + 34 * players_per_team
+        self.obs_size = 19 + 24 * players_per_team
+        self.state_size = 7 + 43 * players_per_team
 
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0,
@@ -418,9 +444,12 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
             game_length=game_length,
             action_mode=self._action_mode_i,
             do_team_switch=int(do_team_switch),
-            opponents_enabled=int(opponents_enabled),
+            warm_start_reward_shaping=int(warm_start_reward_shaping),
             vision_range=float(vision_range),
             reset_setup=0 if reset_setup == "position" else 1,
+            shaping_distance_penalty=float(shaping_distance_penalty),
+            shaping_touch_bonus=float(shaping_touch_bonus),
+            shaping_velocity_bonus=float(shaping_velocity_bonus),
         )
         self.tick = 0
 
@@ -466,6 +495,11 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         """
 
         binding.vec_set_field_scale(self._handle, float(scale))
+
+    def set_red_in_formation(self, in_formation: bool) -> None:
+        """Broadcast warm-start red placement mode to every env shard."""
+
+        binding.vec_set_red_in_formation(self._handle, 1 if in_formation else 0)
 
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         return binding.vec_get_state(self._handle, env_idx)

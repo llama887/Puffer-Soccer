@@ -106,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             train_pufferl.RL_ALG_SELF_PLAY,
             train_pufferl.RL_ALG_LEAGUE,
-            train_pufferl.RL_ALG_MARLODONNA,
+            train_pufferl.RL_ALG_FICTITIOUS,
         ],
     )
     parser.add_argument(
@@ -166,6 +166,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=(
             "experiments/best_checkpoint_rl_tuning/"
             + time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        ),
+    )
+    parser.add_argument(
+        "--export-standardized-path",
+        type=str,
+        default=None,
+        help=(
+            "When set, write the winning hyperparameters in the standardized "
+            "format that train_pufferl.py --hyperparameters-path can load. "
+            "This bridges tuning output to training input."
         ),
     )
     return parser
@@ -941,6 +951,19 @@ def main() -> None:
         f"Confirmed mean win rate={best_candidate['mean_win_rate']:.3f}, "
         f"mean score diff={best_candidate['mean_score_diff']:.3f}"
     )
+
+    if args.export_standardized_path is not None:
+        export_path = Path(args.export_standardized_path)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        train_pufferl.write_standardized_hyperparameters(
+            path=export_path,
+            effective_hyperparameters=best_hypers,
+            source_path=best_path,
+            source_label=f"tune_best_checkpoint_rl/{args.rl_alg}__kl_{args.kl_regularization_mode}",
+            source_num_agents=args.total_agents,
+        )
+        print(f"Exported standardized hyperparameters: {export_path}")
+
     print(f"Artifacts written to {output_dir}")
 
 

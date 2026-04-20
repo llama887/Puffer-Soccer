@@ -1,17 +1,17 @@
 """League training helpers shared by experimental RL training modes.
 
 This module keeps the non-environment-specific parts of the league logic out of the main
-training script. The project now wants to compare ordinary self-play against MARLadona-style
-league training, and that comparison is much easier to reason about when the basic concepts
-have names of their own instead of being encoded as ad hoc dictionaries scattered across the
-trainer.
+training script. The project compares three opponent-selection strategies: self-play, league
+(curated bounded pool), and fictitious play (uniform over all past iterates). Factoring the
+pool bookkeeping into named helpers makes that comparison much easier to reason about.
 
 The helpers here intentionally stay small and generic:
 
 - ``LeagueConfig`` describes the policy-pool and promotion defaults for one RL algorithm mode.
 - ``LeagueEntry`` stores one immutable opponent snapshot together with stable ids and labels.
-- ``LeagueManager`` owns the capped league pool, deterministic uniform sampling, promotion
-  bookkeeping, and simple summary payloads.
+- ``LeagueManager`` owns the pool of opponent snapshots, deterministic uniform sampling,
+  promotion bookkeeping, and simple summary payloads. For league mode the pool is capped with
+  FIFO eviction; for fictitious play it grows without bound.
 
 The actual rollout collection still lives in the trainer because it needs deep knowledge of
 the active vector environment and policy class. Keeping that boundary explicit makes it easier
@@ -35,20 +35,18 @@ class LeagueConfig:
 
     The project wants two related but distinct league-style algorithms:
 
-    - ``league``: the minimal MARLadona-inspired league core
-    - ``marlodonna``: the closest practical paper-faithful reproduction we can run here
+    - ``league``: a curated pool of past iterates with bounded capacity and FIFO eviction
+    - ``fictitious_play``: an unbounded pool of all past iterates sampled uniformly
 
-    Both modes share the same underlying concepts, but they differ in defaults such as league
-    capacity and whether standardized evaluation is expected. Bundling those settings into one
-    dataclass keeps the later trainer code decision-complete and avoids magic constants leaking
-    into multiple call sites.
+    Both modes share the same underlying concepts, but they differ in pool management: league
+    evicts old snapshots to stay within ``max_size``, while fictitious play keeps every
+    snapshot ever promoted. Bundling those settings into one dataclass keeps the later trainer
+    code decision-complete and avoids magic constants leaking into multiple call sites.
     """
 
     rl_alg: str
     max_size: int
     promotion_win_rate_threshold: float
-    standardized_eval_ratio: float
-    standardized_eval_enabled: bool
     side_balance: bool = True
     opponent_sampling: str = "uniform"
     same_policy_per_team: bool = True
@@ -142,10 +140,9 @@ class LeagueManager:
     ) -> LeagueEntry:
         """Seed the league with one initial opponent snapshot when the pool is empty.
 
-        League training cannot start without at least one frozen opponent to play against.
-        Our environment does not provide MARLadona's separate bot and random-controller setup,
-        so the closest practical analogue is to begin with a frozen copy of the current policy.
-        This helper makes that bootstrap explicit and idempotent.
+        League and fictitious-play training cannot start without at least one frozen opponent
+        to play against. We begin with a frozen copy of the current policy. This helper makes
+        that bootstrap explicit and idempotent.
         """
 
         if self._entries:
@@ -163,12 +160,13 @@ class LeagueManager:
         label: str,
         source_epoch: int,
     ) -> LeagueEntry:
-        """Add one immutable snapshot to the pool and enforce the configured capacity.
+        """Add one immutable snapshot to the pool and optionally enforce capacity.
 
         The state dict is copied into a plain ``dict`` so later training updates cannot mutate
-        the stored snapshot through shared references. When the pool exceeds ``max_size``, the
-        oldest snapshot is evicted first. That FIFO policy matches the simplest interpretation
-        of a capped replay buffer and is easy to explain when reading training logs.
+        the stored snapshot through shared references. In league mode, when the pool exceeds
+        ``max_size`` the oldest snapshot is evicted (FIFO). In fictitious play mode
+        (``rl_alg == "fictitious_play"``), eviction is skipped so the pool accumulates every
+        past iterate for true uniform sampling over the full history.
         """
 
         entry = LeagueEntry(
@@ -179,7 +177,7 @@ class LeagueManager:
         )
         self._next_entry_id += 1
         self._entries.append(entry)
-        if len(self._entries) > self.config.max_size:
+        if self.config.rl_alg != "fictitious_play" and len(self._entries) > self.config.max_size:
             self._entries.pop(0)
         return entry
 
@@ -224,11 +222,9 @@ class LeagueManager:
     ) -> LeaguePromotionResult:
         """Promote the current policy into the pool when the configured threshold is met.
 
-        The paper-first MARLadona comparison requested by this project uses a win-rate gate
-        rather than the public repo's score-difference gate. The score difference is still
-        carried through the result because it is informative for dashboards and summaries, but
-        the actual decision is based only on ``aggregate_win_rate`` versus the configured
-        threshold.
+        The decision is based only on ``aggregate_win_rate`` versus the configured threshold.
+        The score difference is still carried through the result because it is informative for
+        dashboards and summaries.
         """
 
         promoted_entry_id: int | None = None
@@ -265,8 +261,6 @@ class LeagueManager:
             ),
             "opponent_sampling": self.config.opponent_sampling,
             "same_policy_per_team": bool(self.config.same_policy_per_team),
-            "standardized_eval_enabled": bool(self.config.standardized_eval_enabled),
-            "standardized_eval_ratio": float(self.config.standardized_eval_ratio),
             "side_balance": bool(self.config.side_balance),
             "size": len(self._entries),
             "entry_ids": [entry.entry_id for entry in self._entries],

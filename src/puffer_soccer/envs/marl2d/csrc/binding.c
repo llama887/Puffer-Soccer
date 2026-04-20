@@ -19,6 +19,11 @@
 #define DISCRETE_KICK_BUCKETS 8
 #define DISCRETE_ACTION_COUNT (DISCRETE_KICK_ACTION_START + DISCRETE_KICK_BUCKETS)
 
+#define STAT_SIGMA 0.15f
+#define WHEELBASE 2.0f
+#define MAX_STEER_ANGLE 1.2f
+#define STEER_RATE 0.4f
+
 typedef struct {
     float score;
     float episode_return;
@@ -38,6 +43,10 @@ typedef struct {
     float last_move;
     float last_rot;
     int team;
+    float stat_kick;
+    float stat_speed;
+    float stat_turn;
+    float steer_angle;
 } Agent;
 
 typedef struct {
@@ -57,7 +66,7 @@ typedef struct {
     float cumulative_blue_team_episode_return;
     float cumulative_red_team_episode_return;
     int do_team_switch;
-    int opponents_enabled;
+    int warm_start_reward_shaping;
     int blue_left;
     int reset_setup;
     int action_mode;
@@ -85,6 +94,28 @@ typedef struct {
     float base_y_out_start;
     float base_y_out_end;
     float base_goal_half_h;
+    int last_touch_team;
+    int throw_in_active;
+    int throw_in_player;
+    /* Warm-start dense-shaping coefficients. Exposed as runtime parameters so
+     * Optuna can tune the balance between dense bootstrap signal and the
+     * sparse +/-1 goal reward. Only consulted when warm_start_reward_shaping
+     * is set on the Env. Defaults (set in init_env_common if 0/negative) are
+     * scaled down ~10x from the original hard-coded values so the goal
+     * reward dominates discounted returns. */
+    float shaping_distance_penalty;
+    float shaping_touch_bonus;
+    float shaping_velocity_bonus;
+    /* Warm-start red placement selector. 0 = red clusters at endline corners
+     * (easy bootstrap, blue has open lane to goal). 1 = red uses the regular
+     * self-play formation (harder, matches main-game conditions). Only
+     * consulted when warm_start_reward_shaping is set. The curriculum
+     * controller toggles this via py_env_set_red_in_formation after the
+     * field-scale ladder completes. */
+    int warm_start_red_in_formation;
+    /* Per-agent "touched ball this step" flag, cleared at the start of each step
+       and set inside ball_check_hit. Used for dense warm-start reward shaping. */
+    int ball_touched_this_step[MAX_PLAYERS];
     int obs_size;
     int state_size;
     uint32_t rng;
@@ -139,12 +170,32 @@ static float randf(uint32_t* s, float lo, float hi) {
     return lo + (hi - lo) * r;
 }
 
+static float rand_normal(uint32_t* s, float mean, float sigma) {
+    float u1 = randf(s, 1e-6f, 1.0f);
+    float u2 = randf(s, 0.0f, 1.0f);
+    float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
+    return mean + sigma * z;
+}
+
 static int obs_size_for_team(int n) {
-    return 16 + 14*n;
+    /* Per-focus observation breakdown (for n = players_per_team):
+       - 1 time_left
+       - 2 self x, y
+       - 2 self cos(rot), sin(rot)
+       - 2 self last_move, last_rot
+       - 2 self vx, vy (world frame, team-signed)
+       - 11 self id one-hot
+       - 4 self stats + steer
+       - 2 set-piece flags (throw_in_active, is_thrower)
+       - 5 ball (visibility, distance, angle, rel_vx, rel_vy)
+       - 12 per teammate and per opponent (9 rel-obs + 3 stats: kick, speed, turn),
+         with (2n - 1) other agents total => 12 * (2n - 1).
+       Self+ball block = 31; other-agent block = 24n - 12; total = 19 + 24n. */
+    return 19 + 24*n;
 }
 
 static int state_size_for_team(int n) {
-    return 5 + 34*n;
+    return 7 + 43*n;
 }
 
 static void get_one_hot(int id, float* out11) {
@@ -155,10 +206,6 @@ static void get_one_hot(int id, float* out11) {
 static int team_on_left(const Env* env, int team) {
     if (team == 0) return env->blue_left;
     return !env->blue_left;
-}
-
-static int is_inactive_opponent(const Env* env, int player_idx) {
-    return !env->opponents_enabled && env->agents[player_idx].team != 0;
 }
 
 static float field_half_width(const Env* env) {
@@ -190,26 +237,82 @@ static void apply_field_scale(Env* env, float scale) {
     clamp_live_state_to_field(env);
 }
 
+static void compute_formation_pos(int pidx, int players_per_team, float* out_x, float* out_y) {
+    /* Deterministic formation for any team size.
+     * Index 0 is the deepest position (likely emergent goalie under offside
+     * pressure). Remaining players spread in rows on own half.
+     * Coordinates are in field units (own half is x<0, to be mirrored). */
+    if (pidx == 0) {
+        /* Deepest position - near own goal */
+        *out_x = -45.0f;
+        *out_y = 0.0f;
+        return;
+    }
+    int n = players_per_team - 1;  /* field players */
+    if (n == 0) { *out_x = -25.0f; *out_y = 0.0f; return; }
+    /* Arrange in columns (y-spread) and rows (x-depth).
+     * Up to 4 players: single row. 5+: two rows. */
+    int cols, rows;
+    if (n <= 4) { cols = n; rows = 1; }
+    else { cols = (n + 1) / 2; rows = 2; }
+    int r = (pidx - 1) / cols;
+    int c = (pidx - 1) % cols;
+    /* Rows from x=-30 (defenders) to x=-15 (attackers) */
+    *out_x = (rows == 1) ? -22.0f : (-30.0f + r * 15.0f);
+    /* Columns spread from y=-20 to y=+20 */
+    *out_y = (cols == 1) ? 0.0f : (-20.0f + (float)c * (40.0f / (float)(cols - 1)));
+}
+
 static void reset_field(Env* env) {
     float pos_noise = 0.05f;
     for (int i = 0; i < env->num_players; i++) {
         Agent* a = &env->agents[i];
         int place_left = team_on_left(env, a->team);
 
-        if (is_inactive_opponent(env, i)) {
-            a->x = env->x_out_end;
-            a->y = ((float)(i - env->players_per_team) + 0.5f) * 4.0f;
-            a->y = clampf(a->y, env->y_out_start, env->y_out_end);
-            a->rot = (float)M_PI;
+        /* Sample per-agent stats */
+        a->stat_kick  = clampf(rand_normal(&env->rng, 1.0f, STAT_SIGMA), 0.5f, 1.5f);
+        a->stat_speed = clampf(rand_normal(&env->rng, 1.0f, STAT_SIGMA), 0.5f, 1.5f);
+        a->stat_turn  = clampf(rand_normal(&env->rng, 1.0f, STAT_SIGMA), 0.5f, 1.5f);
+        a->steer_angle = 0.0f;
+
+        /* Warm-start corner placement for red. Only used when shaping is
+         * active AND the curriculum has not yet asked for formation red.
+         * Cluster red on their defensive endline near the top/bottom
+         * sidelines so they stay clear of the goalmouth. This makes the
+         * bootstrap task tractable (blue has an open lane to goal) while
+         * keeping every other env mechanic identical to self-play. Once the
+         * curriculum reaches the formation stage, `warm_start_red_in_formation`
+         * is flipped and this branch is skipped so red spawns at the regular
+         * self-play positions. */
+        if (env->warm_start_reward_shaping
+                && !env->warm_start_red_in_formation
+                && a->team == 1) {
+            int red_idx = i - env->players_per_team;
+            int row = red_idx / 2;
+            float sign = (red_idx % 2 == 0) ? 1.0f : -1.0f;
+            float pullback = fminf(0.2f * (float)row, 0.6f);
+            float endline_x = place_left ? env->x_out_start : env->x_out_end;
+            float y_edge = env->y_out_end * (0.85f - fminf(0.05f * (float)row, 0.3f));
+            a->x = endline_x * (0.95f - pullback);
+            a->y = sign * y_edge;
+            a->rot = place_left ? 0.0f : (float)M_PI;
             a->last_move = 0.0f;
             a->last_rot = 0.0f;
             continue;
         }
 
-        if (env->reset_setup == 0 && env->num_players == 22) {
-            int pidx = i % 11;
-            float new_x = (init_position_11[pidx][1] + randf(&env->rng, -pos_noise, pos_noise)) * 110.0f;
-            float new_y = (init_position_11[pidx][0] + randf(&env->rng, -pos_noise, pos_noise)) * 110.0f;
+        float new_x, new_y;
+        if (env->reset_setup == 0) {
+            if (env->num_players == 22) {
+                int pidx = i % 11;
+                new_x = (init_position_11[pidx][1] + randf(&env->rng, -pos_noise, pos_noise)) * 110.0f;
+                new_y = (init_position_11[pidx][0] + randf(&env->rng, -pos_noise, pos_noise)) * 110.0f;
+            } else {
+                int pidx = i % env->players_per_team;
+                compute_formation_pos(pidx, env->players_per_team, &new_x, &new_y);
+                new_x += randf(&env->rng, -pos_noise, pos_noise) * 110.0f;
+                new_y += randf(&env->rng, -pos_noise, pos_noise) * 110.0f;
+            }
             a->x = clampf(new_x, env->x_out_start, 0.0f);
             a->y = clampf(new_y, env->y_out_start, env->y_out_end);
         } else {
@@ -217,24 +320,24 @@ static void reset_field(Env* env) {
             a->y = randf(&env->rng, env->y_out_start, env->y_out_end);
         }
 
-        a->rot = randf(&env->rng, -1.0f, 1.0f) * (float)M_PI;
+        a->rot = place_left ? 0.0f : (float)M_PI;
         if (!place_left) {
             a->x *= -1.0f;
             a->y *= -1.0f;
-            a->rot += (float)M_PI;
-            if (a->rot > 2.0f * (float)M_PI) a->rot -= 2.0f * (float)M_PI;
         }
         a->last_move = 0.0f;
         a->last_rot = 0.0f;
     }
 
+    /* Ball at center */
     env->ball_vx = 0.0f;
     env->ball_vy = 0.0f;
-    env->ball_x = randf(&env->rng, env->x_out_start, env->x_out_end);
-    env->ball_y = randf(&env->rng, env->y_out_start, env->y_out_end);
-    if (!env->blue_left) {
-        env->ball_x *= -1.0f;
-    }
+    env->ball_x = 0.0f;
+    env->ball_y = 0.0f;
+
+    env->throw_in_active = 0;
+    env->throw_in_player = -1;
+    env->last_touch_team = -1;
 }
 
 static void full_reset(Env* env, int hard_reset_score) {
@@ -242,6 +345,9 @@ static void full_reset(Env* env, int hard_reset_score) {
     env->cumulative_episode_return = 0.0f;
     env->cumulative_blue_team_episode_return = 0.0f;
     env->cumulative_red_team_episode_return = 0.0f;
+    env->throw_in_active = 0;
+    env->throw_in_player = -1;
+    env->last_touch_team = -1;
     if (hard_reset_score) {
         env->goals_blue = 0;
         env->goals_red = 0;
@@ -302,26 +408,41 @@ static void ball_check_hit(Env* env, const float* kick_scales) {
     const float body_speed = 0.6f;
     const float leg_speed = 4.0f;
     const float agent_radius = 1.0f;
-    const float leg_length = 3.0f;
+    const float leg_length = 1.0f;
 
     for (int i = 0; i < env->num_players; i++) {
         Agent* a = &env->agents[i];
-        if (is_inactive_opponent(env, i)) continue;
         float d = dist2(env->ball_x, env->ball_y, a->x, a->y);
+        int touched = 0;
         if (d < ball_radius + agent_radius) {
             float x_diff = env->ball_x - a->x;
             float y_diff = env->ball_y - a->y;
             env->ball_vx += body_speed * x_diff / (d + 1e-4f);
             env->ball_vy += body_speed * y_diff / (d + 1e-4f);
+            touched = 1;
         }
 
         if (d < ball_radius + leg_length) {
             float delta, cc, ss;
             calc_line_ball_stats(a->rot, ball_radius, env->ball_x, env->ball_y, a->x, a->y, &delta, &cc, &ss);
             if (delta >= 0.0f && d < 2.0f * agent_radius + 2.0f * ball_radius) {
-                env->ball_vx += leg_speed * kick_scales[i] * cc;
-                env->ball_vy += leg_speed * kick_scales[i] * ss;
+                float ks = kick_scales[i] * a->stat_kick;
+                env->ball_vx += leg_speed * ks * cc;
+                env->ball_vy += leg_speed * ks * ss;
+                touched = 1;
+
+                /* End throw-in only when the throwing player actually kicks */
+                if (env->throw_in_active && i == env->throw_in_player
+                        && kick_scales[i] > 0.0f) {
+                    env->throw_in_active = 0;
+                    env->throw_in_player = -1;
+                }
             }
+        }
+
+        if (touched) {
+            env->last_touch_team = a->team;
+            env->ball_touched_this_step[i] = 1;
         }
     }
 
@@ -349,30 +470,50 @@ static int visible(float focus_rot, float obj_rot, float vision_range, float* ob
     return 0;
 }
 
-static void rel_obs_agent(const Env* env, const Agent* focus, const Agent* other, float* out7) {
+static void rel_obs_agent(const Env* env, const Agent* focus, const Agent* other, float* out9) {
     float obj_rot = atan2f(other->y - focus->y, other->x - focus->x);
     float obj_view = 0.0f;
     if (!visible(focus->rot, obj_rot, env->vision_range, &obj_view)) {
-        memset(out7, 0, sizeof(float) * 7);
+        memset(out9, 0, sizeof(float) * 9);
         return;
     }
 
     float max_dist = dist2(0, 0, field_half_width(env), field_half_height(env));
-    out7[0] = 1.0f;
-    out7[1] = dist2(focus->x, focus->y, other->x, other->y) / max_dist;
-    out7[2] = obj_view / (env->vision_range / 2.0f);
+    out9[0] = 1.0f;
+    out9[1] = dist2(focus->x, focus->y, other->x, other->y) / max_dist;
+    out9[2] = obj_view / (env->vision_range / 2.0f);
 
     float rot = other->rot;
-    float x_rot = cosf(rot);
-    float y_rot = sinf(rot);
     float rel_x = cosf(rot - focus->rot);
     float rel_y = sinf(rot - focus->rot);
-    (void)x_rot;
-    (void)y_rot;
-    out7[3] = rel_x;
-    out7[4] = rel_y;
-    out7[5] = other->last_move;
-    out7[6] = other->last_rot;
+    out9[3] = rel_x;
+    out9[4] = rel_y;
+    out9[5] = other->last_move;
+    out9[6] = other->last_rot;
+
+    /* Ego-frame velocity of `other`. Because the bicycle model updates position
+       as v = last_move * move_speed * stat_speed applied along the new heading,
+       the actual world-frame velocity just applied is well-approximated by the
+       last action scaled by move_speed * stat_speed. Exposing this directly
+       saves the policy from having to infer it from commands + unobserved
+       stats, which is especially important because `other->stat_speed` is not
+       otherwise visible in the focus agent's observation. */
+    float other_v = other->last_move * env->move_speed * other->stat_speed;
+    float other_vx = other_v * cosf(other->rot);
+    float other_vy = other_v * sinf(other->rot);
+    /* Rotate into focus's ego frame so the features are invariant to the
+       focus agent's heading (matching the convention used by the ball's
+       relative-velocity features). */
+    float cos_f = cosf(focus->rot);
+    float sin_f = sinf(focus->rot);
+    float ego_vx = cos_f * other_vx + sin_f * other_vy;
+    float ego_vy = -sin_f * other_vx + cos_f * other_vy;
+    /* Normalize by the peak plausible agent speed (move_speed * max stat_speed).
+       stat_speed lives in a narrow sampled band, so move_speed alone is a safe
+       upper bound divisor and keeps the features near [-1, 1]. */
+    float norm = env->move_speed > 1e-6f ? env->move_speed : 1.0f;
+    out9[7] = ego_vx / norm;
+    out9[8] = ego_vy / norm;
 }
 
 static void rel_obs_ball(const Env* env, const Agent* focus, float* out5) {
@@ -404,19 +545,19 @@ static void compute_observations(Env* env, int goal_scored_team) {
     float* state = env->global_states;
     float time_left = 1.0f - ((float)env->num_steps / (float)env->game_length);
     float* state_base = state;
+
+    /* Global state header: time, ball, throw-in info */
     state_base[0] = time_left;
     state_base[1] = sign_state * env->ball_x / half_width;
     state_base[2] = sign_state * env->ball_y / half_height;
     state_base[3] = sign_state * env->ball_vx / MAX_BALL_SPEED;
     state_base[4] = sign_state * env->ball_vy / MAX_BALL_SPEED;
+    state_base[5] = env->throw_in_active ? 1.0f : 0.0f;
+    state_base[6] = (float)env->throw_in_player / (float)(np > 0 ? np : 1);
 
-    int sidx = 5;
+    int sidx = 7;
     for (int i = 0; i < np; i++) {
         Agent* a = &env->agents[i];
-        if (is_inactive_opponent(env, i)) {
-            for (int k = 0; k < 17; k++) state_base[sidx++] = 0.0f;
-            continue;
-        }
         float onehot[11];
         get_one_hot(i, onehot);
         state_base[sidx++] = sign_state * a->x / half_width;
@@ -426,6 +567,10 @@ static void compute_observations(Env* env, int goal_scored_team) {
         state_base[sidx++] = a->last_move;
         state_base[sidx++] = a->last_rot;
         for (int k = 0; k < 11; k++) state_base[sidx++] = onehot[k];
+        state_base[sidx++] = a->stat_kick;
+        state_base[sidx++] = a->stat_speed;
+        state_base[sidx++] = a->stat_turn;
+        state_base[sidx++] = a->steer_angle / MAX_STEER_ANGLE;
     }
 
     for (int a = 1; a < np; a++) {
@@ -446,9 +591,27 @@ static void compute_observations(Env* env, int goal_scored_team) {
         out[o++] = focus->last_move;
         out[o++] = focus->last_rot;
 
+        /* Self world-frame velocity from last applied action, sign-flipped with
+           the team so symmetric self-play sees a consistent canonical frame.
+           See rel_obs_agent for the velocity derivation. */
+        float self_v = focus->last_move * env->move_speed * focus->stat_speed;
+        float self_vx = self_v * cosf(focus->rot);
+        float self_vy = self_v * sinf(focus->rot);
+        float v_norm = env->move_speed > 1e-6f ? env->move_speed : 1.0f;
+        out[o++] = sign * self_vx / v_norm;
+        out[o++] = sign * self_vy / v_norm;
+
         float onehot[11];
         get_one_hot(i, onehot);
         for (int k = 0; k < 11; k++) out[o++] = onehot[k];
+
+        /* Ego state fields: stats, steer, set-piece (throw-in or free-kick) */
+        out[o++] = focus->stat_kick;
+        out[o++] = focus->stat_speed;
+        out[o++] = focus->stat_turn;
+        out[o++] = focus->steer_angle / MAX_STEER_ANGLE;
+        out[o++] = env->throw_in_active ? 1.0f : 0.0f;
+        out[o++] = (env->throw_in_active && env->throw_in_player == i) ? 1.0f : 0.0f;
 
         float brobs[5];
         rel_obs_ball(env, focus, brobs);
@@ -457,33 +620,64 @@ static void compute_observations(Env* env, int goal_scored_team) {
         for (int j = 0; j < np; j++) {
             if (j == i) continue;
             if (env->agents[j].team != focus->team) continue;
-            float aobs[7];
+            float aobs[9];
             rel_obs_agent(env, focus, &env->agents[j], aobs);
-            for (int k = 0; k < 7; k++) out[o++] = aobs[k];
+            for (int k = 0; k < 9; k++) out[o++] = aobs[k];
+            /* Per-other-agent stats: each player can read its teammates' and
+               opponents' kick/speed/turn so policies can reason about skill
+               asymmetries that currently only the self-vector exposes. */
+            out[o++] = env->agents[j].stat_kick;
+            out[o++] = env->agents[j].stat_speed;
+            out[o++] = env->agents[j].stat_turn;
         }
         for (int j = 0; j < np; j++) {
             if (env->agents[j].team == focus->team) continue;
-            float aobs[7];
-            if (is_inactive_opponent(env, j)) {
-                memset(aobs, 0, sizeof(float) * 7);
-            } else {
-                rel_obs_agent(env, focus, &env->agents[j], aobs);
-            }
-            for (int k = 0; k < 7; k++) out[o++] = aobs[k];
+            float aobs[9];
+            rel_obs_agent(env, focus, &env->agents[j], aobs);
+            for (int k = 0; k < 9; k++) out[o++] = aobs[k];
+            out[o++] = env->agents[j].stat_kick;
+            out[o++] = env->agents[j].stat_speed;
+            out[o++] = env->agents[j].stat_turn;
         }
 
         float r = 0.0f;
         if (goal_scored_team >= 0) {
-            if (!env->opponents_enabled) {
-                if (focus->team == 0) {
-                    r = (goal_scored_team == 0) ? 1.0f : -1.0f;
-                } else {
-                    r = 0.0f;
-                }
-            } else {
-                r = (focus->team == goal_scored_team) ? 1.0f : -1.0f;
+            r = (focus->team == goal_scored_team) ? 1.0f : -1.0f;
+        }
+
+        /* Dense reward shaping applied during warm-start only (and only to the
+           team being trained, team 0). The goal is to give the policy a
+           learnable signal long before it stumbles on a full scoring sequence.
+           We keep the shaping small relative to the +/-1 goal reward so the
+           policy still prefers finishing a goal over hovering near the ball,
+           and we deliberately do NOT apply it during self-play so learned
+           self-play behavior is not biased by hand-tuned shaping terms. */
+        if (env->warm_start_reward_shaping && focus->team == 0) {
+            float half_width_s = field_half_width(env);
+            float half_height_s = field_half_height(env);
+            float max_dist_s = dist2(0, 0, half_width_s, half_height_s);
+            float d_ball = dist2(focus->x, focus->y, env->ball_x, env->ball_y);
+            /* Distance-to-ball penalty: keeps blue close to the ball early.
+               Coefficient tunable; default scaled so full-field distance
+               contributes ~-0.0001 per step. */
+            r += -env->shaping_distance_penalty * (d_ball / (max_dist_s + 1e-6f));
+
+            /* Per-touch bonus so the policy gets a strong signal the first
+               time it manages to contact the ball. Coefficient tunable. */
+            if (env->ball_touched_this_step[i]) {
+                r += env->shaping_touch_bonus;
+            }
+
+            /* Bonus for ball velocity toward the opponent goal. Coefficient
+               tunable; magnitude capped by MAX_BALL_SPEED so the term stays
+               small relative to the +/-1 goal reward. */
+            float goal_sign = team_on_left(env, 0) ? 1.0f : -1.0f;
+            float ball_toward_goal = goal_sign * env->ball_vx;
+            if (ball_toward_goal > 0.0f) {
+                r += env->shaping_velocity_bonus * (ball_toward_goal / MAX_BALL_SPEED);
             }
         }
+
         env->rewards[i] = r;
     }
 }
@@ -503,7 +697,10 @@ static void init_env_common(
     int game_length,
     int action_mode,
     int do_team_switch,
-    int opponents_enabled,
+    int warm_start_reward_shaping,
+    float shaping_distance_penalty,
+    float shaping_touch_bonus,
+    float shaping_velocity_bonus,
     float vision_range,
     int reset_setup
 ) {
@@ -512,7 +709,18 @@ static void init_env_common(
     env->num_players = players_per_team * 2;
     env->game_length = game_length;
     env->do_team_switch = do_team_switch;
-    env->opponents_enabled = opponents_enabled;
+    env->warm_start_reward_shaping = warm_start_reward_shaping;
+    /* Defaults match the original hard-coded coefficients that produced
+     * working warm-start runs before the scaling experiment. Negative values
+     * fall back to these defaults so callers can pass 0 to zero out one
+     * shaping term without affecting the rest. */
+    env->shaping_distance_penalty = shaping_distance_penalty >= 0.0f
+        ? shaping_distance_penalty : 0.001f;
+    env->shaping_touch_bonus = shaping_touch_bonus >= 0.0f
+        ? shaping_touch_bonus : 0.05f;
+    env->shaping_velocity_bonus = shaping_velocity_bonus >= 0.0f
+        ? shaping_velocity_bonus : 0.01f;
+    env->warm_start_red_in_formation = 0;
     env->blue_left = 1;
     env->reset_setup = reset_setup;
     env->vision_range = vision_range;
@@ -535,10 +743,17 @@ static void init_env_common(
     env->goal_half_h = env->base_goal_half_h;
     env->rot_speed = 0.4f;
     env->move_speed = 1.0f;
+    env->last_touch_team = -1;
+    env->throw_in_active = 0;
+    env->throw_in_player = -1;
     env->rng = (uint32_t)(seed + 1);
 
     for (int a = 0; a < env->num_players; a++) {
         env->agents[a].team = (a < players_per_team) ? 0 : 1;
+        env->agents[a].stat_kick = 1.0f;
+        env->agents[a].stat_speed = 1.0f;
+        env->agents[a].stat_turn = 1.0f;
+        env->agents[a].steer_angle = 0.0f;
     }
 
     apply_field_scale(env, 1.0f);
@@ -559,6 +774,84 @@ static void c_reset(Env* env, int seed) {
     compute_observations(env, -1);
 }
 
+/* Check offside (canonical FIFA Law 11): offside line = second-to-last defender.
+ * Returns the defending team (which gets the free kick) or -1 if no offside.
+ * On detection, writes the offside player's position to *out_x, *out_y. */
+static int check_offside(const Env* env, float* out_x, float* out_y) {
+    if (env->throw_in_active) return -1;
+    /* Disable offside while the warm-start dense shaping is on so the bootstrap
+     * task isn't constantly interrupted by offside teleports against
+     * stationary scripted red defenders. Self-play (shaping off) keeps the
+     * full FIFA-style rule. */
+    if (env->warm_start_reward_shaping) return -1;
+
+    for (int team = 0; team < 2; team++) {
+        int other_team = 1 - team;
+        int attacks_right = team_on_left(env, team);
+        int other_defends_left = team_on_left(env, other_team);
+        int other_start = other_team == 0 ? 0 : env->players_per_team;
+        int other_end = other_start + env->players_per_team;
+
+        /* Find the two deepest defenders of other_team. The offside line is at
+         * the position of the LESS-deep one (the second-to-last defender).
+         * "Deeper" means closer to one's own goal. */
+        float deepest = 0.0f, second = 0.0f;
+        int n_found = 0;
+        for (int j = other_start; j < other_end; j++) {
+            float xj = env->agents[j].x;
+            if (n_found == 0) {
+                deepest = xj;
+                n_found = 1;
+            } else if (n_found == 1) {
+                if (other_defends_left ? (xj < deepest) : (xj > deepest)) {
+                    second = deepest;
+                    deepest = xj;
+                } else {
+                    second = xj;
+                }
+                n_found = 2;
+            } else {
+                if (other_defends_left ? (xj < deepest) : (xj > deepest)) {
+                    second = deepest;
+                    deepest = xj;
+                } else if (other_defends_left ? (xj < second) : (xj > second)) {
+                    second = xj;
+                }
+            }
+        }
+        if (n_found < 2) continue;  /* Need at least two defenders for offside */
+
+        float offside_line = second;
+
+        /* Check each attacker on this team. */
+        int atk_start = team == 0 ? 0 : env->players_per_team;
+        int atk_end = atk_start + env->players_per_team;
+        for (int i = atk_start; i < atk_end; i++) {
+            float ax = env->agents[i].x;
+            /* Must be in opposing half. */
+            if (attacks_right && ax <= 0.0f) continue;
+            if (!attacks_right && ax >= 0.0f) continue;
+            /* Must be past the second-to-last defender. */
+            int caught_by_defender = (attacks_right && ax > offside_line)
+                                   || (!attacks_right && ax < offside_line);
+            if (!caught_by_defender) continue;
+            /* FIFA Law 11 also requires the attacker to be ahead of the ball.
+             * Without this check the ball-carrier itself is constantly flagged
+             * offside as soon as they cross midfield (since their x equals or
+             * exceeds the ball's x). It also wrongly catches teammates who are
+             * still BEHIND the ball — they have to be in front of the ball to
+             * be in an offside position. */
+            int caught_by_ball = (attacks_right && ax > env->ball_x)
+                              || (!attacks_right && ax < env->ball_x);
+            if (!caught_by_ball) continue;
+            *out_x = ax;
+            *out_y = env->agents[i].y;
+            return other_team;
+        }
+    }
+    return -1;
+}
+
 static void c_step(Env* env) {
     int np = env->num_players;
     float kick_scales[MAX_PLAYERS];
@@ -568,18 +861,14 @@ static void c_step(Env* env) {
     clear_terminal_render_state(env);
     env->num_steps += 1;
     clear_outputs(env);
+    /* Reset per-step ball-touch flags; ball_check_hit below will set them for
+       any agent that actually contacts the ball during this physics tick. */
+    memset(env->ball_touched_this_step, 0, sizeof(env->ball_touched_this_step));
 
     for (int i = 0; i < np; i++) {
         Agent* a = &env->agents[i];
         float move = 0.0f;
         float rot = 0.0f;
-
-        if (is_inactive_opponent(env, i)) {
-            a->last_move = 0.0f;
-            a->last_rot = 0.0f;
-            kick_scales[i] = 0.0f;
-            continue;
-        }
 
         if (env->action_mode == 0) {
             int* atn = (int*)env->actions;
@@ -612,18 +901,36 @@ static void c_step(Env* env) {
             kick_scales[i] = 1.0f;
         }
 
+        /* Throw-in: locked player can only rotate in place and kick. */
+        if (env->throw_in_active && i == env->throw_in_player) {
+            move = 0.0f;
+            /* Direct rotation (bypass bicycle model). */
+            a->last_move = 0.0f;
+            a->last_rot = rot;
+            a->rot -= rot * env->rot_speed * a->stat_turn;
+            if (a->rot > 2.0f*(float)M_PI) a->rot -= 2.0f*(float)M_PI;
+            else if (a->rot < 0.0f) a->rot += 2.0f*(float)M_PI;
+            continue;
+        }
+
         a->last_move = move;
         a->last_rot = rot;
 
-        a->rot -= rot * env->rot_speed;
-        if (a->rot > 2.0f*(float)M_PI) a->rot -= 2.0f*(float)M_PI;
-        else if (a->rot < 0.0f) a->rot += 2.0f*(float)M_PI;
+        /* Bicycle model: ROTATE changes steer_angle, heading changes when moving. */
+        a->steer_angle += rot * STEER_RATE * a->stat_turn;
+        a->steer_angle = clampf(a->steer_angle, -MAX_STEER_ANGLE, MAX_STEER_ANGLE);
 
-        float sin_comp = move * env->move_speed * sinf(a->rot);
-        float cos_comp = move * env->move_speed * cosf(a->rot);
+        float v = move * env->move_speed * a->stat_speed;
 
-        a->x = clampf(a->x + cos_comp, env->x_out_start, env->x_out_end);
-        a->y = clampf(a->y + sin_comp, env->y_out_start, env->y_out_end);
+        if (fabsf(v) > 1e-6f) {
+            float dtheta = (v / WHEELBASE) * tanf(a->steer_angle);
+            a->rot += dtheta;
+            if (a->rot > 2.0f*(float)M_PI) a->rot -= 2.0f*(float)M_PI;
+            else if (a->rot < 0.0f) a->rot += 2.0f*(float)M_PI;
+        }
+
+        a->x = clampf(a->x + v * cosf(a->rot), env->x_out_start, env->x_out_end);
+        a->y = clampf(a->y + v * sinf(a->rot), env->y_out_start, env->y_out_end);
     }
 
     ball_check_hit(env, kick_scales);
@@ -638,6 +945,7 @@ static void c_step(Env* env) {
         env->ball_vy = 0.0f;
     }
 
+    /* --- Goal detection (x-boundary within goal posts) --- */
     int goal_scored = -1;
     if (fabsf(env->ball_y) <= env->goal_half_h) {
         if (env->ball_x < env->x_out_start) {
@@ -650,6 +958,7 @@ static void c_step(Env* env) {
             else env->goals_red += 1;
         }
     } else {
+        /* x-boundary outside goal posts: bounce */
         if (env->ball_x < env->x_out_start) {
             env->ball_x = env->x_out_start;
             env->ball_vx = -env->ball_vx;
@@ -663,16 +972,76 @@ static void c_step(Env* env) {
         }
     }
 
-    if (env->ball_y < env->y_out_start) {
-        env->ball_y = env->y_out_start;
-        env->ball_vy = -env->ball_vy;
-        env->ball_vx *= 0.6f;
-        env->ball_vy *= 0.6f;
-    } else if (env->ball_y > env->y_out_end) {
-        env->ball_y = env->y_out_end;
-        env->ball_vy = -env->ball_vy;
-        env->ball_vx *= 0.6f;
-        env->ball_vy *= 0.6f;
+    /* --- Sideline (y-boundary): throw-in instead of bounce ---
+     *
+     * The ball clamp runs unconditionally so the ball cannot drift outside the
+     * field regardless of the current set-piece state. Only the thrower-setup
+     * (teleport + velocity zero) and the no-last-touch bounce remain gated on
+     * !throw_in_active, so a stray body impulse during an active throw-in
+     * cannot leak the ball past the sideline. */
+    if (env->ball_y < env->y_out_start || env->ball_y > env->y_out_end) {
+        env->ball_y = clampf(env->ball_y, env->y_out_start, env->y_out_end);
+        if (!env->throw_in_active) {
+            if (env->last_touch_team >= 0) {
+                env->ball_vx = 0.0f;
+                env->ball_vy = 0.0f;
+
+                int opposing_team = 1 - env->last_touch_team;
+                int best = -1;
+                float best_dist = 1e9f;
+                for (int i = 0; i < np; i++) {
+                    if (env->agents[i].team != opposing_team) continue;
+                    float d = dist2(env->ball_x, env->ball_y,
+                                    env->agents[i].x, env->agents[i].y);
+                    if (d < best_dist) { best_dist = d; best = i; }
+                }
+                if (best >= 0) {
+                    env->agents[best].x = env->ball_x;
+                    env->agents[best].y = env->ball_y;
+                    env->agents[best].steer_angle = 0.0f;
+                    env->throw_in_active = 1;
+                    env->throw_in_player = best;
+                }
+            } else {
+                /* No last touch known: bounce */
+                env->ball_vy = -env->ball_vy;
+                env->ball_vx *= 0.6f;
+                env->ball_vy *= 0.6f;
+            }
+        }
+    }
+
+    /* --- Offside check: triggers an indirect free kick to the defending team
+     *     (no goal scored). Reuses the throw-in player-lock plumbing. --- */
+    if (goal_scored < 0 && !env->throw_in_active) {
+        float off_x = 0.0f, off_y = 0.0f;
+        int defending_team = check_offside(env, &off_x, &off_y);
+        if (defending_team >= 0) {
+            /* Place the ball at the offside spot. */
+            env->ball_x = clampf(off_x, env->x_out_start, env->x_out_end);
+            env->ball_y = clampf(off_y, env->y_out_start, env->y_out_end);
+            env->ball_vx = 0.0f;
+            env->ball_vy = 0.0f;
+
+            /* Find nearest defender to the ball; teleport them to it. */
+            int best = -1;
+            float best_dist = 1e9f;
+            int def_start = defending_team == 0 ? 0 : env->players_per_team;
+            int def_end = def_start + env->players_per_team;
+            for (int j = def_start; j < def_end; j++) {
+                float d = dist2(env->ball_x, env->ball_y,
+                                env->agents[j].x, env->agents[j].y);
+                if (d < best_dist) { best_dist = d; best = j; }
+            }
+            if (best >= 0) {
+                env->agents[best].x = env->ball_x;
+                env->agents[best].y = env->ball_y;
+                env->agents[best].steer_angle = 0.0f;
+                env->throw_in_active = 1;     /* reuse lock mechanic */
+                env->throw_in_player = best;
+                env->last_touch_team = -1;
+            }
+        }
     }
 
     if (goal_scored >= 0) {
@@ -911,19 +1280,25 @@ static int validate_vector_arrays(
 
 static PyObject* py_env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyObject *obs_obj, *act_obj, *rew_obj, *term_obj, *trunc_obj, *state_obj;
-    int seed, players_per_team, game_length, action_mode, do_team_switch, opponents_enabled, reset_setup;
+    int seed, players_per_team, game_length, action_mode, do_team_switch, warm_start_reward_shaping, reset_setup;
     float vision_range;
+    float shaping_distance_penalty = -1.0f;
+    float shaping_touch_bonus = -1.0f;
+    float shaping_velocity_bonus = -1.0f;
 
     static char* kwlist[] = {
         "observations", "actions", "rewards", "terminals", "truncations", "global_states",
         "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
-        "opponents_enabled", "vision_range", "reset_setup", NULL
+        "warm_start_reward_shaping", "vision_range", "reset_setup",
+        "shaping_distance_penalty", "shaping_touch_bonus", "shaping_velocity_bonus",
+        NULL
     };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiifi", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiifi|fff", kwlist,
             &obs_obj, &act_obj, &rew_obj, &term_obj, &trunc_obj, &state_obj,
             &seed, &players_per_team, &game_length, &action_mode,
-            &do_team_switch, &opponents_enabled, &vision_range, &reset_setup)) {
+            &do_team_switch, &warm_start_reward_shaping, &vision_range, &reset_setup,
+            &shaping_distance_penalty, &shaping_touch_bonus, &shaping_velocity_bonus)) {
         return NULL;
     }
 
@@ -968,7 +1343,10 @@ static PyObject* py_env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         game_length,
         action_mode,
         do_team_switch,
-        opponents_enabled,
+        warm_start_reward_shaping,
+        shaping_distance_penalty,
+        shaping_touch_bonus,
+        shaping_velocity_bonus,
         vision_range,
         reset_setup
     );
@@ -1010,6 +1388,18 @@ static PyObject* py_env_set_field_scale(PyObject* self, PyObject* args) {
     if (!env) return NULL;
     apply_field_scale(env, scale);
     compute_observations(env, -1);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_env_set_red_in_formation(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int in_formation;
+    if (!PyArg_ParseTuple(args, "Oi", &handle_obj, &in_formation)) {
+        return NULL;
+    }
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    env->warm_start_red_in_formation = in_formation ? 1 : 0;
     Py_RETURN_NONE;
 }
 
@@ -1081,19 +1471,25 @@ static PyObject* py_env_close(PyObject* self, PyObject* args) {
 
 static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyObject *obs_obj, *act_obj, *rew_obj, *term_obj, *trunc_obj, *state_obj;
-    int num_envs, seed, players_per_team, game_length, action_mode, do_team_switch, opponents_enabled, reset_setup;
+    int num_envs, seed, players_per_team, game_length, action_mode, do_team_switch, warm_start_reward_shaping, reset_setup;
     float vision_range;
+    float shaping_distance_penalty = -1.0f;
+    float shaping_touch_bonus = -1.0f;
+    float shaping_velocity_bonus = -1.0f;
 
     static char* kwlist[] = {
         "observations", "actions", "rewards", "terminals", "truncations", "global_states",
         "num_envs", "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
-        "opponents_enabled", "vision_range", "reset_setup", NULL
+        "warm_start_reward_shaping", "vision_range", "reset_setup",
+        "shaping_distance_penalty", "shaping_touch_bonus", "shaping_velocity_bonus",
+        NULL
     };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiiifi", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiiifi|fff", kwlist,
             &obs_obj, &act_obj, &rew_obj, &term_obj, &trunc_obj, &state_obj,
             &num_envs, &seed, &players_per_team, &game_length, &action_mode,
-            &do_team_switch, &opponents_enabled, &vision_range, &reset_setup)) {
+            &do_team_switch, &warm_start_reward_shaping, &vision_range, &reset_setup,
+            &shaping_distance_penalty, &shaping_touch_bonus, &shaping_velocity_bonus)) {
         return NULL;
     }
 
@@ -1160,7 +1556,10 @@ static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
             game_length,
             action_mode,
             do_team_switch,
-            opponents_enabled,
+            warm_start_reward_shaping,
+            shaping_distance_penalty,
+            shaping_touch_bonus,
+            shaping_velocity_bonus,
             vision_range,
             reset_setup
         );
@@ -1208,6 +1607,20 @@ static PyObject* py_vec_set_field_scale(PyObject* self, PyObject* args) {
     for (int i = 0; i < vec->num_envs; i++) {
         apply_field_scale(&vec->envs[i], scale);
         compute_observations(&vec->envs[i], -1);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_vec_set_red_in_formation(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int in_formation;
+    if (!PyArg_ParseTuple(args, "Oi", &handle_obj, &in_formation)) {
+        return NULL;
+    }
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++) {
+        vec->envs[i].warm_start_red_in_formation = in_formation ? 1 : 0;
     }
     Py_RETURN_NONE;
 }
@@ -1288,6 +1701,7 @@ static PyMethodDef Methods[] = {
     {"env_reset", py_env_reset, METH_VARARGS, "Reset one env"},
     {"env_step", py_env_step, METH_VARARGS, "Step one env"},
     {"env_set_field_scale", py_env_set_field_scale, METH_VARARGS, "Set one env field scale"},
+    {"env_set_red_in_formation", py_env_set_red_in_formation, METH_VARARGS, "Toggle warm-start red formation placement"},
     {"env_log", py_env_log, METH_VARARGS, "Get one env log"},
     {"env_get_last_scores", py_env_get_last_scores, METH_VARARGS, "Get last scalar env scores"},
     {"env_get_state", py_env_get_state, METH_VARARGS, "Get one env state"},
@@ -1296,6 +1710,7 @@ static PyMethodDef Methods[] = {
     {"vec_reset", py_vec_reset, METH_VARARGS, "Reset vector env"},
     {"vec_step", py_vec_step, METH_VARARGS, "Step vector env"},
     {"vec_set_field_scale", py_vec_set_field_scale, METH_VARARGS, "Set vector env field scale"},
+    {"vec_set_red_in_formation", py_vec_set_red_in_formation, METH_VARARGS, "Toggle warm-start red formation placement"},
     {"vec_log", py_vec_log, METH_VARARGS, "Get vector log"},
     {"vec_get_last_scores", py_vec_get_last_scores, METH_VARARGS, "Get last vector env scores"},
     {"vec_get_state", py_vec_get_state, METH_VARARGS, "Get one env state from vector env"},

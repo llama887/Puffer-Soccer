@@ -3,8 +3,8 @@
 This project now compares three opponent-generation algorithms:
 
 - ordinary self-play
-- MARLadona-style league core
-- paper-first MARLadona reproduction
+- curated league (bounded pool with FIFO eviction)
+- fictitious play (uniform over all past iterates)
 
 and it also wants KL regularization to remain an orthogonal axis. Running all six
 combinations by hand would be tedious and error-prone, especially because the user wants
@@ -67,7 +67,7 @@ def matrix_variants() -> list[dict[str, str]]:
     """
 
     variants: list[dict[str, str]] = []
-    for rl_alg in ("self_play", "league", "marlodonna"):
+    for rl_alg in ("self_play", "league", "fictitious_play"):
         for kl_mode in ("off", "on"):
             variants.append(
                 {

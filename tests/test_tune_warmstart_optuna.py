@@ -104,6 +104,9 @@ def test_build_training_command_keeps_run_warmstart_only() -> None:
         "ent_coef": 1e-7,
         "prio_alpha": 0.9,
         "prio_beta0": 0.7,
+        "shaping_distance_penalty": 1e-3,
+        "shaping_touch_bonus": 5e-2,
+        "shaping_velocity_bonus": 1e-2,
         "no_opponent_map_scale_ladder": "0.2,0.4,0.6,0.8,1.0",
     }
 

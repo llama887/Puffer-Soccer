@@ -25,7 +25,7 @@ def test_matrix_variants_lists_all_six_rl_comparison_combinations():
 
     assert len(variants) == 6
     assert variants[0]["label"] == "self_play__kl_off"
-    assert variants[-1]["label"] == "marlodonna__kl_on"
+    assert variants[-1]["label"] == "fictitious_play__kl_on"
 
 
 def test_build_child_command_includes_variant_flags_and_output_folder(tmp_path):

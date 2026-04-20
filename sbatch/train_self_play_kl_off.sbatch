@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=tune_md_kl_on
+#SBATCH --job-name=train_sp_kl_off
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-export TUNE_MATRIX_LABEL="marlodonna__kl_on"
-export TUNE_RL_ALG="marlodonna"
-export TUNE_KL_MODE="on"
+export TRAIN_RL_ALG="self_play"
+export TRAIN_KL_MODE="off"
+export TRAIN_HYPERPARAMETERS_PATH="experiments/tuned_hyperparameters/self_play__kl_off.json"
 
-bash sbatch/run_tune_self_play_variant.sh
+bash sbatch/run_train_variant.sh

@@ -213,9 +213,9 @@ def test_parse_training_args_exposes_cached_warm_start_controls() -> None:
 
     args = train_pufferl.parse_training_args(["--no-autoload-hyperparameters"])
 
-    assert args.cached_warm_start_path is None
-    assert args.reuse_cached_warm_start is False
-    assert args.save_cached_warm_start is False
+    assert args.cached_warm_start_path == "experiments/cached_warm_start.pt"
+    assert args.reuse_cached_warm_start is True
+    assert args.save_cached_warm_start is True
 
 
 def test_resolve_kl_regularization_enabled_keeps_new_mode_orthogonal() -> None:
@@ -296,6 +296,7 @@ def test_save_and_load_cached_warm_start_roundtrip(tmp_path: Path) -> None:
     args = SimpleNamespace(
         players_per_team=5,
         no_opponent_phase_goal_rate_threshold=0.8,
+        no_opponent_phase_stage_advancement_threshold=0.5,
         no_opponent_phase_multi_goal_rate_threshold=0.0,
         no_opponent_eval_games=100,
         no_opponent_eval_max_steps=600,
@@ -658,7 +659,7 @@ def test_save_match_video_uses_resolved_no_opponent_game_length(
         args,
         output_path=tmp_path / "no_opponent.mp4",
         label="test video",
-        opponents_enabled=False,
+        warm_start=True,
         overwrite_existing=True,
     )
 
@@ -732,8 +733,6 @@ def test_build_run_summary_records_no_opponent_task_config() -> None:
         league_manager=None,
         latest_league_metrics=None,
         final_league_metrics=None,
-        latest_standardized_league_metrics=None,
-        final_standardized_league_metrics=None,
         model_path=Path("model.pt"),
         retained_past_checkpoint_epochs=[],
     )
@@ -847,8 +846,6 @@ def test_build_run_summary_records_league_metadata() -> None:
         league_manager=league_manager,
         latest_league_metrics=league_metrics,
         final_league_metrics=None,
-        latest_standardized_league_metrics=None,
-        final_standardized_league_metrics=None,
         model_path=Path("model.pt"),
         retained_past_checkpoint_epochs=[],
     )

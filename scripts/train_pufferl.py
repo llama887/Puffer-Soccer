@@ -51,6 +51,7 @@ torch = import_torch()
 
 
 STANDARD_HYPERPARAMETERS_PATH = Path("experiments/autoload_hyperparameters.json")
+STANDARD_WARM_START_CACHE_PATH = Path("experiments/cached_warm_start.pt")
 STANDARD_HYPERPARAMETER_KEYS = (
     "learning_rate",
     "gamma",
@@ -122,7 +123,7 @@ RUN_VIDEO_FILENAMES = {
 PERIODIC_EVAL_VIDEO_NAMESPACE = "video/evals"
 RL_ALG_SELF_PLAY = "self_play"
 RL_ALG_LEAGUE = "league"
-RL_ALG_MARLODONNA = "marlodonna"
+RL_ALG_FICTITIOUS = "fictitious_play"
 KL_REGULARIZATION_AUTO = "auto"
 KL_REGULARIZATION_ON = "on"
 KL_REGULARIZATION_OFF = "off"
@@ -214,22 +215,6 @@ class LeagueEvaluationSummary:
     opponent_count: int
     per_opponent: dict[int, dict[str, float]]
 
-
-@dataclass(frozen=True)
-class StandardizedLeagueEvalSummary:
-    """Describe one fixed-opponent standardized evaluation used by MARLadona mode.
-
-    The MARLadona-style path wants a stable behavioral yardstick in addition to the changing
-    full-league aggregate. In our environment we do not have the paper's scripted bot, so we
-    standardize on a fixed retained league opponent instead. This summary keeps that signal
-    explicit and easy to serialize.
-    """
-
-    opponent_entry_id: int
-    opponent_epoch: int
-    win_rate: float
-    score_diff: float
-    games: float
 
 
 def forward_policy_eval(
@@ -629,7 +614,6 @@ class HeadToHeadEvaluator:
             render_mode=None,
             seed=0,
             log_interval=1,
-            opponents_enabled=True,
         )
         self.opponent_policy = Policy(self.eval_env).to(device)
         self.num_envs = self.eval_env.num_envs
@@ -771,7 +755,7 @@ class LeagueTrainingWrapper(pufferlib.PufferEnv):
     The wrapper also supports side balancing. Half of the environments expose the blue team as
     the learner side and the other half expose the red team. That keeps the training data from
     collapsing onto one field orientation while still preserving the simple "one policy per
-    whole opponent team" rule requested by the MARLadona comparison.
+    whole opponent team" rule used by the league and fictitious play modes.
     """
 
     def __init__(
@@ -789,8 +773,6 @@ class LeagueTrainingWrapper(pufferlib.PufferEnv):
         index maps once and then reuse them throughout training.
         """
 
-        if not getattr(env, "opponents_enabled", True):
-            raise ValueError("LeagueTrainingWrapper requires opponents_enabled=True")
         if players_per_team < 1:
             raise ValueError("players_per_team must be positive")
 
@@ -803,7 +785,6 @@ class LeagueTrainingWrapper(pufferlib.PufferEnv):
         self.current_on_blue = make_side_assignment(self.num_envs)
         self.single_observation_space = env.single_observation_space
         self.single_action_space = env.single_action_space
-        self.opponents_enabled = True
         self._full_action_template = np.zeros_like(env.actions)
         self._learner_indices = self._build_flat_indices(current_side=True)
         self._opponent_indices = self._build_flat_indices(current_side=False)
@@ -919,7 +900,7 @@ class LeagueTrainingWrapper(pufferlib.PufferEnv):
         """Run frozen league opponents and return their actions for the current full state.
 
         Each environment reuses one sampled frozen policy for its whole opponent team, matching
-        the MARLadona "same policy per team" rule. We batch environments that share the same
+        the "same policy per team" rule. We batch environments that share the same
         opponent entry id so the hidden-opponent inference path stays efficient even when many
         environments are running in parallel.
         """
@@ -1036,39 +1017,44 @@ class LeagueTrainingWrapper(pufferlib.PufferEnv):
         self.env.close()
 
 
+WARM_START_RED_ACTION = 12
+"""Scripted red-team action used during warm-start.
+
+Every red agent every step selects discrete action 12 (max-power kick, no movement, no
+rotation). That combination guarantees two things: (a) red contributes normal body+leg
+physics to ball interactions whenever it gets close enough, and (b) when red is the
+locked player for a throw-in or an indirect free kick, the kick always clears
+`throw_in_active`. Both properties avoid game deadlocks without the env having to add a
+timeout mechanic.
+"""
+
+
 class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
-    """Expose only blue-team trajectories while preserving the native no-opponent simulator.
+    """Expose only blue-team trajectories during warm-start against scripted red.
 
-    The native no-opponent env disables red gameplay internally, but it still exposes red agent
-    slots to PPO. Those red slots never move and never receive reward, so half of every warm-
-    start rollout becomes dead experience that only adds noise to the sparse scoring task.
-
-    This wrapper keeps the simulator untouched and instead fixes the training interface. PPO
-    only sees the blue agents that can act and learn, while the wrapped env still owns the full
-    game state, the scoreboard, rendering, and field-scaling behavior. Blue observations keep
-    the same feature shape as self-play, including zero-filled opponent slots, so warm-start and
-    self-play still train the same policy architecture.
+    Warm-start training runs against a red team that is physically present and driven by a
+    fixed scripted policy (`WARM_START_RED_ACTION`, max-power kick every step). The full env
+    dynamics — throw-ins, offside, body collisions, observations — are therefore identical
+    to self-play. This wrapper hides the red agent slots from PPO so the learner only backs
+    up gradients on blue trajectories; the simulator still owns the full game state and
+    renders both teams. Blue observations keep the same feature shape as self-play, so the
+    policy architecture is the same across phases.
     """
 
     def __init__(self, env: pufferlib.PufferEnv, players_per_team: int) -> None:
-        """Wrap one no-opponent env and expose only the controllable blue agents.
+        """Wrap one warm-start env and expose only the learnable blue agents.
 
         The wrapper relies on the soccer env's fixed ordering where each env shard lists the
         blue team first and the red team second. That gives us one static index map for both
         slicing outputs and re-expanding blue actions back into the full native action array.
         """
 
-        if getattr(env, "opponents_enabled", True):
-            raise ValueError(
-                "BlueTeamNoOpponentWrapper requires opponents_enabled=False"
-            )
         if players_per_team < 1:
             raise ValueError("players_per_team must be positive")
 
         self.env = env
         self.players_per_team = players_per_team
         self.num_envs = int(getattr(env, "num_envs", 1))
-        self.opponents_enabled = False
         self.single_observation_space = env.single_observation_space
         self.single_action_space = env.single_action_space
         self.num_agents = self.num_envs * self.players_per_team
@@ -1124,13 +1110,14 @@ class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
     def _expand_blue_actions(self, blue_actions: np.ndarray) -> np.ndarray:
         """Expand blue-only actions into the full native action array expected by the env.
 
-        The wrapped no-opponent env ignores red actions entirely, so zero is a safe filler for
-        all hidden red slots. Reusing one persistent full-size buffer avoids repeated allocation
+        Red slots are filled with the scripted max-power kick action so throw-ins and
+        indirect free kicks never deadlock the env when a red agent happens to be the
+        locked player. Reusing one persistent full-size buffer avoids repeated allocation
         inside the rollout loop.
         """
 
         expanded_actions = self._full_action_template
-        expanded_actions.fill(0)
+        expanded_actions.fill(WARM_START_RED_ACTION)
         expanded_actions[self._blue_indices] = blue_actions
         return expanded_actions
 
@@ -1167,6 +1154,17 @@ class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
                 "wrapped environment does not support set_field_scale()"
             )
         setter(scale)
+        self._copy_blue_outputs()
+
+    def set_red_in_formation(self, in_formation: bool) -> None:
+        """Forward the warm-start red placement toggle to the wrapped env."""
+
+        setter = getattr(self.env, "set_red_in_formation", None)
+        if setter is None:
+            raise RuntimeError(
+                "wrapped environment does not support set_red_in_formation()"
+            )
+        setter(in_formation)
         self._copy_blue_outputs()
 
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
@@ -1327,6 +1325,7 @@ class NoOpponentPhaseConfig:
     eval_interval: int
     goal_rate_threshold: float
     multi_goal_rate_threshold: float
+    stage_advancement_threshold: float
 
     @classmethod
     def from_args(cls, args) -> "NoOpponentPhaseConfig":
@@ -1337,6 +1336,11 @@ class NoOpponentPhaseConfig:
         setup readable and gives tests one stable constructor path to exercise.
         """
 
+        stage_advancement = getattr(
+            args, "no_opponent_phase_stage_advancement_threshold", None
+        )
+        if stage_advancement is None:
+            stage_advancement = float(args.no_opponent_phase_goal_rate_threshold)
         return cls(
             min_iterations=int(args.no_opponent_phase_min_iterations),
             max_iterations=int(args.no_opponent_phase_max_iterations),
@@ -1345,6 +1349,7 @@ class NoOpponentPhaseConfig:
             multi_goal_rate_threshold=float(
                 args.no_opponent_phase_multi_goal_rate_threshold
             ),
+            stage_advancement_threshold=float(stage_advancement),
         )
 
     def validate(self, total_ppo_iterations: int) -> None:
@@ -1376,6 +1381,10 @@ class NoOpponentPhaseConfig:
         if not 0.0 <= self.multi_goal_rate_threshold <= 1.0:
             raise ValueError(
                 "no-opponent-phase-multi-goal-rate-threshold must be in [0.0, 1.0]"
+            )
+        if not 0.0 <= self.stage_advancement_threshold <= 1.0:
+            raise ValueError(
+                "no-opponent-phase-stage-advancement-threshold must be in [0.0, 1.0]"
             )
         if self.max_iterations > total_ppo_iterations:
             raise ValueError(
@@ -1486,6 +1495,7 @@ def run_no_opponent_rollouts(
     num_games: int,
     max_steps: int,
     field_scale: float = 1.0,
+    red_in_formation: bool = False,
 ) -> list[dict[str, float]]:
     """Run greedy no-opponent episodes in one native vector batch and summarize each game.
 
@@ -1497,6 +1507,13 @@ def run_no_opponent_rollouts(
     `field_scale` is part of the task definition now. Promotion through the warm-start ladder
     depends on solving the current stage, so evaluation must run on the same active map size as
     training rather than silently grading the policy on a different field.
+
+    `red_in_formation` must mirror the training env's current red placement mode. A fresh
+    eval env defaults to corners-red (C default = 0), so without this parameter every eval
+    would silently grade the policy on the easy layout even after the curriculum switched
+    training to the harder formation layout. Passing it here keeps the training setup and the
+    evaluation setup byte-identical, which is a precondition for the completion gate to mean
+    what the curriculum thinks it means.
     """
 
     no_opponent_game_length = resolve_no_opponent_game_length(max_steps)
@@ -1512,7 +1529,7 @@ def run_no_opponent_rollouts(
         game_length=no_opponent_game_length,
         render_mode=None,
         seed=seed,
-        opponents_enabled=False,
+        warm_start_reward_shaping=True,
     )
     env = BlueTeamNoOpponentWrapper(base_env, players_per_team)
     results: list[dict[str, float]] = []
@@ -1520,6 +1537,8 @@ def run_no_opponent_rollouts(
     policy.eval()
 
     try:
+        if red_in_formation:
+            env.set_red_in_formation(True)
         if field_scale != 1.0:
             maybe_set_training_field_scale(env, field_scale)
         with torch.no_grad():
@@ -1579,6 +1598,7 @@ def evaluate_no_opponent_policy(
     num_games: int,
     max_steps: int,
     field_scale: float = 1.0,
+    red_in_formation: bool = False,
 ) -> dict[str, float]:
     """Measure whether a policy solves the no-opponent scoring task repeatedly.
 
@@ -1603,6 +1623,7 @@ def evaluate_no_opponent_policy(
         num_games=num_games,
         max_steps=max_steps,
         field_scale=field_scale,
+        red_in_formation=red_in_formation,
     )
 
     return {
@@ -1846,7 +1867,9 @@ def resolve_requested_train_sizes(
     batch_size = (
         default_batch_size if requested_batch_size is None else requested_batch_size
     )
-    batch_size = round_up_to_multiple(max(batch_size, minimum_batch_size), horizon)
+    batch_size = round_up_to_multiple(
+        max(batch_size, minimum_batch_size), total_agents * horizon
+    )
 
     requested_minibatch = (
         default_minibatch_size
@@ -1916,7 +1939,7 @@ def build_phase_train_config(
     *,
     ppo_iterations: int,
     total_timesteps: int | None,
-    opponents_enabled: bool,
+    warm_start_reward_shaping: bool,
 ) -> dict[str, Any]:
     """Assemble the concrete PuffeRL train config for one specific training phase.
 
@@ -1932,7 +1955,7 @@ def build_phase_train_config(
     batch-aligned PuffeRL config for the active environment.
     """
 
-    phase_args = phase_args_for_training(args, opponents_enabled=opponents_enabled)
+    phase_args = phase_args_for_training(args, warm_start_reward_shaping=warm_start_reward_shaping)
     config = load_base_train_config()
     max_minibatch_size = config.get("max_minibatch_size")
     requested_batch_size = phase_args.train_batch_size
@@ -2028,7 +2051,7 @@ def build_train_config(args, vecenv, device: str) -> dict[str, Any]:
         device,
         ppo_iterations=int(args.ppo_iterations),
         total_timesteps=args.total_timesteps,
-        opponents_enabled=True,
+        warm_start_reward_shaping=False,
     )
 
 
@@ -2277,17 +2300,17 @@ def autoload_source_is_no_opponent(args) -> bool:
     return False
 
 
-def phase_args_for_training(args, *, opponents_enabled: bool):
+def phase_args_for_training(args, *, warm_start_reward_shaping: bool):
     """Return the effective argparse namespace for one specific training phase.
 
-    The intended workflow is asymmetric: the no-opponent phase should keep the no-opponent
+    The intended workflow is asymmetric: the warm-start phase should keep the no-opponent
     sweep defaults, while the self-play phase should only inherit those PPO settings when a
     human asked for them explicitly on the CLI. Returning a shallow copy lets the caller
     adjust one phase cleanly without mutating the shared parsed namespace.
     """
 
     phase_args = copy.copy(args)
-    if not opponents_enabled or not autoload_source_is_no_opponent(args):
+    if warm_start_reward_shaping or not autoload_source_is_no_opponent(args):
         return phase_args
 
     parser_defaults = base_training_arg_defaults()
@@ -2606,23 +2629,13 @@ def build_training_parser(
         "--rl-alg",
         type=str,
         default=RL_ALG_SELF_PLAY,
-        choices=[RL_ALG_SELF_PLAY, RL_ALG_LEAGUE, RL_ALG_MARLODONNA],
+        choices=[RL_ALG_SELF_PLAY, RL_ALG_LEAGUE, RL_ALG_FICTITIOUS],
     )
     parser.add_argument("--league-max-size", type=int, default=8)
     parser.add_argument(
         "--league-promotion-win-rate-threshold",
         type=float,
         default=0.75,
-    )
-    parser.add_argument(
-        "--marlodonna-eval-ratio",
-        type=float,
-        default=0.15,
-    )
-    parser.add_argument(
-        "--marlodonna-standardized-eval-games",
-        type=int,
-        default=64,
     )
     parser.add_argument(
         "--kl-regularization-mode",
@@ -2649,6 +2662,16 @@ def build_training_parser(
         default=0.0,
     )
     parser.add_argument(
+        "--no-opponent-phase-stage-advancement-threshold",
+        type=float,
+        default=0.50,
+        help=(
+            "Goal rate required to advance to the next curriculum stage. "
+            "Defaults lower than the final gate threshold so intermediate "
+            "stages do not bottleneck the warm-start budget."
+        ),
+    )
+    parser.add_argument(
         "--no-opponent-map-scale-ladder",
         type=str,
         default="0.2,0.4,0.6,0.8,1.0",
@@ -2666,7 +2689,7 @@ def build_training_parser(
     parser.add_argument("--uniform-kl-power", type=float, default=0.3)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--wandb-project", type=str, default="robot-soccer")
+    parser.add_argument("--wandb-project", type=str, default="robot-soccer-discrete")
     parser.add_argument("--wandb-group", type=str, default="puffer-default")
     parser.add_argument("--wandb-tag", type=str, default=None)
     parser.add_argument("--wandb-video-key", type=str, default="self_play_video")
@@ -2695,6 +2718,33 @@ def build_training_parser(
     parser.add_argument("--past-iterate-eval-game-length", type=int, default=400)
     parser.add_argument("--no-opponent-eval-games", type=int, default=100)
     parser.add_argument("--no-opponent-eval-max-steps", type=int, default=600)
+    parser.add_argument(
+        "--shaping-distance-penalty",
+        type=float,
+        default=-1.0,
+        help=(
+            "Warm-start shaping coefficient: blue's per-step penalty proportional to "
+            "distance-to-ball, normalized by field diagonal. Negative = C default (0.0001)."
+        ),
+    )
+    parser.add_argument(
+        "--shaping-touch-bonus",
+        type=float,
+        default=-1.0,
+        help=(
+            "Warm-start shaping coefficient: bonus applied once per step when a blue "
+            "agent touches the ball. Negative = C default (0.005)."
+        ),
+    )
+    parser.add_argument(
+        "--shaping-velocity-bonus",
+        type=float,
+        default=-1.0,
+        help=(
+            "Warm-start shaping coefficient: bonus when ball moves toward the opponent "
+            "goal, scaled by ball_vx/MAX_BALL_SPEED. Negative = C default (0.001)."
+        ),
+    )
     parser.add_argument("--final-best-eval-games", type=int, default=0)
     parser.add_argument(
         "--fixed-best-checkpoint",
@@ -2730,17 +2780,17 @@ def build_training_parser(
     parser.add_argument(
         "--cached-warm-start-path",
         type=str,
-        default=None,
+        default=str(STANDARD_WARM_START_CACHE_PATH),
     )
     parser.add_argument(
         "--reuse-cached-warm-start",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
     parser.add_argument(
         "--save-cached-warm-start",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
     if default_overrides:
         parser.set_defaults(**default_overrides)
@@ -2831,23 +2881,18 @@ def build_league_config(args) -> LeagueConfig | None:
     """Translate CLI flags into the league behavior used by the selected RL algorithm.
 
     Ordinary self-play does not need league state, so this helper returns ``None`` for that
-    mode. The two league-style modes share most knobs, but MARLadona additionally enables a
-    standardized evaluation path and uses the paper-style league defaults.
+    mode. Both league and fictitious play share the same knobs; the key difference is that
+    fictitious play skips FIFO eviction so the pool grows without bound.
     """
 
     if args.rl_alg == RL_ALG_SELF_PLAY:
         return None
-    standardized_eval_enabled = args.rl_alg == RL_ALG_MARLODONNA
     return LeagueConfig(
         rl_alg=str(args.rl_alg),
         max_size=int(args.league_max_size),
         promotion_win_rate_threshold=float(
             args.league_promotion_win_rate_threshold
         ),
-        standardized_eval_ratio=float(args.marlodonna_eval_ratio)
-        if standardized_eval_enabled
-        else 0.0,
-        standardized_eval_enabled=standardized_eval_enabled,
         side_balance=True,
         opponent_sampling="uniform",
         same_policy_per_team=True,
@@ -2868,10 +2913,6 @@ def validate_rl_algorithm_args(args) -> None:
         raise ValueError(
             "league-promotion-win-rate-threshold must be in [0.0, 1.0]"
         )
-    if not 0.0 <= args.marlodonna_eval_ratio < 1.0:
-        raise ValueError("marlodonna-eval-ratio must be in [0.0, 1.0)")
-    if args.marlodonna_standardized_eval_games < 1:
-        raise ValueError("marlodonna-standardized-eval-games must be positive")
 
 
 def make_side_assignment(num_envs: int) -> np.ndarray:
@@ -2973,36 +3014,6 @@ def evaluate_against_league(
         aggregate_score_diff=float(np.mean(aggregate_score_diffs)),
         opponent_count=len(per_opponent),
         per_opponent=per_opponent,
-    )
-
-
-def evaluate_standardized_league_opponent(
-    *,
-    current_policy: Policy,
-    standardized_entry: LeagueEntry,
-    evaluator: HeadToHeadEvaluator,
-    games: int,
-    seed: int,
-) -> StandardizedLeagueEvalSummary:
-    """Evaluate against one fixed retained opponent for MARLadona-style tracking.
-
-    The public MARLadona setup uses a separate standardized evaluation slice to make long-range
-    behavioral comparisons easier. Our environment does not expose their scripted bot baseline,
-    so we pin the standardized comparison to one fixed retained league snapshot instead.
-    """
-
-    metrics = evaluator.evaluate(
-        current_policy,
-        standardized_entry.state_dict,
-        num_games=games,
-        seed=seed,
-    )
-    return StandardizedLeagueEvalSummary(
-        opponent_entry_id=int(standardized_entry.entry_id),
-        opponent_epoch=int(standardized_entry.source_epoch),
-        win_rate=float(metrics["win_rate"]),
-        score_diff=float(metrics["score_diff"]),
-        games=float(metrics["games"]),
     )
 
 
@@ -3329,7 +3340,8 @@ def save_cached_warm_start(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format_version": 1,
+        "format_version": 2,
+        "obs_size": 19 + 24 * int(args.players_per_team),
         "created_at_utc": current_timestamp(),
         "players_per_team": int(args.players_per_team),
         "epoch": int(epoch),
@@ -3337,6 +3349,9 @@ def save_cached_warm_start(
         "rl_alg": RL_ALG_SELF_PLAY,
         "no_opponent_task_config": {
             "goal_rate_threshold": float(args.no_opponent_phase_goal_rate_threshold),
+            "stage_advancement_threshold": float(
+                args.no_opponent_phase_stage_advancement_threshold
+            ),
             "multi_goal_rate_threshold": float(
                 args.no_opponent_phase_multi_goal_rate_threshold
             ),
@@ -3368,6 +3383,13 @@ def load_cached_warm_start(path: Path) -> dict[str, object]:
     payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, dict):
         raise ValueError(f"Expected a dict warm-start payload in {path}")
+    format_version = payload.get("format_version")
+    if format_version != 2:
+        raise ValueError(
+            f"Warm-start cache {path} has format_version={format_version!r}; "
+            "only format_version=2 is supported after the observation-space change. "
+            "Regenerate the cache with tune_warmstart_optuna.py."
+        )
     state_dict = payload.get("state_dict")
     epoch = payload.get("epoch")
     global_step = payload.get("global_step")
@@ -4203,7 +4225,6 @@ def log_periodic_eval_match_videos(
                 filename_stem=target.filename_stem,
             ),
             label=f"periodic eval video ({target.filename_stem})",
-            opponents_enabled=True,
             opponent_state_dict=target.opponent
             if isinstance(target.opponent, Mapping)
             else None,
@@ -4306,7 +4327,6 @@ def log_periodic_league_match_videos(
                 filename_stem=target.filename_stem,
             ),
             label=f"league eval video ({target.filename_stem})",
-            opponents_enabled=True,
             opponent_state_dict=target.opponent,
             overwrite_existing=True,
         )
@@ -4412,7 +4432,7 @@ def log_periodic_no_opponent_video(
         args,
         output_path=no_opponent_path,
         label="no-opponent video",
-        opponents_enabled=False,
+        warm_start_reward_shaping=True,
         no_opponent_field_scale=field_scale,
         overwrite_existing=True,
     )
@@ -4450,8 +4470,6 @@ def _build_run_summary(
     league_manager: LeagueManager | None,
     latest_league_metrics: LeagueEvaluationSummary | None,
     final_league_metrics: LeagueEvaluationSummary | None,
-    latest_standardized_league_metrics: StandardizedLeagueEvalSummary | None,
-    final_standardized_league_metrics: StandardizedLeagueEvalSummary | None,
     model_path: Path,
     retained_past_checkpoint_epochs: Sequence[int],
 ) -> dict[str, object]:
@@ -4549,12 +4567,6 @@ def _build_run_summary(
             "opponent_count": final_league_metrics.opponent_count,
             "per_opponent": final_league_metrics.per_opponent,
         },
-        "latest_standardized_league_metrics": None
-        if latest_standardized_league_metrics is None
-        else latest_standardized_league_metrics.__dict__.copy(),
-        "final_standardized_league_metrics": None
-        if final_standardized_league_metrics is None
-        else final_standardized_league_metrics.__dict__.copy(),
         "kl_mode_summary": kl_regularization_summary(args),
         "no_opponent_task_config": {
             "training_game_length": int(
@@ -4563,6 +4575,9 @@ def _build_run_summary(
             "eval_max_steps": int(args.no_opponent_eval_max_steps),
             "field_curriculum_enabled": bool(field_curriculum_enabled(args)),
             "goal_rate_threshold": float(args.no_opponent_phase_goal_rate_threshold),
+            "stage_advancement_threshold": float(
+                args.no_opponent_phase_stage_advancement_threshold
+            ),
             "multi_goal_rate_threshold": float(
                 args.no_opponent_phase_multi_goal_rate_threshold
             ),
@@ -4654,9 +4669,6 @@ def main():
     league_wrapper: LeagueTrainingWrapper | None = None
     latest_league_metrics: LeagueEvaluationSummary | None = None
     final_league_metrics: LeagueEvaluationSummary | None = None
-    latest_standardized_league_metrics: StandardizedLeagueEvalSummary | None = None
-    final_standardized_league_metrics: StandardizedLeagueEvalSummary | None = None
-    standardized_league_entry: LeagueEntry | None = None
     cached_warm_start_path = (
         None
         if args.cached_warm_start_path is None
@@ -4719,7 +4731,10 @@ def main():
             game_length=no_opponent_game_length,
             render_mode=None,
             seed=args.seed,
-            opponents_enabled=False,
+            warm_start_reward_shaping=True,
+            shaping_distance_penalty=float(args.shaping_distance_penalty),
+            shaping_touch_bonus=float(args.shaping_touch_bonus),
+            shaping_velocity_bonus=float(args.shaping_velocity_bonus),
             vec=warm_start_vec_config,
         )
         warm_start_vecenv = BlueTeamNoOpponentWrapper(
@@ -4761,7 +4776,7 @@ def main():
                 total_ppo_iterations=int(args.ppo_iterations),
                 phase_ppo_iterations=warm_start_budget,
             ),
-            opponents_enabled=False,
+            warm_start_reward_shaping=True,
         )
         print(
             "No-opponent train config: "
@@ -4790,6 +4805,13 @@ def main():
             1, min(no_opponent_phase.eval_interval, warm_start_trainer.total_epochs)
         )
         no_opponent_stage_index = 0
+        # Formation sub-phase: after the scale ladder finishes, red swaps from
+        # the endline-corner bootstrap layout into its regular self-play
+        # formation. The policy must again clear the completion thresholds in
+        # this harder setting before warm-start is considered done — that's
+        # what actually keeps the learned behavior transferable instead of
+        # overfitting to "empty lane to goal".
+        warm_start_red_in_formation = False
 
         while warm_start_trainer.epoch < warm_start_trainer.total_epochs:
             warm_start_trainer.evaluate()
@@ -4811,6 +4833,7 @@ def main():
                 num_games=args.no_opponent_eval_games,
                 max_steps=args.no_opponent_eval_max_steps,
                 field_scale=train_scale,
+                red_in_formation=warm_start_red_in_formation,
             )
             latest_no_opponent_metrics = dict(no_opponent_metrics)
             print(
@@ -4857,7 +4880,8 @@ def main():
                 field_scale=train_scale,
             )
             if (
-                no_opponent_metrics["goal_rate"] >= no_opponent_phase.goal_rate_threshold
+                no_opponent_metrics["goal_rate"]
+                >= no_opponent_phase.stage_advancement_threshold
                 and no_opponent_stage_index < no_opponent_curriculum.stage_count() - 1
             ):
                 previous_scale = train_scale
@@ -4878,12 +4902,23 @@ def main():
                 warm_start_trainer.epoch >= no_opponent_phase.min_iterations
                 and no_opponent_phase.completion_reached(no_opponent_metrics)
             ):
+                if not warm_start_red_in_formation:
+                    warm_start_red_in_formation = True
+                    warm_start_vecenv.set_red_in_formation(True)
+                    print(
+                        "Entered warm-start formation sub-phase: "
+                        f"epoch={warm_start_trainer.epoch}, "
+                        f"goal_rate={no_opponent_metrics['goal_rate']:.3f}, "
+                        f"train_scale={train_scale:.3f} "
+                        "(red switched from corners to formation)"
+                    )
+                    continue
                 final_no_opponent_metrics = dict(no_opponent_metrics)
                 print(
                     "No-opponent phase complete: "
                     f"epoch={warm_start_trainer.epoch}, "
                     f"goal_rate={no_opponent_metrics['goal_rate']:.3f}, "
-                    f"train_scale={train_scale:.3f}"
+                    f"train_scale={train_scale:.3f} (red_in_formation=True)"
                 )
                 break
 
@@ -4902,6 +4937,7 @@ def main():
                     if latest_no_opponent_metrics is None
                     else float(latest_no_opponent_metrics["multi_goal_rate"])
                 )
+                warm_start_trainer.close()
                 raise RuntimeError(
                     "No-opponent warm-start exhausted its budget without reaching the "
                     "required scoring thresholds. Refusing to continue into self-play with "
@@ -4967,6 +5003,18 @@ def main():
         0,
         int(args.ppo_iterations) - consumed_warm_start_epochs,
     )
+    if (
+        final_no_opponent_metrics is not None
+        and int(args.ppo_iterations) == int(args.no_opponent_phase_max_iterations)
+    ):
+        print(
+            "Stopping after warm-start completion because the entire PPO budget was "
+            "allocated to the warm-start phase: "
+            f"epoch={consumed_warm_start_epochs}, "
+            f"goal_rate={final_no_opponent_metrics['goal_rate']:.3f}, "
+            f"model_path={model_path}"
+        )
+        self_play_iterations = 0
     if self_play_iterations > 0:
         vec_config, autotune_result = resolve_training_vec_config(args)
         vecenv = make_soccer_vecenv(
@@ -4975,7 +5023,6 @@ def main():
             game_length=400,
             render_mode=None,
             seed=args.seed,
-            opponents_enabled=True,
             vec=vec_config,
         )
         if autotune_result is not None:
@@ -5005,7 +5052,7 @@ def main():
 
         if league_config is not None:
             league_manager = LeagueManager(league_config, seed=args.seed)
-            standardized_league_entry = league_manager.bootstrap(
+            league_manager.bootstrap(
                 snapshot_policy_state(current_policy),
                 label="bootstrap",
                 source_epoch=0 if final_trainer is None else int(final_trainer.epoch),
@@ -5022,8 +5069,7 @@ def main():
                 f"rl_alg={league_config.rl_alg}, "
                 f"max_size={league_config.max_size}, "
                 "promotion_win_rate_threshold="
-                f"{league_config.promotion_win_rate_threshold:.3f}, "
-                f"standardized_eval_enabled={league_config.standardized_eval_enabled}"
+                f"{league_config.promotion_win_rate_threshold:.3f}"
             )
 
         train_config = build_phase_train_config(
@@ -5032,7 +5078,7 @@ def main():
             device,
             ppo_iterations=self_play_iterations,
             total_timesteps=remaining_total_timesteps,
-            opponents_enabled=True,
+            warm_start_reward_shaping=False,
         )
         print(
             "Train config: "
@@ -5102,20 +5148,6 @@ def main():
             or league_manager is not None
         )
         eval_env_override = args.past_iterate_eval_envs
-        if (
-            eval_env_override is None
-            and league_config is not None
-            and league_config.standardized_eval_enabled
-        ):
-            eval_env_override = max(
-                1,
-                int(
-                    round(
-                        total_sim_envs(vec_config)
-                        * league_config.standardized_eval_ratio
-                    )
-                ),
-            )
         eval_vec_config = (
             resolve_eval_vec_config(vec_config, eval_env_override)
             if needs_evaluator
@@ -5240,43 +5272,6 @@ def main():
                     print_league_summary(
                         "League eval", trainer.epoch, latest_league_metrics
                     )
-                    if (
-                        league_config is not None
-                        and league_config.standardized_eval_enabled
-                        and standardized_league_entry is not None
-                    ):
-                        latest_standardized_league_metrics = (
-                            evaluate_standardized_league_opponent(
-                                current_policy=current_policy,
-                                standardized_entry=standardized_league_entry,
-                                evaluator=evaluator,
-                                games=args.marlodonna_standardized_eval_games,
-                                seed=eval_seed + 3_000,
-                            )
-                        )
-                        log_payload.update(
-                            {
-                                "evaluation/marlodonna_standardized/win_rate": (
-                                    latest_standardized_league_metrics.win_rate
-                                ),
-                                "evaluation/marlodonna_standardized/score_diff": (
-                                    latest_standardized_league_metrics.score_diff
-                                ),
-                                "evaluation/marlodonna_standardized/games": (
-                                    latest_standardized_league_metrics.games
-                                ),
-                                "evaluation/marlodonna_standardized/opponent_entry_id": (
-                                    float(
-                                        latest_standardized_league_metrics.opponent_entry_id
-                                    )
-                                ),
-                                "evaluation/marlodonna_standardized/opponent_epoch": (
-                                    float(
-                                        latest_standardized_league_metrics.opponent_epoch
-                                    )
-                                ),
-                            }
-                        )
                     promotion = league_manager.maybe_promote(
                         aggregate_win_rate=latest_league_metrics.aggregate_win_rate,
                         aggregate_score_diff=latest_league_metrics.aggregate_score_diff,
@@ -5366,18 +5361,6 @@ def main():
                 seed=args.seed + 40_000_000,
             )
             print_league_summary("Final league eval", trainer.epoch, final_league_metrics)
-            if (
-                league_config is not None
-                and league_config.standardized_eval_enabled
-                and standardized_league_entry is not None
-            ):
-                final_standardized_league_metrics = evaluate_standardized_league_opponent(
-                    current_policy=current_policy,
-                    standardized_entry=standardized_league_entry,
-                    evaluator=evaluator,
-                    games=args.marlodonna_standardized_eval_games,
-                    seed=args.seed + 41_000_000,
-                )
             if logger is not None:
                 league_log_payload = {
                     "evaluation/progress_step": float(trainer.global_step),
@@ -5392,25 +5375,6 @@ def main():
                     if league_wrapper is None
                     else league_wrapper.latest_opponent_histogram(),
                 )
-                if final_standardized_league_metrics is not None:
-                    league_log_payload.update(
-                        {
-                            "evaluation/final_marlodonna_standardized/win_rate": (
-                                final_standardized_league_metrics.win_rate
-                            ),
-                            "evaluation/final_marlodonna_standardized/score_diff": (
-                                final_standardized_league_metrics.score_diff
-                            ),
-                            "evaluation/final_marlodonna_standardized/games": (
-                                final_standardized_league_metrics.games
-                            ),
-                            "evaluation/final_marlodonna_standardized/opponent_entry_id": (
-                                float(
-                                    final_standardized_league_metrics.opponent_entry_id
-                                )
-                            ),
-                        }
-                    )
                 logger.wandb.log(league_log_payload, step=trainer.global_step)
 
         if best_opponent is not None and args.final_best_eval_games > 0:
@@ -5622,8 +5586,6 @@ def main():
         league_manager=league_manager,
         latest_league_metrics=latest_league_metrics,
         final_league_metrics=final_league_metrics,
-        latest_standardized_league_metrics=latest_standardized_league_metrics,
-        final_standardized_league_metrics=final_standardized_league_metrics,
         model_path=model_path,
         retained_past_checkpoint_epochs=[
             checkpoint.epoch for checkpoint in retained_periodic_checkpoints
@@ -5695,31 +5657,31 @@ def save_match_video(
     *,
     output_path: Path,
     label: str,
-    opponents_enabled: bool = True,
+    warm_start: bool = False,
+    warm_start_red_in_formation: bool = False,
     no_opponent_field_scale: float = 1.0,
     opponent_state_dict: Mapping[str, torch.Tensor] | None = None,
     opponent_policy_runner: Any | None = None,
     overwrite_existing: bool = False,
 ) -> Path | None:
-    """Capture one rendered policy replay against either itself, no opponents, or a snapshot.
+    """Capture one rendered policy replay against either itself, scripted red, or a snapshot.
 
     Training now needs one shared video exporter for three closely related cases:
-    no-opponent warm-start rollouts, ordinary self-play, and current-versus-best-checkpoint
-    comparisons. Keeping those in one helper ensures they all use the same rendering loop,
-    frame writing, and fallback behavior instead of drifting apart over time.
+    warm-start rollouts (blue vs scripted red), ordinary self-play, and current-versus-best-
+    checkpoint comparisons. Keeping those in one helper ensures they all use the same
+    rendering loop, frame writing, and fallback behavior instead of drifting apart.
 
-    ``opponents_enabled`` controls whether the environment should spawn the red team at all.
-    When an ``opponent_state_dict`` or ``opponent_policy_runner`` is supplied, the current
-    policy controls blue and the supplied opponent controls red. Otherwise the current policy
-    simply controls every active agent in the environment, which preserves the old self-play
-    behavior. ``overwrite_existing`` is used by periodic run-scoped videos so they update one
-    stable local file that can then be uploaded to W&B without fighting older runs for
-    filenames.
+    ``warm_start`` switches the env into warm-start mode: shorter episode length, the
+    BlueTeamNoOpponentWrapper so blue-only trajectories drive the rollout, and the dense
+    reward shaping on. Red is driven by the scripted max-power kick policy inside the
+    wrapper. When an ``opponent_state_dict`` or ``opponent_policy_runner`` is supplied, the
+    current policy controls blue and the supplied opponent controls red. Otherwise the
+    current policy controls every active agent in the environment (self-play replay).
     """
 
     game_length = (
         resolve_no_opponent_game_length(int(args.no_opponent_eval_max_steps))
-        if not opponents_enabled
+        if warm_start
         else 400
     )
     base_env = make_puffer_env(
@@ -5728,14 +5690,16 @@ def save_match_video(
         game_length=game_length,
         render_mode="rgb_array",
         seed=args.seed,
-        opponents_enabled=opponents_enabled,
+        warm_start_reward_shaping=warm_start,
     )
     env = (
         BlueTeamNoOpponentWrapper(base_env, args.players_per_team)
-        if not opponents_enabled
+        if warm_start
         else base_env
     )
-    if not opponents_enabled and no_opponent_field_scale != 1.0:
+    if warm_start and warm_start_red_in_formation:
+        env.set_red_in_formation(True)
+    if warm_start and no_opponent_field_scale != 1.0:
         maybe_set_training_field_scale(env, no_opponent_field_scale)
 
     frames: list[np.ndarray] = []
@@ -5825,7 +5789,6 @@ def save_self_play_video(
         args,
         output_path=Path(str(args.video_output)),
         label="self-play video",
-        opponents_enabled=True,
         overwrite_existing=overwrite_existing,
     )
 
@@ -5846,7 +5809,6 @@ def save_best_checkpoint_video(
         args,
         output_path=Path(str(args.best_checkpoint_video_output)),
         label="best-checkpoint video",
-        opponents_enabled=True,
         opponent_state_dict=best_opponent
         if isinstance(best_opponent, Mapping)
         else None,

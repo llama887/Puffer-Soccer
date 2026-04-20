@@ -124,7 +124,7 @@ def build_policy_from_checkpoint(checkpoint_path: Path, players_per_team: int) -
     env = tp.make_puffer_env(
         players_per_team=players_per_team,
         action_mode="discrete",
-        opponents_enabled=False,
+        warm_start_reward_shaping=True,
     )
     try:
         policy = tp.Policy(env).to("cpu")

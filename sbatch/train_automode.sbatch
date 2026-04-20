@@ -159,7 +159,7 @@ uv run python -u scripts/train_pufferl.py \
     --hyperparameters-path "$TRAIN_AUTOMODE_HYPERPARAMETERS_PATH" \
     --device cuda \
     --wandb \
-    --wandb-project robot-soccer \
+    --wandb-project robot-soccer-discrete \
     --ppo-iterations "$TRAIN_AUTOMODE_PPO_ITERATIONS" \
     --no-opponent-phase-min-iterations "$TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS" \
     --no-opponent-phase-max-iterations "$TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS" \

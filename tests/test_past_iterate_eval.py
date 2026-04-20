@@ -74,6 +74,7 @@ def test_split_phase_iterations_reserves_remaining_budget_for_self_play():
         eval_interval=4,
         goal_rate_threshold=0.95,
         multi_goal_rate_threshold=0.5,
+        stage_advancement_threshold=0.5,
     )
 
     warm_start, self_play = train_pufferl.split_phase_iterations(1_000, phase)
@@ -83,19 +84,19 @@ def test_split_phase_iterations_reserves_remaining_budget_for_self_play():
 
 
 def test_blue_team_no_opponent_wrapper_exposes_only_learning_agents():
-    """Verify the warm-start wrapper removes dead red-agent trajectories from PPO input.
+    """Verify the warm-start wrapper removes red-agent trajectories from PPO input.
 
-    The warm-start fix depends on PPO seeing only blue agents even though the native simulator
-    still maintains full red-team slots for rendering and zero-filled opponent observations.
-    This regression test checks both sides of that contract:
+    Warm-start runs the full self-play env with red driven by a scripted max-power kick
+    policy. This regression test checks both sides of that contract:
     - the wrapper exposes only `players_per_team` agents to the trainer
     - the wrapped native env still keeps the full two-team state internally
+    - the wrapper fills red action slots with the scripted `WARM_START_RED_ACTION`
     """
 
     base_env = make_puffer_env(
         players_per_team=3,
         action_mode="discrete",
-        opponents_enabled=False,
+        warm_start_reward_shaping=True,
     )
     wrapped_env = train_pufferl.BlueTeamNoOpponentWrapper(base_env, players_per_team=3)
 
@@ -105,7 +106,13 @@ def test_blue_team_no_opponent_wrapper_exposes_only_learning_agents():
         assert wrapped_env.num_agents == 3
         assert base_env.num_agents == 6
         assert obs.shape[0] == 3
-        np.testing.assert_allclose(obs[0][-21:], 0.0, atol=1e-6)
+
+        blue_actions = np.zeros((3,), dtype=base_env.actions.dtype)
+        # pylint: disable=protected-access
+        expanded = wrapped_env._expand_blue_actions(blue_actions)
+        assert expanded.shape == (6,)
+        assert (expanded[:3] == 0).all()
+        assert (expanded[3:] == train_pufferl.WARM_START_RED_ACTION).all()
     finally:
         wrapped_env.close()
 
@@ -633,7 +640,7 @@ def test_register_existing_checkpoint_promotes_finished_model_into_best_files(tm
         vec_batch_size=None,
         vec_num_workers=None,
         wandb=False,
-        wandb_project="robot-soccer",
+        wandb_project="robot-soccer-discrete",
         wandb_group="manual-best-checkpoint",
         wandb_tag=None,
     )

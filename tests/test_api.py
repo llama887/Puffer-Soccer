@@ -62,6 +62,10 @@ class _NativeAgent(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("last_move", ctypes.c_float),
         ("last_rot", ctypes.c_float),
         ("team", ctypes.c_int),
+        ("stat_kick", ctypes.c_float),
+        ("stat_speed", ctypes.c_float),
+        ("stat_turn", ctypes.c_float),
+        ("steer_angle", ctypes.c_float),
     ]
 
 
@@ -91,7 +95,7 @@ class _NativeEnv(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("cumulative_blue_team_episode_return", ctypes.c_float),
         ("cumulative_red_team_episode_return", ctypes.c_float),
         ("do_team_switch", ctypes.c_int),
-        ("opponents_enabled", ctypes.c_int),
+        ("warm_start_reward_shaping", ctypes.c_int),
         ("blue_left", ctypes.c_int),
         ("reset_setup", ctypes.c_int),
         ("action_mode", ctypes.c_int),
@@ -119,6 +123,9 @@ class _NativeEnv(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("base_y_out_start", ctypes.c_float),
         ("base_y_out_end", ctypes.c_float),
         ("base_goal_half_h", ctypes.c_float),
+        ("last_touch_team", ctypes.c_int),
+        ("throw_in_active", ctypes.c_int),
+        ("throw_in_player", ctypes.c_int),
     ]
 
 
@@ -234,13 +241,13 @@ def _set_discrete_control_state(
 def test_scalar_puffer_env_shapes_discrete():
     env = make_puffer_env(players_per_team=3, action_mode="discrete")
     obs, _ = env.reset(seed=0)
-    assert obs.shape == (6, 58)
-    assert env.global_states.shape == (6, 107)
+    assert obs.shape == (6, 91)
+    assert env.global_states.shape == (6, 7 + 43 * 3)
     assert env.single_action_space.n == DISCRETE_ACTION_COUNT
 
     actions = np.zeros((6,), dtype=np.int32)
     obs, rewards, terminals, truncations, _ = env.step(actions)
-    assert obs.shape == (6, 58)
+    assert obs.shape == (6, 91)
     assert rewards.shape == (6,)
     assert terminals.shape == (6,)
     assert truncations.shape == (6,)
@@ -263,12 +270,12 @@ def test_only_discrete_action_mode_is_supported() -> None:
 def test_scalar_puffer_env_roundtrip():
     env = make_puffer_env(players_per_team=2, action_mode="discrete")
     obs, infos = env.reset(seed=123)
-    assert obs.shape == (4, 44)
+    assert obs.shape == (4, 67)
     assert infos == []
 
     actions = np.zeros((4,), dtype=np.int32)
     obs, rewards, terms, truncs, infos = env.step(actions)
-    assert obs.shape == (4, 44)
+    assert obs.shape == (4, 67)
     assert rewards.shape == (4,)
     assert terms.shape == (4,)
     assert truncs.shape == (4,)
@@ -283,48 +290,68 @@ def test_discrete_noop_leaves_pose_and_ball_unchanged() -> None:
     develop instead of being forced to move, turn, or kick every step. This test uses a state
     where the ball is far enough away that no incidental collision can occur and confirms one
     noop step leaves both the agent pose and ball velocity unchanged.
+
+    With the goalie feature, agent 0 (the goalie) is clamped to the goalie box near the left
+    goal (x in [-50, -34]). So we place the agent within the goalie box.
     """
 
-    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", warm_start_reward_shaping=True)
 
     try:
-        _set_discrete_control_state(env, ball_x=10.0, agent_x=0.0, agent_rot=0.0)
+        _set_discrete_control_state(env, ball_x=-20.0, agent_x=-40.0, agent_rot=0.0)
         env.step(np.full((2,), DISCRETE_ACTION_NOOP, dtype=np.int32))
         state = env.get_state()
     finally:
         env.close()
 
-    assert state["ball"] == pytest.approx((10.0, 0.0, 0.0, 0.0))
-    assert tuple(state["positions"][0]) == (0.0, 0.0)
+    assert state["ball"] == pytest.approx((-20.0, 0.0, 0.0, 0.0))
+    assert tuple(state["positions"][0]) == pytest.approx((-40.0, 0.0))
     assert state["rotations"][0] == pytest.approx(0.0)
 
 
-def test_discrete_move_and_rotate_actions_change_only_one_control_channel() -> None:
-    """Check that movement and rotation intents no longer happen in the same discrete step.
+def test_discrete_move_and_rotate_with_bicycle_model() -> None:
+    """Check that the bicycle model applies: rotate changes steer_angle, heading changes only
+    when moving.
 
-    The single-action control rewrite is only correct if each locomotion action touches exactly
-    one control channel. This regression test first applies a forward move and then a left
-    rotation from a simple state, confirming the move changes position without changing heading
-    while the rotation changes heading without moving the agent.
+    With the bicycle model, ROTATE actions change the front-wheel steer_angle instead of
+    directly rotating the agent. Heading only updates via bicycle kinematics when the agent is
+    moving. This test confirms: (1) forward move with zero steer_angle moves straight without
+    changing heading, (2) rotate alone changes steer_angle without changing heading or position,
+    and (3) combining rotate then move produces a heading change via bicycle kinematics.
     """
 
-    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", warm_start_reward_shaping=True)
 
     try:
-        native_env = _set_discrete_control_state(env, ball_x=10.0, agent_x=0.0, agent_rot=0.0)
+        # Place agent inside goalie box (x in [-50, -34] for blue-left goalie).
+        # Move forward with steer_angle=0: straight line, no heading change.
+        native_env = _set_discrete_control_state(env, ball_x=-20.0, agent_x=-42.0, agent_rot=0.0)
+        stat_speed = native_env.agents[0].stat_speed
+        start_x = -42.0
         env.step(np.full((2,), DISCRETE_ACTION_MOVE_FORWARD, dtype=np.int32))
         move_state = env.get_state()
 
-        native_env = _set_discrete_control_state(env, ball_x=10.0, agent_x=0.0, agent_rot=0.0)
+        # Rotate alone: steer_angle changes, heading and position unchanged.
+        _set_discrete_control_state(env, ball_x=-20.0, agent_x=-42.0, agent_rot=0.0)
         env.step(np.full((2,), DISCRETE_ACTION_ROTATE_LEFT, dtype=np.int32))
         rotate_state = env.get_state()
+
+        # Rotate then move: heading should change via bicycle kinematics.
+        _set_discrete_control_state(env, ball_x=-20.0, agent_x=-42.0, agent_rot=0.0)
+        env.step(np.full((2,), DISCRETE_ACTION_ROTATE_LEFT, dtype=np.int32))
+        env.step(np.full((2,), DISCRETE_ACTION_MOVE_FORWARD, dtype=np.int32))
+        combined_state = env.get_state()
     finally:
         env.close()
 
-    assert tuple(move_state["positions"][0]) == pytest.approx((native_env.move_speed, 0.0))
+    expected_x = start_x + native_env.move_speed * stat_speed
+    assert tuple(move_state["positions"][0]) == pytest.approx((expected_x, 0.0), abs=1e-4)
     assert move_state["rotations"][0] == pytest.approx(0.0)
-    assert tuple(rotate_state["positions"][0]) == pytest.approx((0.0, 0.0))
-    assert rotate_state["rotations"][0] == pytest.approx(native_env.rot_speed)
+
+    assert tuple(rotate_state["positions"][0]) == pytest.approx((start_x, 0.0))
+    assert rotate_state["rotations"][0] == pytest.approx(0.0)
+
+    assert combined_state["rotations"][0] != pytest.approx(0.0, abs=1e-4)
 
 
 def test_discrete_kick_strength_changes_ball_speed_without_moving_agent() -> None:
@@ -336,10 +363,11 @@ def test_discrete_kick_strength_changes_ball_speed_without_moving_agent() -> Non
     place during the kick.
     """
 
-    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", warm_start_reward_shaping=True)
 
     def measure_kick(kick_strength: int) -> tuple[tuple[float, float], float]:
-        _set_discrete_control_state(env, ball_x=0.5, agent_x=0.0, agent_rot=0.0)
+        # Place agent inside goalie box; ball within kick range.
+        _set_discrete_control_state(env, ball_x=-41.5, agent_x=-42.0, agent_rot=0.0)
         env.step(np.full((2,), encode_discrete_kick_action(kick_strength), dtype=np.int32))
         state = env.get_state()
         return tuple(state["positions"][0]), float(math.hypot(state["ball"][2], state["ball"][3]))
@@ -350,8 +378,8 @@ def test_discrete_kick_strength_changes_ball_speed_without_moving_agent() -> Non
     finally:
         env.close()
 
-    assert weak_position == pytest.approx((0.0, 0.0))
-    assert strong_position == pytest.approx((0.0, 0.0))
+    assert weak_position == pytest.approx((-42.0, 0.0))
+    assert strong_position == pytest.approx((-42.0, 0.0))
     assert weakest_speed > 0.0
     assert strongest_speed > weakest_speed
 
@@ -365,7 +393,7 @@ def test_discrete_ball_decay_uses_the_new_slower_constant() -> None:
     speed matches the new decay constant rather than the old faster one.
     """
 
-    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", warm_start_reward_shaping=True)
 
     try:
         _set_discrete_control_state(
@@ -437,12 +465,12 @@ def test_native_vec_env_shapes_and_second_render():
         vec=VecEnvConfig(backend="native", shard_num_envs=2, num_shards=1),
     )
     obs, _ = env.reset(seed=0)
-    assert obs.shape == (8, 44)
-    assert env.global_states.shape == (8, 73)
+    assert obs.shape == (8, 67)
+    assert env.global_states.shape == (8, 93)
 
     actions = np.zeros((8,), dtype=np.int32)
     obs, rewards, terminals, truncations, _ = env.step(actions)
-    assert obs.shape == (8, 44)
+    assert obs.shape == (8, 67)
     assert rewards.shape == (8,)
     assert terminals.shape == (8,)
     assert truncations.shape == (8,)
@@ -459,7 +487,7 @@ def test_large_reset_seed_is_folded_into_signed_env_range():
     large_seed = MAX_SIGNED_ENV_SEED + 123_456
     obs, infos = env.reset(seed=large_seed)
 
-    assert obs.shape == (4, 44)
+    assert obs.shape == (4, 67)
     assert infos == []
     assert normalize_env_seed(large_seed) == 123_456
     env.close()
@@ -515,34 +543,27 @@ def test_goal_rewards_only_reward_the_attacking_team():
         env.close()
 
 
-def test_disabled_opponents_stay_inactive_and_receive_no_reward():
-    """Check that the no-opponent mode removes gameplay pressure from the red team.
+def test_warm_start_reward_shaping_applies_only_to_blue():
+    """Check that dense reward shaping is gated to the learning team only.
 
-    The user-facing flag is meant to create a simple curriculum where one team can learn to
-    reach the ball and score without interference. This test verifies the native env matches
-    that contract in two concrete ways:
-    - red-team agents spawn pinned on the far right edge instead of contesting the ball
-    - red-team rewards stay at zero even when the blue team scores
+    The `warm_start_reward_shaping` flag should fire the distance-to-ball penalty, the
+    ball-touch bonus, and the goal-direction shaping for blue agents only, while red agents
+    remain on the standard sparse +/-1 goal reward. That gating keeps warm-start rollouts
+    bootstrap-friendly without contaminating red-side learning signals.
     """
 
     env = make_puffer_env(
         players_per_team=2,
         action_mode="discrete",
-        opponents_enabled=False,
+        warm_start_reward_shaping=True,
     )
     actions = np.zeros((4,), dtype=np.int32)
 
     try:
         env.reset(seed=0)
-        state = env.get_state()
-        positions = state["positions"]
-        np.testing.assert_allclose(positions[2:, 0], 50.0, atol=1e-6)
-
-        _force_ball_into_goal(env, "right")
         _, rewards, _, _, _ = env.step(actions)
-
+        assert np.any(rewards[:2] != 0.0), "blue should receive dense shaping each step"
         np.testing.assert_allclose(rewards[2:], 0.0, atol=1e-6)
-        assert np.all(rewards[:2] > 0.0)
     finally:
         env.close()
 
@@ -555,18 +576,15 @@ def test_episode_return_logs_the_full_accumulated_episode_reward():
     matters for sparse-reward soccer because a team can score early, spend the final step with
     zero reward, and still deserve a non-zero episode total in the logs.
 
-    This regression test uses only the public environment API. It creates a short no-opponent
-    episode, forces one blue-team goal on the first step, and then ends the episode on the
-    second step without any additional reward. If the native logger is correct, the terminal
-    log must still contain the reward from the earlier scoring step for the aggregate episode
-    return and for the new per-team return metrics.
+    Self-play rewards are zero-sum: when blue scores, blue gets +1 and red gets -1 per agent.
+    The aggregate episode_return therefore sums to zero, while the per-team splits retain the
+    signed rewards.
     """
 
     env = make_puffer_env(
         players_per_team=2,
         action_mode="discrete",
         game_length=2,
-        opponents_enabled=False,
     )
     actions = np.zeros((4,), dtype=np.int32)
 
@@ -575,7 +593,7 @@ def test_episode_return_logs_the_full_accumulated_episode_reward():
         _force_ball_into_goal(env, "right")
         _, rewards, terminals, _, _ = env.step(actions)
         np.testing.assert_allclose(rewards[:2], 1.0, atol=1e-6)
-        np.testing.assert_allclose(rewards[2:], 0.0, atol=1e-6)
+        np.testing.assert_allclose(rewards[2:], -1.0, atol=1e-6)
         assert not terminals.any()
 
         _, rewards, terminals, _, _ = env.step(actions)
@@ -586,9 +604,9 @@ def test_episode_return_logs_the_full_accumulated_episode_reward():
         assert log is not None
         assert log["n"] == 1.0
         assert log["episode_length"] == 2.0
-        assert log["episode_return"] == 2.0
+        assert log["episode_return"] == 0.0
         assert log["blue_team_episode_return"] == 2.0
-        assert log["red_team_episode_return"] == 0.0
+        assert log["red_team_episode_return"] == -2.0
     finally:
         env.close()
 
@@ -668,19 +686,18 @@ def test_merge_team_episode_return_log_adds_current_team_metric():
     }
 
 
-def test_native_field_scale_resizes_no_opponent_map_without_obs_noise():
+def test_native_field_scale_resizes_warm_start_map_bounds():
     """Verify the map-size curriculum changes geometry without adding reward shaping.
 
-    The no-opponent curriculum should make the task easier by shrinking the field, not by
-    changing the reward. This test checks two concrete properties of the native setter:
-    - the live field bounds and state metadata reflect the requested scale
-    - disabled-opponent observation slots remain zero after resizing
+    The warm-start curriculum makes the task easier by shrinking the field. This test checks
+    that the native setter updates the live field bounds and state metadata to the requested
+    scale.
     """
 
     env = make_puffer_env(
         players_per_team=3,
         action_mode="discrete",
-        opponents_enabled=False,
+        warm_start_reward_shaping=True,
     )
 
     try:
@@ -694,7 +711,7 @@ def test_native_field_scale_resizes_no_opponent_map_without_obs_noise():
         np.testing.assert_allclose(native_env.x_out_end, 30.0, atol=1e-6)
         np.testing.assert_allclose(native_env.y_out_start, -21.0, atol=1e-6)
         np.testing.assert_allclose(native_env.y_out_end, 21.0, atol=1e-6)
-        np.testing.assert_allclose(obs[0][-21:], 0.0, atol=1e-6)
+        assert obs.shape == (6, 19 + 24 * 3)
     finally:
         env.close()
 
@@ -720,7 +737,7 @@ def test_observations_are_team_symmetric_and_egocentric():
         red_obs = obs[1]
 
         np.testing.assert_allclose(blue_obs[1:7], red_obs[1:7], atol=1e-6)
-        np.testing.assert_allclose(blue_obs[16:21], red_obs[16:21], atol=1e-6)
-        np.testing.assert_allclose(blue_obs[21:28], red_obs[21:28], atol=1e-6)
+        np.testing.assert_allclose(blue_obs[24:29], red_obs[24:29], atol=1e-6)
+        np.testing.assert_allclose(blue_obs[29:36], red_obs[29:36], atol=1e-6)
     finally:
         env.close()

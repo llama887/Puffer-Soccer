@@ -21,7 +21,7 @@ uv run scripts/train_pufferl.py --players-per-team 5 --vec-backend auto --ppo-it
 ```
 
 This writes a self-play video at `experiments/self_play.mp4` after training.
-W&B logging is enabled by default with the `robot-soccer` project and logs the generated self-play video to the same run.
+W&B logging is enabled by default with the `robot-soccer-discrete` project and logs the generated self-play video to the same run.
 
 The training path runs directly on `MARL2DPufferEnv` without a PettingZoo wrapper or Python serial vectorizer.
 
