@@ -1,0 +1,7 @@
+behavior=dribble
+player=7
+n_touches=5
+center_frac=0.724
+start_step=597
+end_step=625
+fps=20

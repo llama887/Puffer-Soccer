@@ -188,12 +188,12 @@ def plot(
     extent = [grid_blue_x.min() - 2.5, grid_blue_x.max() + 2.5,
               grid_red_x.min() - 2.5, grid_red_x.max() + 2.5]
 
-    fig = plt.figure(figsize=(14.0, 9.5))
+    fig = plt.figure(figsize=(14.5, 9.5))
     # Main heatmap on left; 5 corner renderings stacked on right.
     n_corners = 5
     gs = fig.add_gridspec(
-        n_corners, 3, width_ratios=[3.2, 0.12, 1.0],
-        hspace=0.65, wspace=0.12,
+        n_corners, 3, width_ratios=[3.2, 0.14, 1.0],
+        hspace=0.65, wspace=0.45,
     )
     ax = fig.add_subplot(gs[:, 0])
     cax = fig.add_subplot(gs[:, 1])
@@ -216,7 +216,7 @@ def plot(
     ax.legend(fontsize=8, loc="upper left", framealpha=0.9)
 
     cbar = fig.colorbar(im, cax=cax)
-    cbar.set_label("V(s) from blue carrier", fontsize=10)
+    cax.set_title("V(s)", fontsize=10)
 
     # Five representative corners. C splits by whether the blue
     # teammate line is past the red defensive line (C1) or still on
@@ -297,7 +297,15 @@ def main() -> None:
             # centered at 0 so early critics' negative regions render
             # as red (red winning) vs late critics' all-positive as blue.
             amp = float(max(np.max(np.abs(v)) for _, v in vs))
-            fig, axes = plt.subplots(1, len(vs), figsize=(4.3 * len(vs), 4.2), sharey=True)
+            # constrained_layout handles the shared colorbar spacing properly;
+            # the previous tight_layout + fraction/pad combo was overlapping
+            # the final panel.
+            fig, axes = plt.subplots(
+                1, len(vs),
+                figsize=(4.3 * len(vs) + 1.2, 4.2),
+                sharey=True,
+                constrained_layout=True,
+            )
             if len(vs) == 1:
                 axes = [axes]
             extent = [grid_blue_x.min() - 2.5, grid_blue_x.max() + 2.5,
@@ -314,12 +322,12 @@ def main() -> None:
                 ax.set_title(f"ep={ep}", fontsize=10)
                 ax.set_xlabel("blue line x", fontsize=9)
             axes[0].set_ylabel("red line x", fontsize=10)
-            fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02, label="V(carrier)")
+            cbar = fig.colorbar(im, ax=axes, fraction=0.035, pad=0.03)
+            cbar.ax.set_title("V(carrier)", fontsize=9)
             fig.suptitle(
                 "Emergence of formation-aware value: same scenario scored by 5 checkpoints",
                 fontsize=11,
             )
-            fig.tight_layout(rect=[0, 0, 1, 0.93])
             out2 = args.output_dir / "formation_value_evolution.png"
             fig.savefig(out2, dpi=140, bbox_inches="tight")
             plt.close(fig)

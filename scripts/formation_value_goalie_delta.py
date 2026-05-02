@@ -176,11 +176,11 @@ def plot_delta(
     extent = [grid_blue_x.min() - 2.5, grid_blue_x.max() + 2.5,
               grid_red_x.min() - 2.5, grid_red_x.max() + 2.5]
 
-    fig = plt.figure(figsize=(14.0, 9.5))
+    fig = plt.figure(figsize=(14.5, 9.5))
     n_corners = 5
     gs = fig.add_gridspec(
-        n_corners, 3, width_ratios=[3.2, 0.12, 1.0],
-        hspace=0.65, wspace=0.12,
+        n_corners, 3, width_ratios=[3.2, 0.14, 1.0],
+        hspace=0.65, wspace=0.45,
     )
     ax = fig.add_subplot(gs[:, 0])
     cax = fig.add_subplot(gs[:, 1])
@@ -206,7 +206,7 @@ def plot_delta(
     )
 
     cbar = fig.colorbar(im, cax=cax)
-    cbar.set_label("ΔV = V_no_goalie − V_with_goalie", fontsize=10)
+    cax.set_title("ΔV", fontsize=10)
 
     corners = [
         (+40, -10, "A: red behind carrier,\nblue forward"),

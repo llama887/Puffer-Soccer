@@ -1,0 +1,6 @@
+behavior=def_vs_off
+start_step=267
+end_step=346
+label=red_len64
+n_frames=35
+fps=20

@@ -54,6 +54,7 @@ FIELD_HALF_X = 50.0
 FIELD_HALF_Y = 35.0
 GOAL_HALF_Y = 20.0
 GOALIE_BASELINE_EPS = 10.0
+GOALIE_ROTATION_WINDOW = 20  # frames; handoff must happen within this span
 
 MODEL_NAME_RE = re.compile(r"model_(\d+)\.pt$")
 
@@ -180,13 +181,44 @@ def compute_game_stats(
     red_baseline_x = FIELD_HALF_X if blue_left else -FIELD_HALF_X
 
     goalie_frames = {0: 0, 1: 0}
+    # per-step goalie player-idx per team (-1 if no one is goalie).
+    # If multiple teammates satisfy the goalie condition we pick the one
+    # closest to the own baseline (tie-breaker = smallest |y|).
+    goalie_id = {0: np.full(T, -1, dtype=np.int32), 1: np.full(T, -1, dtype=np.int32)}
     for tm, baseline_x in ((0, blue_baseline_x), (1, red_baseline_x)):
         idx = np.arange(num_players)[team == tm]
         pos = positions[:, idx]  # (T, ppt, 2)
         at_baseline = np.abs(pos[:, :, 0] - baseline_x) < GOALIE_BASELINE_EPS
         in_goal_y = np.abs(pos[:, :, 1]) < GOAL_HALF_Y
-        goalie_steps = np.any(at_baseline & in_goal_y, axis=1)
+        mask = at_baseline & in_goal_y  # (T, ppt)
+        goalie_steps = np.any(mask, axis=1)
         goalie_frames[tm] = int(goalie_steps.sum())
+        # rank teammates per step: distance to baseline, break ties on |y|.
+        dist = np.abs(pos[:, :, 0] - baseline_x) + 1e-3 * np.abs(pos[:, :, 1])
+        dist_masked = np.where(mask, dist, np.inf)
+        best = np.argmin(dist_masked, axis=1)  # (T,)
+        has_any = goalie_steps
+        chosen = np.where(has_any, idx[best], -1)
+        goalie_id[tm] = chosen.astype(np.int32)
+
+    # goalie rotation: while some player is the current goalie, another
+    # teammate replaces them within GOALIE_ROTATION_WINDOW frames. Counts
+    # an event when the active goalie-id changes to a NEW teammate whose
+    # onset is within W steps of the previous goalie's last active frame.
+    # A -> none -> A (self re-entry) is NOT a rotation; A -> (any gap ≤ W) -> B is.
+    rotations = {0: 0, 1: 0}
+    for tm in (0, 1):
+        seq = goalie_id[tm]
+        last_id = -1
+        last_step = -GOALIE_ROTATION_WINDOW - 1
+        for t in range(T):
+            cur = int(seq[t])
+            if cur == -1:
+                continue
+            if last_id != -1 and cur != last_id and (t - last_step) <= GOALIE_ROTATION_WINDOW:
+                rotations[tm] += 1
+            last_id = cur
+            last_step = t
 
     # -------------------------- attacking-stayers while defending / vice versa
     # For team T: "own third" = ball in the third closest to team T's baseline.
@@ -292,6 +324,7 @@ def compute_game_stats(
     goalie_frac_blue = goalie_frames[0] / max(1, T)
     goalie_frac_red = goalie_frames[1] / max(1, T)
     goalie_frac = 0.5 * (goalie_frac_blue + goalie_frac_red)
+    goalie_rotations = 0.5 * (rotations[0] + rotations[1])
 
     def frac(num_steps, denom_steps):
         return (num_steps / denom_steps) if denom_steps > 0 else 0.0
@@ -318,6 +351,7 @@ def compute_game_stats(
         "n_triple_passes": n_triple,
         "n_dribbles": n_dribble,
         "goalie_frac": goalie_frac,
+        "goalie_rotations": goalie_rotations,
         "off_while_def_frac": off_while_def_frac,
         "off_while_def_mean_count": off_while_def_count,
         "def_while_off_frac": def_while_off_frac,
@@ -338,6 +372,7 @@ def run_checkpoint(
     game_length: int,
     seed: int,
     device: str,
+    traces_out: Path | None = None,
 ) -> dict:
     env = make_native_vec_env(
         num_envs=num_envs,
@@ -409,6 +444,19 @@ def run_checkpoint(
     agg["checkpoint"] = str(ckpt_path)
     agg["epoch"] = int(MODEL_NAME_RE.search(ckpt_path.name).group(1))
 
+    if traces_out is not None:
+        traces_out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            traces_out,
+            positions=positions.astype(np.float32),
+            ball=ball.astype(np.float32),
+            actions=actions_log.astype(np.int16),
+            blue_left=blue_left_per,
+            epoch=np.int32(agg["epoch"]),
+            game_length=np.int32(game_length),
+            players_per_team=np.int32(players_per_team),
+        )
+
     env.close()
     return agg
 
@@ -428,6 +476,17 @@ def main() -> None:
         action="store_true",
         help="re-run checkpoints that already have a JSON",
     )
+    parser.add_argument(
+        "--traces-dir",
+        type=Path,
+        default=None,
+        help="also save raw per-env positions/ball/actions as npz per checkpoint",
+    )
+    parser.add_argument(
+        "--traces-keep-last-only",
+        action="store_true",
+        help="only save traces for the highest-epoch checkpoint (saves disk)",
+    )
     args = parser.parse_args()
 
     ckpts = sorted(
@@ -437,12 +496,19 @@ def main() -> None:
     print(f"Processing {len(ckpts)} checkpoints (stride={args.stride}).")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    last_epoch = int(MODEL_NAME_RE.search(ckpts[-1].name).group(1)) if ckpts else -1
     for i, ckpt in enumerate(ckpts):
         epoch = int(MODEL_NAME_RE.search(ckpt.name).group(1))
         out = args.output_dir / f"stats_epoch_{epoch:06d}.json"
         if out.exists() and not args.overwrite:
             print(f"[{i + 1}/{len(ckpts)}] epoch={epoch}  skip (exists)")
             continue
+
+        trace_path = None
+        if args.traces_dir is not None:
+            if (not args.traces_keep_last_only) or epoch == last_epoch:
+                trace_path = args.traces_dir / f"trace_epoch_{epoch:06d}.npz"
+
         print(f"[{i + 1}/{len(ckpts)}] epoch={epoch}  running...", flush=True)
         stats = run_checkpoint(
             ckpt,
@@ -451,12 +517,14 @@ def main() -> None:
             game_length=args.game_length,
             seed=args.seed + epoch,
             device=args.device,
+            traces_out=trace_path,
         )
         with open(out, "w") as f:
             json.dump(stats, f, indent=2)
         print(
             f"    passes={stats['n_passes']:.1f} dribbles={stats['n_dribbles']:.1f} "
-            f"goalie={stats['goalie_frac']:.2f} vtb={stats['velocity_toward_ball']:.3f} "
+            f"goalie={stats['goalie_frac']:.2f} rot={stats['goalie_rotations']:.1f} "
+            f"vtb={stats['velocity_toward_ball']:.3f} "
             f"touches={stats['num_touches']:.0f}",
             flush=True,
         )
