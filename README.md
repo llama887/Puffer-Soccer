@@ -173,8 +173,8 @@ uv run python scripts/teamplay_trace.py \
   --checkpoint-dir experiments/61xajhha \
   --output-dir experiments/teamplay_trace/61xajhha \
   --stride 5 \
-  --save-traces \
-  --traces-final-only
+  --traces-dir experiments/teamplay_trace/61xajhha/traces \
+  --traces-keep-last-only
 
 # Per-metric emergence panels (slides 14, 15, 16, 17, 18, 19, 20)
 uv run python scripts/plot_emergence_individual.py \
@@ -191,12 +191,17 @@ uv run python scripts/value_along_trajectory.py \
   --checkpoint experiments/61xajhha/model_049520.pt \
   --output-dir experiments/autoloop/value_trajectory
 
-# Formation value heatmap (slide 25) and goalie delta (slide 26)
+# Formation value heatmap (slide 25) — also writes formation_v.npy that
+# the goalie-delta script consumes as --v-with-goalie
 uv run python scripts/formation_value_heatmap.py \
   --checkpoint experiments/61xajhha/model_049520.pt \
   --output-dir experiments/autoloop/formation
+
+# Formation goalie delta (slide 26) — needs the formation_v.npy from the
+# previous step
 uv run python scripts/formation_value_goalie_delta.py \
   --checkpoint experiments/61xajhha/model_049520.pt \
+  --v-with-goalie experiments/autoloop/formation/formation_v.npy \
   --output-dir experiments/autoloop/formation
 
 # Goalie save region (slide 27)
@@ -204,15 +209,17 @@ uv run python scripts/goalie_save_region.py \
   --checkpoint experiments/61xajhha/model_049520.pt \
   --output-dir experiments/autoloop/formation
 
-# Behavior clips (slides 16, 17, 18, 19, 20)
+# Behavior clips (slides 16, 17, 18, 19, 20) — each runs its own short
+# self-play rollout from the final checkpoint and writes mp4 + .txt clip
+# files into a behavior-typed subdir under --output-dir
 uv run python scripts/extract_dribble_pass_clips.py \
-  --traces experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz \
+  --checkpoint experiments/61xajhha/model_049520.pt \
   --output-dir experiments/autoloop/plots/clips
 uv run python scripts/extract_goalie_transition_clips.py \
-  --traces experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz \
+  --checkpoint experiments/61xajhha/model_049520.pt \
   --output-dir experiments/autoloop/plots/clips
 uv run python scripts/extract_behavior_clips.py \
-  --traces experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz \
+  --checkpoint experiments/61xajhha/model_049520.pt \
   --output-dir experiments/autoloop/plots/clips
 ```
 

@@ -207,12 +207,9 @@ def plot(
     xs = np.linspace(lo, hi, 2)
     ax.plot(xs, xs, color="black", linestyle=":", linewidth=1, alpha=0.55,
             label="blue_line_x = red_line_x")
-    ax.set_xlabel("blue teammate-line x (blue at +x = forward)", fontsize=11)
-    ax.set_ylabel("red defensive-line x (red at +x = in own half)", fontsize=11)
-    ax.set_title(
-        title + f"\nactual V range on this grid: [{vmin:+.3f}, {vmax:+.3f}]",
-        fontsize=11,
-    )
+    ax.set_xlabel("blue teammate-line x", fontsize=11)
+    ax.set_ylabel("red defensive-line x", fontsize=11)
+    ax.set_title(title, fontsize=13)
     ax.legend(fontsize=8, loc="upper left", framealpha=0.9)
 
     cbar = fig.colorbar(im, cax=cax)
@@ -275,8 +272,7 @@ def main() -> None:
     plot(
         v, grid_blue_x, grid_red_x,
         args.output_dir / "formation_value_heatmap.png",
-        "V(carrier) under varied defensive-line / blue-line positions\n"
-        "(blue carrier at (0,0) with ball; blue+red goalies fixed)",
+        "Blue team value under varied player positions",
     )
 
     # Optional evolution: same scenario across earlier checkpoints

@@ -197,13 +197,23 @@ def main() -> None:
     # Interpolate each trace onto a common time grid to compute a mean.
     grid = np.arange(X_MIN, X_MAX + 1, dtype=np.float32)
     interp_stack = []
+    seen_blue = False
+    seen_red = False
     for i, (sd, tr) in enumerate(all_traces):
         v = _scoring_v(tr)
         t_goal = tr["goal_step"]
         x = np.arange(len(v)) - t_goal
         mask = (x >= X_MIN) & (x <= X_MAX)
+        is_blue = tr["scoring_team"] == "blue"
+        label = None
+        if is_blue and not seen_blue:
+            label = "blue scored"
+            seen_blue = True
+        elif (not is_blue) and not seen_red:
+            label = "red scored"
+            seen_red = True
         ax.plot(x[mask], v[mask], alpha=0.55, linewidth=1.2,
-                color="C0" if tr["scoring_team"] == "blue" else "C3")
+                color="C0" if is_blue else "C3", label=label)
         # interpolate onto grid for mean (use NaN outside coverage)
         interp = np.full_like(grid, np.nan, dtype=np.float32)
         m2 = (grid >= x.min()) & (grid <= x.max())
@@ -221,12 +231,8 @@ def main() -> None:
     ax.axhline(0.0, color="gray", linestyle=":", alpha=0.4)
     ax.set_xlim(X_MIN, X_MAX)
     ax.set_xlabel("step relative to goal (t=0 is the goal)", fontsize=11)
-    ax.set_ylabel("V of scoring team (blue if blue scored, red if red scored)", fontsize=11)
-    ax.set_title(
-        f"Critic's value estimate rises as the scoring team approaches the goal\n"
-        f"(repl_pure final checkpoint, ep=49520; {len(all_traces)} single-goal trajectories)",
-        fontsize=12,
-    )
+    ax.set_ylabel("value", fontsize=11)
+    ax.set_title("Value leading to goal", fontsize=13)
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9, loc="upper left")
     fig.tight_layout()

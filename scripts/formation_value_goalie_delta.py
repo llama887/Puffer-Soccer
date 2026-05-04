@@ -194,15 +194,11 @@ def plot_delta(
     hi = min(grid_blue_x.max(), grid_red_x.max())
     xs = np.linspace(lo, hi, 2)
     ax.plot(xs, xs, color="black", linestyle=":", linewidth=1, alpha=0.55)
-    ax.set_xlabel("blue teammate-line x (blue at +x = forward)", fontsize=11)
-    ax.set_ylabel("red defensive-line x (red at +x = in own half)", fontsize=11)
+    ax.set_xlabel("blue teammate-line x", fontsize=11)
+    ax.set_ylabel("red defensive-line x", fontsize=11)
     ax.set_title(
-        "ΔV = V(no red goalie) − V(red goalie in net)\n"
-        "blue = goalie is useful for red (blue benefits if removed);   "
-        "red = 5th line defender is better than goalie (red benefits from removal)\n"
-        f"range: [{diff.min():+.3f}, {diff.max():+.3f}]    "
-        f"mean ΔV = {diff.mean():+.3f}    fraction with ΔV>0: {(diff>0).mean()*100:.0f}%",
-        fontsize=10,
+        "Blue value difference between red team with and without goalie",
+        fontsize=13,
     )
 
     cbar = fig.colorbar(im, cax=cax)

@@ -235,10 +235,7 @@ def plot(
     )
     ax_diff.set_xlabel("blue carrier x", fontsize=11)
     ax_diff.set_ylabel("blue carrier y", fontsize=11)
-    ax_diff.set_title(
-        "ΔV = V(no goalie) − V(with goalie)  —  where does the red goalie add value?",
-        fontsize=11,
-    )
+    ax_diff.set_title("", fontsize=11)
 
     # Reference lines + position markers on the diff heatmap.
     # Red defensive line (x=+40) — present in both variants; the goal line
@@ -292,12 +289,7 @@ def plot(
     _draw_field_cartoon(leg_b, with_goalie=False)
     leg_b.set_title("B: no goalie (3 line defenders)", fontsize=9)
 
-    fig.suptitle(
-        f"Goalie value in a realistic mid-attack state   "
-        f"(ΔV ∈ [{diff.min():+.3f}, {diff.max():+.3f}], mean {diff.mean():+.3f}, "
-        f"{(diff > 0).mean() * 100:.0f}% of cells positive)",
-        fontsize=11,
-    )
+    fig.suptitle("Goalie value over various attacking positions", fontsize=13)
     fig.savefig(output_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {output_path}")
