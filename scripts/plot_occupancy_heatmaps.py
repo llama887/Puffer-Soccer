@@ -83,8 +83,7 @@ def _plot(
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.9, pad=0.02)
     cbar.set_label("log(1 + count)" if log_scale else "count")
-    suffix = f"  ({n_samples:,} samples)" if n_samples is not None else ""
-    ax.set_title(title + suffix, fontsize=11)
+    ax.set_title(title, fontsize=13)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     fig.tight_layout()
@@ -154,35 +153,31 @@ def main() -> None:
         log_scale = scale == "log"
         _plot(
             blue_heat,
-            f"Blue-team occupancy (attacks +x)  {label}  [{scale}]",
+            "Blue-team occupancy",
             args.output_dir / f"occupancy_blue_{label}_{scale}.png",
             cmap="Blues",
             log_scale=log_scale,
-            n_samples=int(blue_all.shape[0]),
         )
         _plot(
             red_heat,
-            f"Red-team occupancy (attacks -x)  {label}  [{scale}]",
+            "Red-team occupancy",
             args.output_dir / f"occupancy_red_{label}_{scale}.png",
             cmap="Reds",
             log_scale=log_scale,
-            n_samples=int(red_all.shape[0]),
         )
         _plot(
             all_heat,
-            f"All-player occupancy  {label}  [{scale}]",
+            "All-player occupancy",
             args.output_dir / f"occupancy_all_{label}_{scale}.png",
             cmap="inferno",
             log_scale=log_scale,
-            n_samples=int(blue_all.shape[0] + red_all.shape[0]),
         )
         _plot(
             ball_heat,
-            f"Ball occupancy  {label}  [{scale}]",
+            "Ball occupancy",
             args.output_dir / f"occupancy_ball_{label}_{scale}.png",
             cmap="inferno",
             log_scale=log_scale,
-            n_samples=int(ball_all.shape[0]),
         )
 
 
