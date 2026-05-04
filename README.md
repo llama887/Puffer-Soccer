@@ -161,6 +161,50 @@ Script: `scripts/goalie_save_region.py`. Cached data:
 
 ---
 
+## Settings-section figures (thesis Chapter 3.1)
+
+Static figures that visualize the env's geometry and dynamics — the
+prose in the Settings section of the written thesis describes these
+behaviors mathematically; these plots make them visible. None require
+the trained policy except the FOV figure, which uses one frame from the
+final-checkpoint trace.
+
+### Field schematic
+
+Annotated 100×70 field with goal regions (`|y| ≤ 20`), midline, and one
+example 5v5 reset showing player positions and headings.
+
+![field schematic](experiments/setting/field_schematic.png)
+
+Script: `scripts/plot_setting_field.py`. Snapshot of the rendered state
+saved at `experiments/setting/field_schematic_state.npz` so the figure
+can be regenerated without re-running the env.
+
+### Kick-strength → ball trajectory
+
+Ball-only simulation of each of the 8 discrete kick strengths under the
+env's impulse + 0.85-decay + 5.0-clip rule. Constants (`leg_speed=4.0`,
+`BALL_VELOCITY_DECAY=0.85`, `MAX_BALL_SPEED=5.0`, the 8 kick scales)
+match `binding.c` at this commit.
+
+![kick strengths](experiments/setting/kick_strengths.png)
+
+Script: `scripts/plot_setting_kick_strengths.py`. Cached data at
+`experiments/setting/kick_strengths_data.npz`.
+
+### Field-of-view overlay (partial observability)
+
+One frame from the final-checkpoint self-play trace, with one player
+highlighted as the observer. The gold wedge is its 180° forward FOV.
+Solid agents are visible to the observer; hollow/dashed agents lie
+outside the FOV and have their feature blocks zero-masked in the
+observation.
+
+![FOV overlay](experiments/setting/fov_overlay.png)
+
+Script: `scripts/plot_setting_fov.py`. Input:
+`experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz`.
+
 ## Reproducing the plots
 
 `uv sync --extra dev` and the env at this commit. The trained policy is
@@ -208,6 +252,15 @@ uv run python scripts/formation_value_goalie_delta.py \
 uv run python scripts/goalie_save_region.py \
   --checkpoint experiments/61xajhha/model_049520.pt \
   --output-dir experiments/autoloop/formation
+
+# Settings figures (no policy required, except FOV uses one trace frame)
+uv run python scripts/plot_setting_field.py \
+  --output-dir experiments/setting
+uv run python scripts/plot_setting_kick_strengths.py \
+  --output-dir experiments/setting
+uv run python scripts/plot_setting_fov.py \
+  --trace experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz \
+  --output-dir experiments/setting --frame 200 --observer 2
 
 # Behavior clips (slides 16, 17, 18, 19, 20) — each runs its own short
 # self-play rollout from the final checkpoint and writes mp4 + .txt clip
