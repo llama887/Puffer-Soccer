@@ -19,6 +19,7 @@ import imageio.v2 as imageio
 import numpy as np
 
 import pufferlib
+import pufferlib.models
 import pufferlib.pufferl as pufferl
 import pufferlib.pytorch
 
@@ -63,6 +64,10 @@ STANDARD_HYPERPARAMETER_KEYS = (
     "ent_coef",
     "prio_alpha",
     "prio_beta0",
+    "use_lstm",
+    "policy_hidden_size",
+    "policy_encoder_size",
+    "lstm_hidden_size",
     "train_batch_size",
     "bptt_horizon",
     "minibatch_size",
@@ -71,6 +76,9 @@ STANDARD_HYPERPARAMETER_KEYS = (
     "no_opponent_map_scale_end",
     "no_opponent_map_scale_power",
     "no_opponent_map_scale_full_progress",
+    "self_play_map_scale_ladder",
+    "self_play_spawn_difficulty_ladder",
+    "self_play_curriculum_full_progress",
 )
 STANDARD_VECENV_KEYS = (
     "vec_backend",
@@ -90,6 +98,10 @@ SELF_PLAY_RESETTABLE_AUTOLOAD_KEYS = (
     "ent_coef",
     "prio_alpha",
     "prio_beta0",
+    "use_lstm",
+    "policy_hidden_size",
+    "policy_encoder_size",
+    "lstm_hidden_size",
     "train_batch_size",
     "bptt_horizon",
     "minibatch_size",
@@ -129,34 +141,152 @@ KL_REGULARIZATION_OFF = "off"
 
 
 class Policy(torch.nn.Module):
-    def __init__(self, env):
+    """Encode one soccer observation and decode action logits plus state value.
+
+    This module is deliberately the feed-forward core, not the whole memory policy. PufferLib's
+    ``LSTMWrapper`` expects a policy core with ``encode_observations`` and ``decode_actions`` so
+    it can own the recurrent state handling during rollout collection and time-batched PPO
+    updates. Keeping this class as the core lets old non-recurrent checkpoints still load while
+    new runs can wrap the same encoder with an LSTM by calling ``build_policy``.
+
+    The default hidden sizes are larger than the previous single-width setup because soccer
+    requires tracking teammates, opponents, ball state, and set-piece context from a partially
+    visible observation. The network is still plain and fast: two ReLU layers before the LSTM
+    or action heads, no attention, and no per-object Python loops in the forward pass.
+    """
+
+    is_continuous = False
+
+    def __init__(
+        self,
+        env,
+        *,
+        encoder_hidden_size: int = 512,
+        encoder_output_size: int = 512,
+    ):
         super().__init__()
         obs_dim = env.single_observation_space.shape[0]
+        self.encoder_output_size = int(encoder_output_size)
         if hasattr(env.single_action_space, "n"):
             self.discrete = True
             act_dim = env.single_action_space.n
-            self.action_head = torch.nn.Linear(256, act_dim)
         else:
             self.discrete = False
             act_dim = env.single_action_space.shape[0]
-            self.action_head = torch.nn.Linear(256, act_dim)
+            self.is_continuous = True
 
         self.net = torch.nn.Sequential(
-            pufferlib.pytorch.layer_init(torch.nn.Linear(obs_dim, 256)),
+            pufferlib.pytorch.layer_init(torch.nn.Linear(obs_dim, encoder_hidden_size)),
             torch.nn.ReLU(),
-            pufferlib.pytorch.layer_init(torch.nn.Linear(256, 256)),
+            pufferlib.pytorch.layer_init(
+                torch.nn.Linear(encoder_hidden_size, encoder_output_size)
+            ),
             torch.nn.ReLU(),
         )
-        self.value_head = torch.nn.Linear(256, 1)
+        self.action_head = torch.nn.Linear(encoder_output_size, act_dim)
+        self.value_head = torch.nn.Linear(encoder_output_size, 1)
+
+    def encode_observations(self, observations, state=None):
+        """Return the per-timestep feature vector consumed by policy heads or an LSTM.
+
+        The method exists for PufferLib's recurrent wrapper. It intentionally ignores
+        ``state`` because this core is memoryless; recurrent memory belongs to the wrapper so
+        training, evaluation, checkpointing, and old feed-forward compatibility all use one
+        canonical state contract.
+        """
+
+        _ = state
+        return self.net(observations)
+
+    def decode_actions(self, hidden):
+        """Decode encoded features into action logits and scalar value estimates.
+
+        Keeping decoding separate from observation encoding is what lets the same policy core
+        serve both feed-forward and recurrent runs. In recurrent mode the LSTM output is passed
+        here; in feed-forward mode ``forward`` passes the encoder output directly.
+        """
+
+        logits = self.action_head(hidden)
+        values = self.value_head(hidden).squeeze(-1)
+        return logits, values
 
     def forward(self, observations, _state=None):
-        hidden = self.net(observations)
-        logits = self.action_head(hidden)
-        values = self.value_head(hidden)
+        """Run the feed-forward policy core without recurrent memory.
+
+        PufferLib calls this directly for non-recurrent runs and through the LSTM wrapper for
+        recurrent runs. The returned value shape preserves the old feed-forward contract where
+        scalar values are shaped like ``(batch, 1)`` during one-step evaluation.
+        """
+
+        hidden = self.encode_observations(observations, state=_state)
+        logits, values = self.decode_actions(hidden)
+        if values.ndim == 1 and observations.ndim > 1:
+            values = values.unsqueeze(-1)
         return logits, values
 
     def forward_eval(self, observations, _state=None):
+        """Run one-step evaluation using the same core path as feed-forward training."""
+
         return self.forward(observations, _state=_state)
+
+
+def build_policy(env, args: Any | None = None) -> torch.nn.Module:
+    """Build the active policy architecture for training or evaluation.
+
+    New experiments use a recurrent policy by default because the soccer environment is
+    partially observable: an agent can lose sight of the ball or opponents and needs memory
+    to act sensibly. The feed-forward ``Policy`` core is still available through
+    ``--no-use-lstm`` and remains the compatibility target for older checkpoints.
+    """
+
+    encoder_hidden_size = int(getattr(args, "policy_hidden_size", 512))
+    encoder_output_size = int(getattr(args, "policy_encoder_size", encoder_hidden_size))
+    core = Policy(
+        env,
+        encoder_hidden_size=encoder_hidden_size,
+        encoder_output_size=encoder_output_size,
+    )
+    if not bool(getattr(args, "use_lstm", True)):
+        return core
+    lstm_hidden_size = int(getattr(args, "lstm_hidden_size", encoder_output_size))
+    return pufferlib.models.LSTMWrapper(
+        env,
+        core,
+        input_size=encoder_output_size,
+        hidden_size=lstm_hidden_size,
+    )
+
+
+def build_policy_for_state(
+    env, state_dict: Mapping[str, torch.Tensor], args: Any | None = None
+) -> torch.nn.Module:
+    """Build a policy whose module layout matches a saved checkpoint state dict.
+
+    Current runs are recurrent, but many useful baselines were produced by the older
+    feed-forward policy. Evaluation and video code therefore need to inspect checkpoint keys
+    before constructing the module. LSTMWrapper checkpoints store ``policy.*``, ``lstm.*``,
+    or ``cell.*`` keys; plain MLP checkpoints store the core layer names directly.
+    """
+
+    has_lstm_keys = any(
+        key.startswith(("policy.", "lstm.", "cell.")) for key in state_dict
+    )
+    if args is None:
+        args = argparse.Namespace(use_lstm=has_lstm_keys)
+    else:
+        args = copy.copy(args)
+        setattr(args, "use_lstm", has_lstm_keys)
+    prefix = "policy." if has_lstm_keys else ""
+    first_weight = state_dict.get(f"{prefix}net.0.weight")
+    second_weight = state_dict.get(f"{prefix}net.2.weight")
+    if isinstance(first_weight, torch.Tensor):
+        setattr(args, "policy_hidden_size", int(first_weight.shape[0]))
+    if isinstance(second_weight, torch.Tensor):
+        setattr(args, "policy_encoder_size", int(second_weight.shape[0]))
+    lstm_weight = state_dict.get("lstm.weight_hh_l0")
+    if isinstance(lstm_weight, torch.Tensor):
+        setattr(args, "lstm_hidden_size", int(lstm_weight.shape[1]))
+    return build_policy(env, args)
 
 
 @dataclass(frozen=True)
@@ -235,6 +365,7 @@ class StandardizedLeagueEvalSummary:
 def forward_policy_eval(
     policy_runner: Any,
     observations: torch.Tensor,
+    state: dict[str, torch.Tensor | None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run eval inference against either a live policy module or a frozen bundle module.
 
@@ -247,8 +378,14 @@ def forward_policy_eval(
     about how a policy object exposes its eval forward pass.
     """
 
+    if state is None and hasattr(policy_runner, "hidden_size"):
+        state = {"lstm_h": None, "lstm_c": None}
+
     if hasattr(policy_runner, "forward_eval"):
-        output = policy_runner.forward_eval(observations)
+        try:
+            output = policy_runner.forward_eval(observations, state)
+        except TypeError:
+            output = policy_runner.forward_eval(observations)
     else:
         output = policy_runner(observations)
     if not isinstance(output, tuple) or len(output) != 2:
@@ -257,6 +394,22 @@ def forward_policy_eval(
     if not isinstance(logits, torch.Tensor) or not isinstance(values, torch.Tensor):
         raise ValueError("Policy runner returned non-tensor outputs")
     return logits, values
+
+
+def initial_recurrent_eval_state(
+    policy_runner: Any,
+) -> dict[str, torch.Tensor | None] | None:
+    """Return an empty recurrent eval state when a policy runner owns LSTM memory.
+
+    PufferLib's ``LSTMWrapper`` mutates the passed state dictionary in place during
+    ``forward_eval``. Keeping the initialization in one helper makes evaluation loops carry
+    memory across steps without forcing non-recurrent policies or TorchScript bundles to
+    accept unused state objects.
+    """
+
+    if hasattr(policy_runner, "hidden_size"):
+        return {"lstm_h": None, "lstm_c": None}
+    return None
 
 
 def policy_example_observation(
@@ -423,7 +576,12 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
 
             if self.regularization_enabled:
                 with torch.no_grad():
-                    old_logits, _ = self.past_policy(mb_obs, state)
+                    old_state = {
+                        "action": mb_actions,
+                        "lstm_h": None,
+                        "lstm_c": None,
+                    }
+                    old_logits, _ = self.past_policy(mb_obs, old_state)
                 old_log_probs = torch.log_softmax(old_logits, dim=-1)
                 new_log_probs = torch.log_softmax(logits, dim=-1)
                 new_probs = torch.softmax(logits, dim=-1)
@@ -631,7 +789,7 @@ class HeadToHeadEvaluator:
             log_interval=1,
             opponents_enabled=True,
         )
-        self.opponent_policy = Policy(self.eval_env).to(device)
+        self.opponent_policy: torch.nn.Module | None = None
         self.num_envs = self.eval_env.num_envs
         self.num_players = players_per_team * 2
         self.current_on_blue = make_side_assignment(self.num_envs)
@@ -668,6 +826,9 @@ class HeadToHeadEvaluator:
         """
 
         if isinstance(opponent, Mapping):
+            self.opponent_policy = build_policy_for_state(self.eval_env, opponent).to(
+                self.device
+            )
             self.opponent_policy.load_state_dict(opponent, strict=True)
             opponent_runner: Any = self.opponent_policy
         else:
@@ -679,6 +840,8 @@ class HeadToHeadEvaluator:
         current_policy.eval()
         if hasattr(opponent_runner, "eval"):
             opponent_runner.eval()
+        current_state = initial_recurrent_eval_state(current_policy)
+        opponent_state = initial_recurrent_eval_state(opponent_runner)
 
         completed_games = 0
         score_diffs: list[float] = []
@@ -691,11 +854,13 @@ class HeadToHeadEvaluator:
 
                 current_logits, _ = forward_policy_eval(
                     current_policy,
-                    obs_tensor.index_select(0, self.current_indices)
+                    obs_tensor.index_select(0, self.current_indices),
+                    current_state,
                 )
                 opponent_logits, _ = forward_policy_eval(
                     opponent_runner,
-                    obs_tensor.index_select(0, self.opponent_indices)
+                    obs_tensor.index_select(0, self.opponent_indices),
+                    opponent_state,
                 )
                 current_actions = (
                     torch.argmax(current_logits, dim=-1)
@@ -808,7 +973,7 @@ class LeagueTrainingWrapper(pufferlib.PufferEnv):
         self._learner_indices = self._build_flat_indices(current_side=True)
         self._opponent_indices = self._build_flat_indices(current_side=False)
         self.num_agents = int(self._learner_indices.size)
-        self._opponent_policy_cache: dict[int, Policy] = {}
+        self._opponent_policy_cache: dict[int, torch.nn.Module] = {}
         self._active_opponent_entry_ids = np.zeros((self.num_envs,), dtype=np.int64)
         self._latest_opponent_histogram: dict[int, int] = {}
 
@@ -853,7 +1018,7 @@ class LeagueTrainingWrapper(pufferlib.PufferEnv):
         self.truncations[:] = self.env.truncations[self._learner_indices]
         self.masks[:] = self.env.masks[self._learner_indices]
 
-    def _policy_for_entry(self, entry_id: int) -> Policy:
+    def _policy_for_entry(self, entry_id: int) -> torch.nn.Module:
         """Return a cached frozen policy module for one league entry id.
 
         Reloading a model on every environment step would be unnecessarily expensive. The
@@ -865,7 +1030,7 @@ class LeagueTrainingWrapper(pufferlib.PufferEnv):
         if cached is not None:
             return cached
         entry = self.league_manager.resolve_entry(entry_id)
-        policy = Policy(self.env).to(self.device)
+        policy = build_policy_for_state(self.env, entry.state_dict).to(self.device)
         policy.load_state_dict(entry.state_dict, strict=True)
         policy.eval()
         self._opponent_policy_cache[entry_id] = policy
@@ -1169,6 +1334,16 @@ class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
         setter(scale)
         self._copy_blue_outputs()
 
+    def set_spawn_difficulty(self, difficulty: float) -> None:
+        """Forward reset-distribution curriculum updates to the wrapped native env."""
+
+        setter = getattr(self.env, "set_spawn_difficulty", None)
+        if setter is None:
+            raise RuntimeError(
+                "wrapped environment does not support set_spawn_difficulty()"
+            )
+        setter(difficulty)
+
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         """Return the full wrapped-env state for scoring diagnostics and rendering."""
 
@@ -1227,6 +1402,27 @@ def parse_no_opponent_scale_ladder(raw_value: str) -> tuple[float, ...]:
     if not stages or any(not stage for stage in stages):
         raise ValueError("no-opponent-map-scale-ladder must list one or more scales")
     return tuple(float(stage) for stage in stages)
+
+
+def interpolate_ladder(stages: Sequence[float], progress: float) -> float:
+    """Linearly interpolate through a curriculum ladder at normalized progress.
+
+    The self-play curriculum is time-based rather than solved-stage-based because there is no
+    single sparse drill metric that cleanly says a symmetric self-play stage is solved. This
+    helper keeps that schedule simple: progress ``0`` returns the first stage, progress ``1``
+    returns the last stage, and intermediate values move linearly across the listed rungs.
+    """
+
+    if not stages:
+        raise ValueError("curriculum ladder must contain at least one value")
+    if len(stages) == 1:
+        return float(stages[0])
+    clamped = min(1.0, max(0.0, float(progress)))
+    scaled = clamped * float(len(stages) - 1)
+    lower = int(math.floor(scaled))
+    upper = min(len(stages) - 1, lower + 1)
+    blend = scaled - float(lower)
+    return float(stages[lower]) * (1.0 - blend) + float(stages[upper]) * blend
 
 
 @dataclass(frozen=True)
@@ -1303,6 +1499,69 @@ class NoOpponentCurriculumConfig:
         if stage_index < 0 or stage_index >= len(self.stage_scales):
             raise ValueError("invalid no-opponent curriculum stage index")
         return float(self.stage_scales[stage_index])
+
+
+@dataclass(frozen=True)
+class SelfPlayCurriculumConfig:
+    """Describe the self-play curriculum that replaces no-opponent warm-starting.
+
+    The old training flow spent an initial phase in a different no-opponent task, then handed
+    the policy to self-play. This config keeps the task as self-play from the first PPO batch
+    but makes early episodes easier: the map starts smaller, the ball starts nearer a goal, and
+    all players start nearer the ball. As progress increases, both the map scale and spawn
+    distribution move toward the normal full-field uniform reset.
+    """
+
+    map_scale_stages: tuple[float, ...]
+    spawn_difficulty_stages: tuple[float, ...]
+    full_progress: float
+
+    @classmethod
+    def from_args(cls, args) -> "SelfPlayCurriculumConfig":
+        """Build the self-play curriculum from parsed CLI values."""
+
+        return cls(
+            map_scale_stages=parse_no_opponent_scale_ladder(
+                args.self_play_map_scale_ladder
+            ),
+            spawn_difficulty_stages=parse_no_opponent_scale_ladder(
+                args.self_play_spawn_difficulty_ladder
+            ),
+            full_progress=float(args.self_play_curriculum_full_progress),
+        )
+
+    def validate(self) -> None:
+        """Reject invalid self-play curriculum values before training starts."""
+
+        if not 0.0 < self.full_progress <= 1.0:
+            raise ValueError("self-play-curriculum-full-progress must be in (0.0, 1.0]")
+        for scale in self.map_scale_stages:
+            if not 0.1 <= scale <= 1.0:
+                raise ValueError("every self-play map scale must be in [0.1, 1.0]")
+        for difficulty in self.spawn_difficulty_stages:
+            if not 0.0 <= difficulty <= 1.0:
+                raise ValueError(
+                    "every self-play spawn difficulty must be in [0.0, 1.0]"
+                )
+
+    def values_at(self, epoch: int, total_epochs: int) -> tuple[float, float, float]:
+        """Return map scale, spawn difficulty, and normalized curriculum progress.
+
+        ``epoch`` comes from the trainer after each PPO update. We divide by
+        ``total_epochs * full_progress`` so the curriculum reaches the final full-field,
+        uniform-spawn task before training ends, leaving the remaining budget to optimize on
+        the real target distribution.
+        """
+
+        if total_epochs < 1:
+            raise ValueError("total_epochs must be positive")
+        denom = max(1.0, float(total_epochs) * self.full_progress)
+        progress = min(1.0, max(0.0, float(epoch) / denom))
+        return (
+            interpolate_ladder(self.map_scale_stages, progress),
+            interpolate_ladder(self.spawn_difficulty_stages, progress),
+            progress,
+        )
 
 
 @dataclass(frozen=True)
@@ -1524,6 +1783,7 @@ def run_no_opponent_rollouts(
             maybe_set_training_field_scale(env, field_scale)
         with torch.no_grad():
             obs, _ = env.reset(seed=seed)
+            eval_state = initial_recurrent_eval_state(policy)
             num_envs = env.num_envs
             first_goal_step = np.full((num_envs,), float(max_steps + 1), dtype=np.float32)
             blue_scored = np.zeros((num_envs,), dtype=bool)
@@ -1533,7 +1793,7 @@ def run_no_opponent_rollouts(
 
             for step_idx in range(1, max_steps + 1):
                 obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
-                logits, _ = policy.forward_eval(obs_tensor)
+                logits, _ = forward_policy_eval(policy, obs_tensor, eval_state)
                 actions = (
                     torch.argmax(logits, dim=-1).cpu().numpy().astype(np.int32, copy=False)
                 )
@@ -1643,6 +1903,43 @@ def maybe_set_training_field_scale(env: object, scale: float) -> None:
             "training field curriculum requires an environment with set_field_scale()"
         )
     setter(scale)
+
+
+def maybe_set_training_spawn_difficulty(env: object, difficulty: float) -> None:
+    """Apply one reset-distribution difficulty to an environment with native support.
+
+    This is the second half of the self-play curriculum. Field scale controls how much space
+    exists; spawn difficulty controls where new episodes begin inside that space. Requiring an
+    explicit environment method avoids silently running the curriculum on a backend that cannot
+    change reset distribution.
+    """
+
+    setter = getattr(env, "set_spawn_difficulty", None)
+    if setter is None:
+        raise RuntimeError(
+            "training spawn curriculum requires an environment with set_spawn_difficulty()"
+        )
+    setter(difficulty)
+
+
+def apply_self_play_curriculum(
+    env: object,
+    curriculum: SelfPlayCurriculumConfig,
+    *,
+    epoch: int,
+    total_epochs: int,
+) -> tuple[float, float, float]:
+    """Apply and return the active self-play curriculum values for one epoch.
+
+    The trainer calls this after each PPO update and once before training starts. Returning the
+    applied values lets the caller log the exact task distribution used at that point, making
+    the curriculum measurable in W&B and in run summaries.
+    """
+
+    field_scale, spawn_difficulty, progress = curriculum.values_at(epoch, total_epochs)
+    maybe_set_training_field_scale(env, field_scale)
+    maybe_set_training_spawn_difficulty(env, spawn_difficulty)
+    return field_scale, spawn_difficulty, progress
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -2005,6 +2302,7 @@ def build_phase_train_config(
     config["max_grad_norm"] = phase_args.max_grad_norm
     config["prio_alpha"] = phase_args.prio_alpha
     config["prio_beta0"] = phase_args.prio_beta0
+    config["use_rnn"] = bool(getattr(phase_args, "use_lstm", True))
     config["device"] = device
     config["seed"] = phase_args.seed
     config["env"] = "puffer_soccer_marl2d"
@@ -2060,6 +2358,10 @@ def summarize_effective_hyperparameters(
         "ent_coef": float(train_config["ent_coef"]),
         "prio_alpha": float(train_config["prio_alpha"]),
         "prio_beta0": float(train_config["prio_beta0"]),
+        "use_lstm": bool(train_config.get("use_rnn", False)),
+        "policy_hidden_size": int(getattr(args, "policy_hidden_size", 512)),
+        "policy_encoder_size": int(getattr(args, "policy_encoder_size", 512)),
+        "lstm_hidden_size": int(getattr(args, "lstm_hidden_size", 512)),
         "train_batch_size": int(train_config["batch_size"]),
         "bptt_horizon": int(train_config["bptt_horizon"]),
         "minibatch_size": int(train_config["minibatch_size"]),
@@ -2601,6 +2903,10 @@ def build_training_parser(
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--prio-alpha", type=float, default=0.8)
     parser.add_argument("--prio-beta0", type=float, default=0.2)
+    parser.add_argument("--use-lstm", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--policy-hidden-size", type=int, default=512)
+    parser.add_argument("--policy-encoder-size", type=int, default=512)
+    parser.add_argument("--lstm-hidden-size", type=int, default=512)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument(
         "--rl-alg",
@@ -2635,8 +2941,8 @@ def build_training_parser(
         ],
     )
     parser.add_argument("--no-regularization", action="store_true")
-    parser.add_argument("--no-opponent-phase-min-iterations", type=int, default=8)
-    parser.add_argument("--no-opponent-phase-max-iterations", type=int, default=128)
+    parser.add_argument("--no-opponent-phase-min-iterations", type=int, default=0)
+    parser.add_argument("--no-opponent-phase-max-iterations", type=int, default=0)
     parser.add_argument("--no-opponent-phase-eval-interval", type=int, default=4)
     parser.add_argument(
         "--no-opponent-phase-goal-rate-threshold",
@@ -2660,6 +2966,21 @@ def build_training_parser(
         "--no-opponent-map-scale-full-progress",
         type=float,
         default=0.6,
+    )
+    parser.add_argument(
+        "--self-play-map-scale-ladder",
+        type=str,
+        default="0.35,0.55,0.75,1.0",
+    )
+    parser.add_argument(
+        "--self-play-spawn-difficulty-ladder",
+        type=str,
+        default="0.0,0.35,0.7,1.0",
+    )
+    parser.add_argument(
+        "--self-play-curriculum-full-progress",
+        type=float,
+        default=0.65,
     )
     parser.add_argument("--past-kl-coef", type=float, default=0.1)
     parser.add_argument("--uniform-kl-base-coef", type=float, default=0.05)
@@ -3644,6 +3965,24 @@ def export_best_policy_bundle(
     }
 
 
+def can_export_policy_bundle(policy: torch.nn.Module) -> bool:
+    """Return whether the current policy can be exported as an observation-only bundle.
+
+    The bundle format used by this repo stores a TorchScript module whose public forward
+    method accepts only an observation tensor and returns ``(logits, values)``. That is the
+    right shape for the original feed-forward policy, but PufferLib's recurrent wrapper also
+    needs an explicit LSTM state. Tracing it with a fake zero state would make the saved best
+    policy look runnable while throwing away memory at every evaluation step, which is worse
+    than not exporting a bundle at all.
+
+    Returning ``False`` for recurrent policies keeps the best-checkpoint pointer useful: the
+    raw checkpoint path is still saved, and this branch can rebuild the matching LSTM policy
+    from that state dict for evaluations and future training runs.
+    """
+
+    return not hasattr(policy, "hidden_size")
+
+
 def register_best_checkpoint(
     *,
     logger,
@@ -3734,6 +4073,7 @@ def register_best_checkpoint(
         policy is not None
         and observation_shape is not None
         and bundle_metadata is not None
+        and can_export_policy_bundle(policy)
     ):
         bundle_result = export_best_policy_bundle(
             policy=policy,
@@ -4569,6 +4909,17 @@ def _build_run_summary(
             "map_scale_ladder": no_opponent_stage_scales,
             "stage_count": len(no_opponent_stage_scales),
         },
+        "self_play_curriculum_config": {
+            "map_scale_ladder": list(
+                parse_no_opponent_scale_ladder(str(args.self_play_map_scale_ladder))
+            ),
+            "spawn_difficulty_ladder": list(
+                parse_no_opponent_scale_ladder(
+                    str(args.self_play_spawn_difficulty_ladder)
+                )
+            ),
+            "full_progress": float(args.self_play_curriculum_full_progress),
+        },
         "vec_config": serialize_vec_config(vec_config),
         "eval_vec_config": None
         if eval_vec_config is None
@@ -4606,6 +4957,8 @@ def main():
     no_opponent_curriculum.validate()
     no_opponent_phase = NoOpponentPhaseConfig.from_args(args)
     no_opponent_phase.validate(int(args.ppo_iterations))
+    self_play_curriculum = SelfPlayCurriculumConfig.from_args(args)
+    self_play_curriculum.validate()
     no_opponent_game_length = resolve_no_opponent_game_length(
         int(args.no_opponent_eval_max_steps)
     )
@@ -4775,7 +5128,7 @@ def main():
             f"ent_coef={warm_start_train_config['ent_coef']:.6g}"
         )
 
-        current_policy = Policy(warm_start_vecenv).to(device)
+        current_policy = build_policy(warm_start_vecenv, args).to(device)
         warm_start_trainer = RegularizedPuffeRL(
             warm_start_train_config,
             warm_start_vecenv,
@@ -4996,7 +5349,7 @@ def main():
         )
 
         trainer_env: pufferlib.PufferEnv = vecenv
-        current_policy = Policy(vecenv).to(device)
+        current_policy = build_policy(vecenv, args).to(device)
         if self_play_initial_state is not None:
             current_policy.load_state_dict(self_play_initial_state, strict=True)
             print(
@@ -5042,7 +5395,10 @@ def main():
             f"total_timesteps={train_config['total_timesteps']}, "
             f"learning_rate={train_config['learning_rate']:.6g}, "
             f"update_epochs={train_config['update_epochs']}, "
-            f"ent_coef={train_config['ent_coef']:.6g}"
+            f"ent_coef={train_config['ent_coef']:.6g}, "
+            f"use_lstm={train_config['use_rnn']}, "
+            f"policy_hidden_size={int(args.policy_hidden_size)}, "
+            f"lstm_hidden_size={int(args.lstm_hidden_size)}"
         )
 
         trainer = RegularizedPuffeRL(
@@ -5054,6 +5410,26 @@ def main():
             past_kl_coef=args.past_kl_coef,
             uniform_kl_base_coef=args.uniform_kl_base_coef,
             uniform_kl_power=args.uniform_kl_power,
+        )
+        field_scale, spawn_difficulty, curriculum_progress = apply_self_play_curriculum(
+            vecenv,
+            self_play_curriculum,
+            epoch=0,
+            total_epochs=trainer.total_epochs,
+        )
+        map_scale_ladder_text = ",".join(
+            f"{value:.3f}" for value in self_play_curriculum.map_scale_stages
+        )
+        spawn_difficulty_ladder_text = ",".join(
+            f"{value:.3f}" for value in self_play_curriculum.spawn_difficulty_stages
+        )
+        print(
+            "Self-play curriculum: "
+            f"map_scale_ladder={map_scale_ladder_text}, "
+            f"spawn_difficulty_ladder={spawn_difficulty_ladder_text}, "
+            f"full_progress={self_play_curriculum.full_progress:.3f}, "
+            f"initial_map_scale={field_scale:.3f}, "
+            f"initial_spawn_difficulty={spawn_difficulty:.3f}"
         )
 
         if best_record is not None:
@@ -5152,6 +5528,12 @@ def main():
         while trainer.epoch < trainer.total_epochs:
             trainer.evaluate()
             trainer.train()
+            field_scale, spawn_difficulty, curriculum_progress = apply_self_play_curriculum(
+                vecenv,
+                self_play_curriculum,
+                epoch=trainer.epoch,
+                total_epochs=trainer.total_epochs,
+            )
             should_run_periodic_event = should_run_periodic_training_event(
                 trainer.epoch,
                 trainer.total_epochs,
@@ -5160,10 +5542,23 @@ def main():
             should_eval = should_run_periodic_event and (
                 args.past_iterate_eval or league_manager is not None
             )
+            if should_run_periodic_event and not should_eval and logger is not None:
+                logger.wandb.log(
+                    {
+                        "evaluation/progress_step": float(trainer.global_step),
+                        "curriculum/self_play/progress": float(curriculum_progress),
+                        "curriculum/self_play/field_scale": float(field_scale),
+                        "curriculum/self_play/spawn_difficulty": float(spawn_difficulty),
+                    },
+                    step=trainer.global_step,
+                )
             if should_eval and evaluator is not None:
                 eval_seed = args.seed + trainer.epoch * 10_000
                 log_payload = {
                     "evaluation/progress_step": float(trainer.global_step),
+                    "curriculum/self_play/progress": float(curriculum_progress),
+                    "curriculum/self_play/field_scale": float(field_scale),
+                    "curriculum/self_play/spawn_difficulty": float(spawn_difficulty),
                 }
                 if args.past_iterate_eval:
                     eval_metrics = evaluate_against_past_iterate(
@@ -5743,7 +6138,7 @@ def save_match_video(
     policy_device = next(current_policy.parameters()).device
     opponent_policy = None
     if opponent_state_dict is not None:
-        opponent_policy = Policy(env).to(policy_device)
+        opponent_policy = build_policy_for_state(env, opponent_state_dict).to(policy_device)
         opponent_policy.load_state_dict(opponent_state_dict, strict=True)
         opponent_policy.eval()
     elif opponent_policy_runner is not None:
@@ -5753,6 +6148,10 @@ def save_match_video(
 
     was_training = current_policy.training
     current_policy.eval()
+    current_state = initial_recurrent_eval_state(current_policy)
+    opponent_state = (
+        None if opponent_policy is None else initial_recurrent_eval_state(opponent_policy)
+    )
     with torch.no_grad():
         for _ in range(args.video_max_steps):
             frame = env.render()
@@ -5761,7 +6160,7 @@ def save_match_video(
 
             obs_tensor = torch.from_numpy(obs).to(policy_device)
             if opponent_policy is None:
-                logits, _ = forward_policy_eval(current_policy, obs_tensor)
+                logits, _ = forward_policy_eval(current_policy, obs_tensor, current_state)
                 actions = (
                     torch.argmax(logits, dim=-1)
                     .cpu()
@@ -5770,8 +6169,12 @@ def save_match_video(
                 )
             else:
                 split = args.players_per_team
-                current_logits, _ = forward_policy_eval(current_policy, obs_tensor[:split])
-                opponent_logits, _ = forward_policy_eval(opponent_policy, obs_tensor[split:])
+                current_logits, _ = forward_policy_eval(
+                    current_policy, obs_tensor[:split], current_state
+                )
+                opponent_logits, _ = forward_policy_eval(
+                    opponent_policy, obs_tensor[split:], opponent_state
+                )
                 current_actions = (
                     torch.argmax(current_logits, dim=-1)
                     .cpu()

@@ -120,6 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
         ],
     )
     parser.add_argument("--total-timesteps", type=int, default=30_000_000)
+    parser.add_argument("--policy-hidden-size", type=int, default=512)
+    parser.add_argument("--policy-encoder-size", type=int, default=512)
+    parser.add_argument("--lstm-hidden-size", type=int, default=512)
     parser.add_argument("--final-eval-games", type=int, default=128)
     parser.add_argument("--max-runs", type=int, default=8)
     parser.add_argument("--confirm-candidates", type=int, default=3)
@@ -137,21 +140,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--save-runtime-config",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--cached-warm-start-path",
-        type=str,
-        default=None,
-    )
-    parser.add_argument(
-        "--reuse-cached-warm-start",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--save-cached-warm-start",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
@@ -511,6 +499,15 @@ def build_trial_command(
         str(float(train["prio_alpha"])),
         "--prio-beta0",
         str(float(train["prio_beta0"])),
+        "--use-lstm",
+        "--policy-hidden-size",
+        str(args.policy_hidden_size),
+        "--policy-encoder-size",
+        str(args.policy_encoder_size),
+        "--lstm-hidden-size",
+        str(args.lstm_hidden_size),
+        "--no-opponent-phase-max-iterations",
+        "0",
         "--past-kl-coef",
         str(float(regularization["past_kl_coef"])),
         "--uniform-kl-base-coef",
@@ -526,23 +523,12 @@ def build_trial_command(
         str(10**9),
         "--no-past-iterate-eval",
         "--no-export-videos",
-        "--no-wandb",
+        "--wandb",
+        "--wandb-group",
+        "no-warmstart-best-checkpoint-tuning",
         "--run-summary-path",
         str(summary_path),
     ]
-    if args.cached_warm_start_path is not None:
-        command.extend(
-            [
-                "--cached-warm-start-path",
-                str(args.cached_warm_start_path),
-                "--reuse-cached-warm-start"
-                if args.reuse_cached_warm_start
-                else "--no-reuse-cached-warm-start",
-                "--save-cached-warm-start"
-                if args.save_cached_warm_start
-                else "--no-save-cached-warm-start",
-            ]
-        )
     command.extend(render_vec_cli_args(vec_config))
     return command
 

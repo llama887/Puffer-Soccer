@@ -71,11 +71,11 @@ def test_build_trial_command_freezes_runtime_and_best_checkpoint_target(tmp_path
         rl_alg=TRAIN_MODULE.RL_ALG_LEAGUE,
         kl_regularization_mode=TRAIN_MODULE.KL_REGULARIZATION_OFF,
         total_timesteps=30_000_000,
+        policy_hidden_size=512,
+        policy_encoder_size=512,
+        lstm_hidden_size=512,
         final_eval_games=128,
         best_checkpoint_config_path="experiments/best_checkpoint.json",
-        cached_warm_start_path="experiments/cached_warm_start_policy.pt",
-        reuse_cached_warm_start=True,
-        save_cached_warm_start=True,
         total_agents=320,
     )
     command = TUNE_MODULE.build_trial_command(
@@ -115,17 +115,15 @@ def test_build_trial_command_freezes_runtime_and_best_checkpoint_target(tmp_path
     )
 
     assert "--fixed-best-checkpoint" in command
-    assert "--no-wandb" in command
+    assert "--wandb" in command
     assert "--no-export-videos" in command
+    assert "--use-lstm" in command
+    assert "--no-opponent-phase-max-iterations" in command
     assert "--vec-backend" in command
     assert command[command.index("--num-envs") + 1] == "32"
     assert command[command.index("--rl-alg") + 1] == "league"
     assert command[command.index("--kl-regularization-mode") + 1] == "off"
-    assert command[command.index("--cached-warm-start-path") + 1] == (
-        "experiments/cached_warm_start_policy.pt"
-    )
-    assert "--reuse-cached-warm-start" in command
-    assert "--save-cached-warm-start" in command
+    assert "--cached-warm-start-path" not in command
 
 
 def test_resolve_runtime_vec_config_reuses_cached_runtime_file(tmp_path):

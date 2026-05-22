@@ -1,0 +1,14 @@
+{
+  "autotune_result": null,
+  "resolved_device": "cuda",
+  "total_agents": 640,
+  "vec_config": {
+    "backend": "native",
+    "batch_size": null,
+    "num_shards": 1,
+    "num_workers": null,
+    "overwork": false,
+    "shard_num_envs": 64,
+    "zero_copy": true
+  }
+}

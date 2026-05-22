@@ -1,0 +1,26 @@
+{
+  "archived_bundle_dir": "experiments/baselines/archive/best-checkpoint-61xajhha-epoch-049520",
+  "checkpoint_state_path": "checkpoint_state.pt",
+  "created_at": "2026-05-21T14:19:52Z",
+  "epoch": 49520,
+  "event": "plotted_checkpoint_backfill",
+  "git_commit": "eb9cadef2676ed62f0ac7368286f924d40b7a2e8",
+  "global_step": 4056678400,
+  "manual_registration": true,
+  "manual_registration_args": {
+    "device": "cuda",
+    "players_per_team": 5,
+    "vec_backend": "native",
+    "vec_batch_size": null,
+    "vec_num_shards": 1,
+    "vec_num_workers": null,
+    "vec_shard_num_envs": 64
+  },
+  "model_format": "torchscript",
+  "original_checkpoint_path": "experiments/61xajhha/model_049520.pt",
+  "policy_module_path": "policy_module.pt",
+  "previous_best_artifact_ref": null,
+  "run_id": "61xajhha",
+  "schema_version": 1,
+  "source_snapshot_path": "source_snapshot/policy_runner.py"
+}

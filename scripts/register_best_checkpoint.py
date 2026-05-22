@@ -144,8 +144,8 @@ def register_existing_checkpoint(args: argparse.Namespace) -> dict[str, object]:
         opponents_enabled=True,
         vec=vec_config,
     )
-    policy = train_pufferl.Policy(vecenv).to(device)
     checkpoint_state = train_pufferl.load_checkpoint_state_dict(checkpoint_path)
+    policy = train_pufferl.build_policy_for_state(vecenv, checkpoint_state).to(device)
     policy.load_state_dict(checkpoint_state, strict=True)
     bundle_metadata = build_bundle_metadata(
         args=args,

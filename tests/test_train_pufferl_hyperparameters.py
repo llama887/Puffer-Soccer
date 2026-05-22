@@ -412,7 +412,10 @@ def test_run_no_opponent_rollouts_uses_resolved_no_opponent_game_length(
             return None
 
         def forward_eval(self, obs):
-            return train_pufferl.torch.zeros((obs.shape[0], 9)), None
+            return (
+                train_pufferl.torch.zeros((obs.shape[0], 9)),
+                train_pufferl.torch.zeros((obs.shape[0], 1)),
+            )
 
     def fake_make_soccer_vecenv(**kwargs):
         observed["game_length"] = int(kwargs["game_length"])

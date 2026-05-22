@@ -128,10 +128,7 @@ uv run python -u scripts/tune_best_checkpoint_rl.py \
     --method "$TUNE_METHOD" \
     --output-dir "$OUTPUT_DIR" \
     --runtime-config-path "$TUNE_RUNTIME_CONFIG_PATH" \
-    --cached-warm-start-path "$TUNE_CACHED_WARM_START_PATH" \
     --reuse-runtime-config \
     --save-runtime-config \
-    --reuse-cached-warm-start \
-    --save-cached-warm-start \
     $TUNE_EXTRA_ARGS
 '

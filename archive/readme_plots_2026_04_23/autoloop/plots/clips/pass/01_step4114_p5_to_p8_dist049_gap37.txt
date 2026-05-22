@@ -1,0 +1,8 @@
+behavior=long_pass
+kicker=5
+receiver=8
+distance=49.08
+gap_steps=37
+start_step=4114
+end_step=4151
+fps=20

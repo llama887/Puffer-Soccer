@@ -1,0 +1,30 @@
+{
+  "artifact_name": "best-checkpoint-61xajhha-epoch-049520",
+  "artifact_ref": "robot-soccer/best-checkpoint-61xajhha-epoch-049520:best",
+  "bundle_dir": "experiments/baselines/current_best",
+  "bundle_manifest_path": "experiments/baselines/current_best/manifest.json",
+  "bundle_policy_module_path": "experiments/baselines/current_best/policy_module.pt",
+  "bundle_schema_version": 1,
+  "cached_checkpoint_path": "experiments/61xajhha/model_049520.pt",
+  "created_at": "2026-05-21T14:19:52Z",
+  "epoch": 49520,
+  "event": "plotted_checkpoint_backfill",
+  "global_step": 4056678400,
+  "previous_best_artifact_ref": null,
+  "promotion_batches": null,
+  "promotion_confidence": null,
+  "promotion_games": null,
+  "promotion_score_diff_vs_previous_best": null,
+  "promotion_win_rate_lcb": null,
+  "promotion_win_rate_vs_previous_best": null,
+  "run_id": "61xajhha",
+  "vec_config": {
+    "backend": "native",
+    "batch_size": null,
+    "num_shards": 1,
+    "num_workers": null,
+    "overwork": false,
+    "shard_num_envs": 64,
+    "zero_copy": true
+  }
+}

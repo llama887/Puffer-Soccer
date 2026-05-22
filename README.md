@@ -1,16 +1,45 @@
-# Puffer Soccer — Thesis Defense Reproduction
+# Puffer Soccer
 
-This branch (`gallant-plotting-backup-2026-04-23`) is the snapshot used for
-**Franklin Yiu's master's thesis defense (2026-04-23)**.
+Native C-backed MARL 2D soccer environment for PufferLib.
 
-It contains, force-added under the otherwise-gitignored `experiments/`:
+## Current Best Agent
+
+The current best checked-in policy is the no-warmstart LSTM curriculum agent:
+
+- Policy checkpoint: [`experiments/t5f7yhut.pt`](experiments/t5f7yhut.pt)
+- Run id: `t5f7yhut`
+- Training length: `999,997,440` agent steps
+- Final built-in evaluation against the previous best: `0.750` win rate,
+  `+0.750` mean score difference over 64 games
+- Fresh side-balanced comparison against the previous README-plot best:
+  `0.767` win rate, `+0.755` mean score difference over 1,024 games
+
+The previous best used for this comparison is preserved as a policy bundle at
+[`experiments/baselines/current_best`](experiments/baselines/current_best).
+It was exported from run `61xajhha`, epoch `049520`, the checkpoint that
+generated the old README plots.
+
+Current policy videos:
+
+- [`experiments/2026-05-21_12-50-10_t5f7yhut/video/self_play.mp4`](experiments/2026-05-21_12-50-10_t5f7yhut/video/self_play.mp4)
+- [`experiments/2026-05-21_12-50-10_t5f7yhut/video/best_checkpoint.mp4`](experiments/2026-05-21_12-50-10_t5f7yhut/video/best_checkpoint.mp4)
+- [`experiments/2026-05-21_12-50-10_t5f7yhut/video/evals/epoch_024414/vs_best_checkpoint.mp4`](experiments/2026-05-21_12-50-10_t5f7yhut/video/evals/epoch_024414/vs_best_checkpoint.mp4)
+
+## Archived README Plot Agent
+
+The old README plots and videos are archived under
+[`archive/readme_plots_2026_04_23`](archive/readme_plots_2026_04_23). This
+archive keeps the older checkpoint sequence, generated plots, cached traces,
+curated clips, and settings figures separate from the active training outputs.
+
+It contains:
 
 - The slide deck (`docs/thesis_defense_2026-04-23.pdf`)
 - Every plot shown in the slides, with the script and data cache that
   produced it
-- The trained policy (`experiments/61xajhha/model_049520.pt`), the warmstart
-  cache (`experiments/cached_warm_start.pt`), and all 248 stride-200
-  intermediate checkpoints
+- The trained policy
+  (`archive/readme_plots_2026_04_23/61xajhha/model_049520.pt`) and all 248
+  stride-200 intermediate checkpoints
 - The final-checkpoint trace (input to the occupancy / clip-extraction
   scripts) and the 50 emergence-stats JSONs (input to every emergence plot)
 - The two policy videos shown in slide 12 and the warmstart video shown in
@@ -18,7 +47,7 @@ It contains, force-added under the otherwise-gitignored `experiments/`:
 - The value-trajectory videos and the curated dribble / pass / goalie /
   defender / forward clips shown in slides 16–20 and 24
 
-The run id is `61xajhha` (Slurm job `6856525`): 50,000 self-play epochs
+The archived run id is `61xajhha` (Slurm job `6856525`): 50,000 self-play epochs
 with the gallant regularized-RL update (PPO + KL-to-past + KL-to-uniform),
 loaded from the no-opponent curriculum warmstart `y3id1i7o` (job `6849509`).
 
@@ -35,129 +64,129 @@ missing from this list, it is missing from the repo — please flag it.
 ### Slide 10 — Pure MMD doesn't work; warmstart curriculum
 
 Warmstart-policy self-play (no opponent):
-[`experiments/y3id1i7o/video/self_play_no_opponent.mp4`](experiments/y3id1i7o/video/self_play_no_opponent.mp4).
+[`archive/readme_plots_2026_04_23/y3id1i7o/video/self_play_no_opponent.mp4`](archive/readme_plots_2026_04_23/y3id1i7o/video/self_play_no_opponent.mp4).
 
 ### Slide 12 — Policy Video
 
 Final-policy self-play and best-checkpoint videos:
 
-- [`experiments/61xajhha/video/self_play.mp4`](experiments/61xajhha/video/self_play.mp4)
-- [`experiments/61xajhha/video/best_checkpoint.mp4`](experiments/61xajhha/video/best_checkpoint.mp4)
+- [`archive/readme_plots_2026_04_23/61xajhha/video/self_play.mp4`](archive/readme_plots_2026_04_23/61xajhha/video/self_play.mp4)
+- [`archive/readme_plots_2026_04_23/61xajhha/video/best_checkpoint.mp4`](archive/readme_plots_2026_04_23/61xajhha/video/best_checkpoint.mp4)
 
 ### Slide 14 — Ball Touches
 
-![ball touches per game](experiments/autoloop/plots/emergence/num_touches.png)
+![ball touches per game](archive/readme_plots_2026_04_23/autoloop/plots/emergence/num_touches.png)
 
 Script: `scripts/plot_emergence_individual.py` reading
-`experiments/teamplay_trace/61xajhha/stats/`.
+`archive/readme_plots_2026_04_23/teamplay_trace/61xajhha/stats/`.
 
 ### Slide 15 — Field Coverage (ball x-position entropy)
 
-![ball x entropy](experiments/autoloop/plots/emergence/ball_x_entropy.png)
+![ball x entropy](archive/readme_plots_2026_04_23/autoloop/plots/emergence/ball_x_entropy.png)
 
 Script: `scripts/plot_emergence_individual.py`.
 
 ### Slide 16 — Dribbling
 
-![dribbles per game](experiments/autoloop/plots/emergence/n_dribbles.png)
+![dribbles per game](archive/readme_plots_2026_04_23/autoloop/plots/emergence/n_dribbles.png)
 
 Script: `scripts/plot_emergence_individual.py`.
 
 Curated dribble clips (`scripts/extract_dribble_pass_clips.py`,
 input: final-checkpoint trace at
-`experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz`):
-[`experiments/autoloop/plots/clips/dribble/`](experiments/autoloop/plots/clips/dribble/) — 4 clips with `.txt` captions.
+`archive/readme_plots_2026_04_23/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz`):
+[`archive/readme_plots_2026_04_23/autoloop/plots/clips/dribble/`](archive/readme_plots_2026_04_23/autoloop/plots/clips/dribble/) — 4 clips with `.txt` captions.
 
 ### Slide 17 — Passing
 
-![passes per game](experiments/autoloop/plots/emergence/n_passes.png)
+![passes per game](archive/readme_plots_2026_04_23/autoloop/plots/emergence/n_passes.png)
 
 Script: `scripts/plot_emergence_individual.py`.
 
 Curated pass clips (`scripts/extract_dribble_pass_clips.py`):
-[`experiments/autoloop/plots/clips/pass/`](experiments/autoloop/plots/clips/pass/) — 3 clips with `.txt` captions.
+[`archive/readme_plots_2026_04_23/autoloop/plots/clips/pass/`](archive/readme_plots_2026_04_23/autoloop/plots/clips/pass/) — 3 clips with `.txt` captions.
 
 ### Slide 18 — Goalie
 
-![goalie rotations per game](experiments/autoloop/plots/emergence/goalie_rotations.png)
+![goalie rotations per game](archive/readme_plots_2026_04_23/autoloop/plots/emergence/goalie_rotations.png)
 
-![% time a goalie on the baseline](experiments/autoloop/plots/emergence/goalie_frac.png)
+![% time a goalie on the baseline](archive/readme_plots_2026_04_23/autoloop/plots/emergence/goalie_frac.png)
 
 Script: `scripts/plot_emergence_individual.py`.
 
 Goalie-rotation clips (`scripts/extract_goalie_transition_clips.py`):
-[`experiments/autoloop/plots/clips/goalie_transition/`](experiments/autoloop/plots/clips/goalie_transition/) — 4 clips, with team / handoff
+[`archive/readme_plots_2026_04_23/autoloop/plots/clips/goalie_transition/`](archive/readme_plots_2026_04_23/autoloop/plots/clips/goalie_transition/) — 4 clips, with team / handoff
 agents / possession / forward-extent encoded in the filenames.
 
 ### Slide 19 — Defensive Players
 
-![mean # defenders back while attacking](experiments/autoloop/plots/emergence/cond_n_defenders_while_attacking.png)
+![mean # defenders back while attacking](archive/readme_plots_2026_04_23/autoloop/plots/emergence/cond_n_defenders_while_attacking.png)
 
-![% time team keeps a defender back while attacking](experiments/autoloop/plots/emergence/def_while_off_frac.png)
+![% time team keeps a defender back while attacking](archive/readme_plots_2026_04_23/autoloop/plots/emergence/def_while_off_frac.png)
 
 Script: `scripts/plot_emergence_individual.py`.
 
 Defender-vs-offense behavior clips (`scripts/extract_behavior_clips.py`):
-[`experiments/autoloop/plots/clips/def_vs_off/`](experiments/autoloop/plots/clips/def_vs_off/) — 4 clips with `.txt` captions.
+[`archive/readme_plots_2026_04_23/autoloop/plots/clips/def_vs_off/`](archive/readme_plots_2026_04_23/autoloop/plots/clips/def_vs_off/) — 4 clips with `.txt` captions.
 
 ### Slide 20 — Offensive Players
 
-![% time team leaves a striker forward while defending](experiments/autoloop/plots/emergence/off_while_def_frac.png)
+![% time team leaves a striker forward while defending](archive/readme_plots_2026_04_23/autoloop/plots/emergence/off_while_def_frac.png)
 
-![mean # forwards forward while defending](experiments/autoloop/plots/emergence/cond_n_forwards_while_defending.png)
+![mean # forwards forward while defending](archive/readme_plots_2026_04_23/autoloop/plots/emergence/cond_n_forwards_while_defending.png)
 
 Script: `scripts/plot_emergence_individual.py`.
 
 Forward-vs-defense behavior clips (`scripts/extract_behavior_clips.py`):
-[`experiments/autoloop/plots/clips/fwd_vs_def/`](experiments/autoloop/plots/clips/fwd_vs_def/) — 4 clips with `.txt` captions.
+[`archive/readme_plots_2026_04_23/autoloop/plots/clips/fwd_vs_def/`](archive/readme_plots_2026_04_23/autoloop/plots/clips/fwd_vs_def/) — 4 clips with `.txt` captions.
 
 ### Slide 21 — Bias Towards Defense (per-team occupancy heatmaps)
 
 | blue team (attacks +x) | red team (attacks −x) |
 |---|---|
-| ![blue occupancy log](experiments/autoloop/plots/occupancy/occupancy_blue_ep049200_log.png) | ![red occupancy log](experiments/autoloop/plots/occupancy/occupancy_red_ep049200_log.png) |
+| ![blue occupancy log](archive/readme_plots_2026_04_23/autoloop/plots/occupancy/occupancy_blue_ep049200_log.png) | ![red occupancy log](archive/readme_plots_2026_04_23/autoloop/plots/occupancy/occupancy_red_ep049200_log.png) |
 
 Script: `scripts/plot_occupancy_heatmaps.py` reading
-`experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz`.
+`archive/readme_plots_2026_04_23/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz`.
 
 ### Slide 22 — Agents tend to play along the sides (ball occupancy)
 
-![ball occupancy linear](experiments/autoloop/plots/occupancy/occupancy_ball_ep049200_linear.png)
+![ball occupancy linear](archive/readme_plots_2026_04_23/autoloop/plots/occupancy/occupancy_ball_ep049200_linear.png)
 
 Script: `scripts/plot_occupancy_heatmaps.py`.
 
 ### Slide 24 — Critic's value rises as the scoring team approaches the goal
 
-![value along trajectory](experiments/autoloop/value_trajectory/value_along_trajectory.png)
+![value along trajectory](archive/readme_plots_2026_04_23/autoloop/value_trajectory/value_along_trajectory.png)
 
 Script: `scripts/value_along_trajectory.py`. Cached data:
-[`experiments/autoloop/value_trajectory/trajectories.npz`](experiments/autoloop/value_trajectory/trajectories.npz),
-[`experiments/autoloop/value_trajectory/trajectory_summary.json`](experiments/autoloop/value_trajectory/trajectory_summary.json).
+[`archive/readme_plots_2026_04_23/autoloop/value_trajectory/trajectories.npz`](archive/readme_plots_2026_04_23/autoloop/value_trajectory/trajectories.npz),
+[`archive/readme_plots_2026_04_23/autoloop/value_trajectory/trajectory_summary.json`](archive/readme_plots_2026_04_23/autoloop/value_trajectory/trajectory_summary.json).
 The 10 example single-goal trajectories (5 blue, 5 red) are rendered to
-mp4 in [`experiments/autoloop/value_trajectory/videos/`](experiments/autoloop/value_trajectory/videos/).
+mp4 in [`archive/readme_plots_2026_04_23/autoloop/value_trajectory/videos/`](archive/readme_plots_2026_04_23/autoloop/value_trajectory/videos/).
 
 ### Slide 25 — V(carrier) under varied formations
 
-![formation value heatmap](experiments/autoloop/formation/formation_value_heatmap.png)
+![formation value heatmap](archive/readme_plots_2026_04_23/autoloop/formation/formation_value_heatmap.png)
 
 Script: `scripts/formation_value_heatmap.py`. Cached data:
-[`experiments/autoloop/formation/formation_v.npy`](experiments/autoloop/formation/formation_v.npy).
+[`archive/readme_plots_2026_04_23/autoloop/formation/formation_v.npy`](archive/readme_plots_2026_04_23/autoloop/formation/formation_v.npy).
 
 ### Slide 26 — Goalie ΔV across blue/red line positions
 
-![formation value goalie delta](experiments/autoloop/formation/formation_value_goalie_delta.png)
+![formation value goalie delta](archive/readme_plots_2026_04_23/autoloop/formation/formation_value_goalie_delta.png)
 
 Script: `scripts/formation_value_goalie_delta.py`. Cached data:
-[`experiments/autoloop/formation/formation_v.npy`](experiments/autoloop/formation/formation_v.npy),
-[`experiments/autoloop/formation/formation_v_no_goalie.npy`](experiments/autoloop/formation/formation_v_no_goalie.npy).
+[`archive/readme_plots_2026_04_23/autoloop/formation/formation_v.npy`](archive/readme_plots_2026_04_23/autoloop/formation/formation_v.npy),
+[`archive/readme_plots_2026_04_23/autoloop/formation/formation_v_no_goalie.npy`](archive/readme_plots_2026_04_23/autoloop/formation/formation_v_no_goalie.npy).
 
 ### Slide 27 — Goalie value in a realistic mid-attack state
 
-![goalie save region](experiments/autoloop/formation/goalie_save_region.png)
+![goalie save region](archive/readme_plots_2026_04_23/autoloop/formation/goalie_save_region.png)
 
 Script: `scripts/goalie_save_region.py`. Cached data:
-[`experiments/autoloop/formation/goalie_save_region_v_no.npy`](experiments/autoloop/formation/goalie_save_region_v_no.npy),
-[`experiments/autoloop/formation/goalie_save_region_v_with.npy`](experiments/autoloop/formation/goalie_save_region_v_with.npy).
+[`archive/readme_plots_2026_04_23/autoloop/formation/goalie_save_region_v_no.npy`](archive/readme_plots_2026_04_23/autoloop/formation/goalie_save_region_v_no.npy),
+[`archive/readme_plots_2026_04_23/autoloop/formation/goalie_save_region_v_with.npy`](archive/readme_plots_2026_04_23/autoloop/formation/goalie_save_region_v_with.npy).
 
 ---
 
@@ -174,10 +203,10 @@ final-checkpoint trace.
 Annotated 100×70 field with goal regions (`|y| ≤ 20`), midline, and one
 example 5v5 reset showing player positions and headings.
 
-![field schematic](experiments/setting/field_schematic.png)
+![field schematic](archive/readme_plots_2026_04_23/setting/field_schematic.png)
 
 Script: `scripts/plot_setting_field.py`. Snapshot of the rendered state
-saved at `experiments/setting/field_schematic_state.npz` so the figure
+saved at `archive/readme_plots_2026_04_23/setting/field_schematic_state.npz` so the figure
 can be regenerated without re-running the env.
 
 ### Kick-strength → ball trajectory
@@ -187,10 +216,10 @@ env's impulse + 0.85-decay + 5.0-clip rule. Constants (`leg_speed=4.0`,
 `BALL_VELOCITY_DECAY=0.85`, `MAX_BALL_SPEED=5.0`, the 8 kick scales)
 match `binding.c` at this commit.
 
-![kick strengths](experiments/setting/kick_strengths.png)
+![kick strengths](archive/readme_plots_2026_04_23/setting/kick_strengths.png)
 
 Script: `scripts/plot_setting_kick_strengths.py`. Cached data at
-`experiments/setting/kick_strengths_data.npz`.
+`archive/readme_plots_2026_04_23/setting/kick_strengths_data.npz`.
 
 ### Field-of-view overlay (partial observability)
 
@@ -200,87 +229,83 @@ Solid agents are visible to the observer; hollow/dashed agents lie
 outside the FOV and have their feature blocks zero-masked in the
 observation.
 
-![FOV overlay](experiments/setting/fov_overlay.png)
+![FOV overlay](archive/readme_plots_2026_04_23/setting/fov_overlay.png)
 
 Script: `scripts/plot_setting_fov.py`. Input:
-`experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz`.
+`archive/readme_plots_2026_04_23/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz`.
 
 ## Reproducing the plots
 
 `uv sync --extra dev` and the env at this commit. The trained policy is
-`experiments/61xajhha/model_049520.pt`; the warmstart is
+`archive/readme_plots_2026_04_23/61xajhha/model_049520.pt`; the warmstart is
 `experiments/cached_warm_start.pt`.
 
 ```bash
 # Emergence stats — slow, walks every checkpoint and writes stats + traces
 uv run python scripts/teamplay_trace.py \
-  --checkpoint-dir experiments/61xajhha \
-  --output-dir experiments/teamplay_trace/61xajhha \
+  --checkpoint-dir archive/readme_plots_2026_04_23/61xajhha \
+  --output-dir archive/readme_plots_2026_04_23/teamplay_trace/61xajhha \
   --stride 5 \
-  --traces-dir experiments/teamplay_trace/61xajhha/traces \
+  --traces-dir archive/readme_plots_2026_04_23/teamplay_trace/61xajhha/traces \
   --traces-keep-last-only
 
 # Per-metric emergence panels (slides 14, 15, 16, 17, 18, 19, 20)
 uv run python scripts/plot_emergence_individual.py \
-  --input-dir experiments/teamplay_trace/61xajhha/stats \
-  --output-dir experiments/autoloop/plots/emergence
+  --input-dir archive/readme_plots_2026_04_23/teamplay_trace/61xajhha/stats \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/plots/emergence
 
 # Occupancy heatmaps (slides 21, 22)
 uv run python scripts/plot_occupancy_heatmaps.py \
-  --traces experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz \
-  --output-dir experiments/autoloop/plots/occupancy
+  --traces archive/readme_plots_2026_04_23/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/plots/occupancy
 
 # Value along trajectory (slide 24)
 uv run python scripts/value_along_trajectory.py \
-  --checkpoint experiments/61xajhha/model_049520.pt \
-  --output-dir experiments/autoloop/value_trajectory
+  --checkpoint archive/readme_plots_2026_04_23/61xajhha/model_049520.pt \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/value_trajectory
 
 # Formation value heatmap (slide 25) — also writes formation_v.npy that
 # the goalie-delta script consumes as --v-with-goalie
 uv run python scripts/formation_value_heatmap.py \
-  --checkpoint experiments/61xajhha/model_049520.pt \
-  --output-dir experiments/autoloop/formation
+  --checkpoint archive/readme_plots_2026_04_23/61xajhha/model_049520.pt \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/formation
 
 # Formation goalie delta (slide 26) — needs the formation_v.npy from the
 # previous step
 uv run python scripts/formation_value_goalie_delta.py \
-  --checkpoint experiments/61xajhha/model_049520.pt \
-  --v-with-goalie experiments/autoloop/formation/formation_v.npy \
-  --output-dir experiments/autoloop/formation
+  --checkpoint archive/readme_plots_2026_04_23/61xajhha/model_049520.pt \
+  --v-with-goalie archive/readme_plots_2026_04_23/autoloop/formation/formation_v.npy \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/formation
 
 # Goalie save region (slide 27)
 uv run python scripts/goalie_save_region.py \
-  --checkpoint experiments/61xajhha/model_049520.pt \
-  --output-dir experiments/autoloop/formation
+  --checkpoint archive/readme_plots_2026_04_23/61xajhha/model_049520.pt \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/formation
 
 # Settings figures (no policy required, except FOV uses one trace frame)
 uv run python scripts/plot_setting_field.py \
-  --output-dir experiments/setting
+  --output-dir archive/readme_plots_2026_04_23/setting
 uv run python scripts/plot_setting_kick_strengths.py \
-  --output-dir experiments/setting
+  --output-dir archive/readme_plots_2026_04_23/setting
 uv run python scripts/plot_setting_fov.py \
-  --trace experiments/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz \
-  --output-dir experiments/setting --frame 200 --observer 2
+  --trace archive/readme_plots_2026_04_23/teamplay_trace/61xajhha/traces/trace_epoch_049200.npz \
+  --output-dir archive/readme_plots_2026_04_23/setting --frame 200 --observer 2
 
 # Behavior clips (slides 16, 17, 18, 19, 20) — each runs its own short
 # self-play rollout from the final checkpoint and writes mp4 + .txt clip
 # files into a behavior-typed subdir under --output-dir
 uv run python scripts/extract_dribble_pass_clips.py \
-  --checkpoint experiments/61xajhha/model_049520.pt \
-  --output-dir experiments/autoloop/plots/clips
+  --checkpoint archive/readme_plots_2026_04_23/61xajhha/model_049520.pt \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/plots/clips
 uv run python scripts/extract_goalie_transition_clips.py \
-  --checkpoint experiments/61xajhha/model_049520.pt \
-  --output-dir experiments/autoloop/plots/clips
+  --checkpoint archive/readme_plots_2026_04_23/61xajhha/model_049520.pt \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/plots/clips
 uv run python scripts/extract_behavior_clips.py \
-  --checkpoint experiments/61xajhha/model_049520.pt \
-  --output-dir experiments/autoloop/plots/clips
+  --checkpoint archive/readme_plots_2026_04_23/61xajhha/model_049520.pt \
+  --output-dir archive/readme_plots_2026_04_23/autoloop/plots/clips
 ```
 
 ---
-
-# Puffer Soccer
-
-Native C-backed MARL 2D soccer environment for PufferLib.
 
 ## Install
 

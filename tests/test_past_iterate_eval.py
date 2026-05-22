@@ -966,6 +966,12 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
         num_agents = 2
         single_observation_space = SimpleNamespace(shape=(4,))
 
+        def set_field_scale(self, _scale: float) -> None:
+            return None
+
+        def set_spawn_difficulty(self, _difficulty: float) -> None:
+            return None
+
     class FakeTrainer:
         """Tiny trainer stub that advances epochs and global steps deterministically."""
 
@@ -1044,6 +1050,7 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
             "max_grad_norm": 1.5,
             "prio_alpha": 0.8,
             "prio_beta0": 0.2,
+            "use_rnn": False,
         }
 
     def fake_eval_against_past_iterate(policy, previous_state_dict, **_kwargs):
@@ -1114,7 +1121,7 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
             _args, _vecenv, _device
         ),
     ), patch.object(
-        train_pufferl, "Policy", return_value=fake_policy
+        train_pufferl, "build_policy", return_value=fake_policy
     ), patch.object(
         train_pufferl.pufferl, "WandbLogger", return_value=logger
     ), patch.object(
@@ -1263,6 +1270,12 @@ def test_main_does_not_promote_mid_run_before_final_check(tmp_path):
         def state_dict(self):
             return {"weight": torch.tensor([float(self.version)])}
 
+        def load_state_dict(self, _state_dict, strict=True):
+            return None
+
+        def forward_eval(self, obs):
+            return torch.zeros((obs.shape[0], 13)), torch.zeros((obs.shape[0], 1))
+
         def train(self):
             self.training = True
             return self
@@ -1274,6 +1287,12 @@ def test_main_does_not_promote_mid_run_before_final_check(tmp_path):
     class FakeVecEnv:
         num_agents = 2
         single_observation_space = SimpleNamespace(shape=(4,))
+
+        def set_field_scale(self, _scale: float) -> None:
+            return None
+
+        def set_spawn_difficulty(self, _difficulty: float) -> None:
+            return None
 
     class FakeTrainer:
         def __init__(self, _config, _vecenv, policy, **_kwargs):
@@ -1345,9 +1364,12 @@ def test_main_does_not_promote_mid_run_before_final_check(tmp_path):
             "max_grad_norm": 1.5,
             "prio_alpha": 0.8,
             "prio_beta0": 0.2,
+            "use_rnn": False,
         },
     ), patch.object(
-        train_pufferl, "Policy", return_value=fake_policy
+        train_pufferl, "build_policy", return_value=fake_policy
+    ), patch.object(
+        train_pufferl.pufferl, "WandbLogger", return_value=DummyLogger()
     ), patch.object(
         train_pufferl, "RegularizedPuffeRL", side_effect=FakeTrainer
     ), patch.object(
@@ -1373,15 +1395,16 @@ def test_main_does_not_promote_mid_run_before_final_check(tmp_path):
         with patch.object(
             sys,
             "argv",
-            [
-                "train_pufferl.py",
-                "--no-opponent-phase-max-iterations",
-                "0",
-                "--final-best-eval-games",
-                "16",
-                "--no-wandb",
-            ],
-        ):
+                [
+                    "train_pufferl.py",
+                    "--no-opponent-phase-max-iterations",
+                    "0",
+                    "--final-best-eval-games",
+                    "16",
+                    "--no-export-videos",
+                    "--wandb",
+                ],
+            ):
             train_pufferl.main()
 
     assert len(register_calls) == 1

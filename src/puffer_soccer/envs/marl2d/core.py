@@ -204,6 +204,7 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         self.num_players = players_per_team * 2
         self.num_envs = 1
         self.num_agents = self.num_players
+        self.agents_per_batch = self.num_agents
         self.game_length = game_length
         self.log_interval = log_interval
 
@@ -299,6 +300,19 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
 
         binding.env_set_field_scale(self._handle, float(scale))
 
+    def set_spawn_difficulty(self, difficulty: float) -> None:
+        """Set how broad future episode resets should be in the spawn curriculum.
+
+        A difficulty of ``0`` creates set-piece-like starts where the ball is near one
+        goal and every active player begins close enough to contest it. A difficulty of
+        ``1`` restores the original broad reset distribution. This knob is intentionally
+        separate from ``set_field_scale`` because map size and reset distribution answer
+        different curriculum questions: how much space exists, and where the first tactical
+        problem begins inside that space.
+        """
+
+        binding.env_set_spawn_difficulty(self._handle, float(difficulty))
+
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         if env_idx != 0:
             raise ValueError("scalar env only has env_idx=0")
@@ -376,6 +390,7 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         self.num_players = players_per_team * 2
         self.num_envs = num_envs
         self.num_agents = self.num_players * num_envs
+        self.agents_per_batch = self.num_agents
         self.game_length = game_length
         self.log_interval = log_interval
 
@@ -466,6 +481,17 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         """
 
         binding.vec_set_field_scale(self._handle, float(scale))
+
+    def set_spawn_difficulty(self, difficulty: float) -> None:
+        """Broadcast one reset-distribution difficulty to every native env shard.
+
+        The value affects future resets only. Current live states are left untouched, which
+        keeps curriculum updates cheap and avoids surprising mid-possession teleports during
+        training. Newly reset episodes then see starts that move from close set pieces toward
+        the environment's original broad reset as the difficulty approaches ``1``.
+        """
+
+        binding.vec_set_spawn_difficulty(self._handle, float(difficulty))
 
     def get_state(self, env_idx: int = 0) -> dict[str, Any]:
         return binding.vec_get_state(self._handle, env_idx)

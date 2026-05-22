@@ -1,0 +1,58 @@
+{
+  "format_version": 1,
+  "generated_at_utc": "2026-05-21T16:48:39Z",
+  "rollout_defaults": {
+    "batch_multiple": 1,
+    "minibatch_divisor": 4,
+    "source_num_agents": 640
+  },
+  "source": {
+    "label": "no_warmstart_best_checkpoint_tuning_result",
+    "path": "experiments/no_warmstart_hparam_tuning/real_20260521_142215/best_hyperparameters.json"
+  },
+  "train_defaults": {
+    "bptt_horizon": 64,
+    "clip_coef": 0.2,
+    "ent_coef": 0.00010000000000000021,
+    "gae_lambda": 0.9,
+    "gamma": 0.995,
+    "learning_rate": 0.00030000000000000073,
+    "lstm_hidden_size": 512,
+    "max_grad_norm": 1.5,
+    "minibatch_size": 10240,
+    "no_opponent_map_scale_end": 1.0,
+    "no_opponent_map_scale_full_progress": 0.6,
+    "no_opponent_map_scale_ladder": "0.2,0.4,0.6,0.8,1.0",
+    "no_opponent_map_scale_power": 3.0,
+    "no_opponent_map_scale_start": 0.45,
+    "policy_encoder_size": 512,
+    "policy_hidden_size": 512,
+    "prio_alpha": 0.7999999999999999,
+    "prio_beta0": 0.19999999999999996,
+    "train_batch_size": 40960,
+    "update_epochs": 2,
+    "use_lstm": true,
+    "vf_clip_coef": 0.20000000000000007,
+    "vf_coef": 2.0
+  },
+  "vecenv_benchmark": {
+    "benchmark_command_notes": "W&B offline, videos disabled, past-iterate eval disabled, update_epochs=1, train_batch_size=16384 requested and rounded by trainer to 40960",
+    "comparison": {
+      "multiprocessing_64_16_4_result": "failed before training because Puffer multiprocessing wrapper lacks set_field_scale/set_spawn_difficulty",
+      "native_128_measured_sps": 215483.29752
+    },
+    "device": "cuda",
+    "global_step": 122880,
+    "measured_sps": 248923.36469,
+    "players_per_team": 5,
+    "policy": "LSTMWrapper hidden_size=512 with 512-wide feed-forward core",
+    "runtime_seconds": 2.3865180015563965,
+    "selection_reason": "fastest completed real train_pufferl LSTM PPO run; multiprocessing wrapper does not expose curriculum setters"
+  },
+  "vecenv_defaults": {
+    "num_envs": 64,
+    "vec_backend": "native",
+    "vec_batch_size": null,
+    "vec_num_shards": null
+  }
+}

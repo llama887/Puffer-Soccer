@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "generated_at_utc": "2026-05-21T14:17:34Z",
+  "rollout_defaults": {},
+  "source": {
+    "label": "no_warmstart_sps_tuning",
+    "path": "experiments/sps_tuning/native_64_summary.json"
+  },
+  "train_defaults": {},
+  "vecenv_defaults": {
+    "num_envs": 64,
+    "vec_backend": "native",
+    "vec_batch_size": null,
+    "vec_num_shards": null
+  },
+  "vecenv_training_benchmark": {
+    "benchmark_command_notes": "W&B offline, videos disabled, past-iterate eval disabled, update_epochs=1, train_batch_size=16384 requested and rounded by trainer to 40960",
+    "comparison": {
+      "multiprocessing_64_16_4_result": "failed before training because Puffer multiprocessing wrapper lacks set_field_scale/set_spawn_difficulty",
+      "native_128_measured_sps": 215483.29752
+    },
+    "device": "cuda",
+    "global_step": 122880,
+    "measured_sps": 248923.36469,
+    "players_per_team": 5,
+    "policy": "LSTMWrapper hidden_size=512 with 512-wide feed-forward core",
+    "runtime_seconds": 2.3865180015563965,
+    "selection_reason": "fastest completed real train_pufferl LSTM PPO run; multiprocessing wrapper does not expose curriculum setters"
+  }
+}

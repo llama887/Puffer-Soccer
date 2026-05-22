@@ -1,9 +1,0 @@
-behavior=goalie_transition
-team=blue
-A_player=0
-B_player=2
-tA_last=788
-tB_first=789
-possession_consecutive_steps=6
-forward_progress_units=36.09
-fps=20

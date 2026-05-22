@@ -80,6 +80,7 @@ typedef struct {
     int goals_blue;
     int goals_red;
     float field_scale;
+    float spawn_difficulty;
     float base_x_out_start;
     float base_x_out_end;
     float base_y_out_start;
@@ -190,11 +191,36 @@ static void apply_field_scale(Env* env, float scale) {
     clamp_live_state_to_field(env);
 }
 
+static void apply_spawn_difficulty(Env* env, float difficulty) {
+    env->spawn_difficulty = clampf(difficulty, 0.0f, 1.0f);
+}
+
 static void reset_field(Env* env) {
     float pos_noise = 0.05f;
+    int use_guided_spawn = env->spawn_difficulty < 0.999f;
+    float guided_ball_x = 0.0f;
+    float guided_ball_y = 0.0f;
+    int guided_attack_right = 1;
+
+    if (use_guided_spawn) {
+        float ease = env->spawn_difficulty;
+        float target_goal_x;
+        guided_attack_right = (randf(&env->rng, 0.0f, 1.0f) < 0.5f) ? 1 : 0;
+        target_goal_x = guided_attack_right ? env->x_out_end : env->x_out_start;
+
+        float close_goal_gap = 5.0f + 20.0f * ease;
+        float close_y_span = fmaxf(2.0f, env->goal_half_h * (0.20f + 0.80f * ease));
+        guided_ball_x = target_goal_x + (guided_attack_right ? -close_goal_gap : close_goal_gap);
+        guided_ball_y = randf(&env->rng, -close_y_span, close_y_span);
+        guided_ball_x = clampf(guided_ball_x, env->x_out_start, env->x_out_end);
+        guided_ball_y = clampf(guided_ball_y, env->y_out_start, env->y_out_end);
+    }
+
     for (int i = 0; i < env->num_players; i++) {
         Agent* a = &env->agents[i];
         int place_left = team_on_left(env, a->team);
+        float base_x;
+        float base_y;
 
         if (is_inactive_opponent(env, i)) {
             a->x = env->x_out_end;
@@ -210,15 +236,30 @@ static void reset_field(Env* env) {
             int pidx = i % 11;
             float new_x = (init_position_11[pidx][1] + randf(&env->rng, -pos_noise, pos_noise)) * 110.0f;
             float new_y = (init_position_11[pidx][0] + randf(&env->rng, -pos_noise, pos_noise)) * 110.0f;
-            a->x = clampf(new_x, env->x_out_start, 0.0f);
-            a->y = clampf(new_y, env->y_out_start, env->y_out_end);
+            base_x = clampf(new_x, env->x_out_start, 0.0f);
+            base_y = clampf(new_y, env->y_out_start, env->y_out_end);
         } else {
-            a->x = randf(&env->rng, env->x_out_start, 0.0f);
-            a->y = randf(&env->rng, env->y_out_start, env->y_out_end);
+            base_x = randf(&env->rng, env->x_out_start, 0.0f);
+            base_y = randf(&env->rng, env->y_out_start, env->y_out_end);
+        }
+
+        if (use_guided_spawn) {
+            float side = randf(&env->rng, 0.0f, 1.0f) < 0.5f ? -1.0f : 1.0f;
+            float agent_gap = randf(&env->rng, 2.0f, 7.0f + 18.0f * env->spawn_difficulty);
+            float agent_spread = 3.0f + 22.0f * env->spawn_difficulty;
+            float guided_x = guided_ball_x + side * agent_gap;
+            float guided_y = guided_ball_y + randf(&env->rng, -agent_spread, agent_spread);
+            a->x = env->spawn_difficulty * base_x + (1.0f - env->spawn_difficulty) * guided_x;
+            a->y = env->spawn_difficulty * base_y + (1.0f - env->spawn_difficulty) * guided_y;
+            a->x = clampf(a->x, env->x_out_start, env->x_out_end);
+            a->y = clampf(a->y, env->y_out_start, env->y_out_end);
+        } else {
+            a->x = base_x;
+            a->y = base_y;
         }
 
         a->rot = randf(&env->rng, -1.0f, 1.0f) * (float)M_PI;
-        if (!place_left) {
+        if (!place_left && !use_guided_spawn) {
             a->x *= -1.0f;
             a->y *= -1.0f;
             a->rot += (float)M_PI;
@@ -230,9 +271,16 @@ static void reset_field(Env* env) {
 
     env->ball_vx = 0.0f;
     env->ball_vy = 0.0f;
-    env->ball_x = randf(&env->rng, env->x_out_start, env->x_out_end);
-    env->ball_y = randf(&env->rng, env->y_out_start, env->y_out_end);
-    if (!env->blue_left) {
+    if (use_guided_spawn) {
+        float uniform_ball_x = randf(&env->rng, env->x_out_start, env->x_out_end);
+        float uniform_ball_y = randf(&env->rng, env->y_out_start, env->y_out_end);
+        env->ball_x = env->spawn_difficulty * uniform_ball_x + (1.0f - env->spawn_difficulty) * guided_ball_x;
+        env->ball_y = env->spawn_difficulty * uniform_ball_y + (1.0f - env->spawn_difficulty) * guided_ball_y;
+    } else {
+        env->ball_x = randf(&env->rng, env->x_out_start, env->x_out_end);
+        env->ball_y = randf(&env->rng, env->y_out_start, env->y_out_end);
+    }
+    if (!env->blue_left && !use_guided_spawn) {
         env->ball_x *= -1.0f;
     }
 }
@@ -533,6 +581,7 @@ static void init_env_common(
     env->y_out_start = env->base_y_out_start;
     env->y_out_end = env->base_y_out_end;
     env->goal_half_h = env->base_goal_half_h;
+    env->spawn_difficulty = 1.0f;
     env->rot_speed = 0.4f;
     env->move_speed = 1.0f;
     env->rng = (uint32_t)(seed + 1);
@@ -542,6 +591,7 @@ static void init_env_common(
     }
 
     apply_field_scale(env, 1.0f);
+    apply_spawn_difficulty(env, 1.0f);
     full_reset(env, 1);
     clear_outputs(env);
     compute_observations(env, -1);
@@ -740,7 +790,8 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
     PyObject* num_steps_obj = PyLong_FromLong(num_steps);
     PyObject* blue_left_obj = PyBool_FromLong(blue_left);
     PyObject* field_scale_obj = PyFloat_FromDouble(env->field_scale);
-    if (!ball || !goals || !d || !num_steps_obj || !blue_left_obj) {
+    PyObject* spawn_difficulty_obj = PyFloat_FromDouble(env->spawn_difficulty);
+    if (!ball || !goals || !d || !num_steps_obj || !blue_left_obj || !field_scale_obj || !spawn_difficulty_obj) {
         Py_XDECREF(pos);
         Py_XDECREF(rot);
         Py_XDECREF(ball);
@@ -749,6 +800,7 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         Py_XDECREF(num_steps_obj);
         Py_XDECREF(blue_left_obj);
         Py_XDECREF(field_scale_obj);
+        Py_XDECREF(spawn_difficulty_obj);
         return NULL;
     }
 
@@ -758,7 +810,8 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         PyDict_SetItemString(d, "goals", goals) < 0 ||
         PyDict_SetItemString(d, "num_steps", num_steps_obj) < 0 ||
         PyDict_SetItemString(d, "blue_left", blue_left_obj) < 0 ||
-        PyDict_SetItemString(d, "field_scale", field_scale_obj) < 0) {
+        PyDict_SetItemString(d, "field_scale", field_scale_obj) < 0 ||
+        PyDict_SetItemString(d, "spawn_difficulty", spawn_difficulty_obj) < 0) {
         Py_DECREF(pos);
         Py_DECREF(rot);
         Py_DECREF(ball);
@@ -767,6 +820,7 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         Py_DECREF(num_steps_obj);
         Py_DECREF(blue_left_obj);
         Py_DECREF(field_scale_obj);
+        Py_DECREF(spawn_difficulty_obj);
         return NULL;
     }
 
@@ -777,6 +831,7 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
     Py_DECREF(num_steps_obj);
     Py_DECREF(blue_left_obj);
     Py_DECREF(field_scale_obj);
+    Py_DECREF(spawn_difficulty_obj);
     return d;
 }
 
@@ -1013,6 +1068,18 @@ static PyObject* py_env_set_field_scale(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* py_env_set_spawn_difficulty(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    float difficulty;
+    if (!PyArg_ParseTuple(args, "Of", &handle_obj, &difficulty)) {
+        return NULL;
+    }
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    apply_spawn_difficulty(env, difficulty);
+    Py_RETURN_NONE;
+}
+
 static PyObject* py_env_log(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     if (!PyArg_ParseTuple(args, "O", &handle_obj)) {
@@ -1212,6 +1279,20 @@ static PyObject* py_vec_set_field_scale(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* py_vec_set_spawn_difficulty(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    float difficulty;
+    if (!PyArg_ParseTuple(args, "Of", &handle_obj, &difficulty)) {
+        return NULL;
+    }
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++) {
+        apply_spawn_difficulty(&vec->envs[i], difficulty);
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject* py_vec_log(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
@@ -1288,6 +1369,7 @@ static PyMethodDef Methods[] = {
     {"env_reset", py_env_reset, METH_VARARGS, "Reset one env"},
     {"env_step", py_env_step, METH_VARARGS, "Step one env"},
     {"env_set_field_scale", py_env_set_field_scale, METH_VARARGS, "Set one env field scale"},
+    {"env_set_spawn_difficulty", py_env_set_spawn_difficulty, METH_VARARGS, "Set one env spawn curriculum difficulty"},
     {"env_log", py_env_log, METH_VARARGS, "Get one env log"},
     {"env_get_last_scores", py_env_get_last_scores, METH_VARARGS, "Get last scalar env scores"},
     {"env_get_state", py_env_get_state, METH_VARARGS, "Get one env state"},
@@ -1296,6 +1378,7 @@ static PyMethodDef Methods[] = {
     {"vec_reset", py_vec_reset, METH_VARARGS, "Reset vector env"},
     {"vec_step", py_vec_step, METH_VARARGS, "Step vector env"},
     {"vec_set_field_scale", py_vec_set_field_scale, METH_VARARGS, "Set vector env field scale"},
+    {"vec_set_spawn_difficulty", py_vec_set_spawn_difficulty, METH_VARARGS, "Set vector env spawn curriculum difficulty"},
     {"vec_log", py_vec_log, METH_VARARGS, "Get vector log"},
     {"vec_get_last_scores", py_vec_get_last_scores, METH_VARARGS, "Get last vector env scores"},
     {"vec_get_state", py_vec_get_state, METH_VARARGS, "Get one env state from vector env"},

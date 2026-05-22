@@ -1,0 +1,6 @@
+behavior=fwd_vs_def
+start_step=100
+end_step=247
+label=red_len132
+n_frames=35
+fps=20
