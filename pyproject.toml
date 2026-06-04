@@ -31,3 +31,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "pylint>=4.0.5",
+]

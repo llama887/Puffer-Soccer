@@ -158,6 +158,8 @@ class EnvConfig:
     opponents_enabled: bool = True
     vision_range: float = DEFAULT_VISION_RANGE
     reset_setup: str = "position"
+    random_team_size_min: int | None = None
+    random_team_size_max: int | None = None
     log_interval: int = 128
     render_mode: str | None = None
     seed: int = 0
@@ -191,6 +193,8 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         opponents_enabled: bool = True,
         vision_range: float = DEFAULT_VISION_RANGE,
         reset_setup: str = "position",
+        random_team_size_min: int | None = None,
+        random_team_size_max: int | None = None,
         log_interval: int = 128,
         render_mode: str | None = None,
         buf: dict[str, np.ndarray] | None = None,
@@ -207,6 +211,8 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         self.agents_per_batch = self.num_agents
         self.game_length = game_length
         self.log_interval = log_interval
+        self.random_team_size_min = random_team_size_min
+        self.random_team_size_max = random_team_size_max
 
         self.obs_size = 16 + 14 * players_per_team
         self.state_size = 5 + 34 * players_per_team
@@ -250,6 +256,7 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
             vision_range=float(vision_range),
             reset_setup=0 if reset_setup == "position" else 1,
         )
+        self._apply_random_team_size_range()
         self.tick = 0
 
     def reset(self, seed: int | None = 0):
@@ -262,6 +269,30 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         self._pending_team_return_sum.fill(0.0)
         self._pending_team_return_count = 0
         return self.observations, []
+
+    def _apply_random_team_size_range(self) -> None:
+        """Configure reset-time active player sampling in the native environment.
+
+        The public observation and action spaces stay sized for `players_per_team`, which keeps
+        PufferLib rollout buffers fixed and fast. When a range is provided, the native simulator
+        samples how many same-team slots are active after each reset and masks the remaining
+        player slots out of movement, ball contact, observations, and rewards. This gives one
+        training run exposure to 1v1 through 11v11 while avoiding Python-side ragged batches.
+        """
+
+        if self.random_team_size_min is None and self.random_team_size_max is None:
+            return
+        min_size = (
+            self.players_per_team
+            if self.random_team_size_min is None
+            else int(self.random_team_size_min)
+        )
+        max_size = (
+            min_size
+            if self.random_team_size_max is None
+            else int(self.random_team_size_max)
+        )
+        binding.env_set_random_team_size_range(self._handle, min_size, max_size)
 
     def step(self, actions: np.ndarray):
         self.tick += 1
@@ -375,6 +406,8 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         opponents_enabled: bool = True,
         vision_range: float = DEFAULT_VISION_RANGE,
         reset_setup: str = "position",
+        random_team_size_min: int | None = None,
+        random_team_size_max: int | None = None,
         log_interval: int = 128,
         render_mode: str | None = None,
         buf: dict[str, np.ndarray] | None = None,
@@ -393,6 +426,8 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         self.agents_per_batch = self.num_agents
         self.game_length = game_length
         self.log_interval = log_interval
+        self.random_team_size_min = random_team_size_min
+        self.random_team_size_max = random_team_size_max
 
         self.obs_size = 16 + 14 * players_per_team
         self.state_size = 5 + 34 * players_per_team
@@ -437,6 +472,7 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
             vision_range=float(vision_range),
             reset_setup=0 if reset_setup == "position" else 1,
         )
+        self._apply_random_team_size_range()
         self.tick = 0
 
     def reset(self, seed: int | None = 0):
@@ -449,6 +485,30 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         self._pending_team_return_sum.fill(0.0)
         self._pending_team_return_count = 0
         return self.observations, []
+
+    def _apply_random_team_size_range(self) -> None:
+        """Configure per-episode active team-size sampling for every native sub-env.
+
+        Native vector training needs all shards to share one fixed buffer shape. This helper
+        therefore keeps the maximum team size as the buffer contract while asking each native
+        sub-env to sample an active count inside the requested range. Inactive slots remain in
+        the batch as zero observations with zero reward, so the policy can learn from explicit
+        masks without the trainer needing variable-length agent batches.
+        """
+
+        if self.random_team_size_min is None and self.random_team_size_max is None:
+            return
+        min_size = (
+            self.players_per_team
+            if self.random_team_size_min is None
+            else int(self.random_team_size_min)
+        )
+        max_size = (
+            min_size
+            if self.random_team_size_max is None
+            else int(self.random_team_size_max)
+        )
+        binding.vec_set_random_team_size_range(self._handle, min_size, max_size)
 
     def step(self, actions: np.ndarray):
         self.tick += 1

@@ -50,6 +50,9 @@ typedef struct {
     float* global_states;
     Agent agents[MAX_PLAYERS];
     int players_per_team;
+    int active_players_per_team;
+    int random_team_size_min;
+    int random_team_size_max;
     int num_players;
     int game_length;
     int num_steps;
@@ -162,6 +165,11 @@ static int is_inactive_opponent(const Env* env, int player_idx) {
     return !env->opponents_enabled && env->agents[player_idx].team != 0;
 }
 
+static int is_inactive_player(const Env* env, int player_idx) {
+    if (is_inactive_opponent(env, player_idx)) return 1;
+    return (player_idx % env->players_per_team) >= env->active_players_per_team;
+}
+
 static float field_half_width(const Env* env) {
     return fmaxf(fabsf(env->x_out_start), fabsf(env->x_out_end));
 }
@@ -222,7 +230,7 @@ static void reset_field(Env* env) {
         float base_x;
         float base_y;
 
-        if (is_inactive_opponent(env, i)) {
+        if (is_inactive_player(env, i)) {
             a->x = env->x_out_end;
             a->y = ((float)(i - env->players_per_team) + 0.5f) * 4.0f;
             a->y = clampf(a->y, env->y_out_start, env->y_out_end);
@@ -285,6 +293,15 @@ static void reset_field(Env* env) {
     }
 }
 
+static void sample_active_team_size(Env* env) {
+    int min_size = env->random_team_size_min;
+    int max_size = env->random_team_size_max;
+    if (min_size < 1) min_size = 1;
+    if (max_size < min_size) max_size = min_size;
+    if (max_size > env->players_per_team) max_size = env->players_per_team;
+    env->active_players_per_team = min_size + (int)(next_u32(&env->rng) % (uint32_t)(max_size - min_size + 1));
+}
+
 static void full_reset(Env* env, int hard_reset_score) {
     env->num_steps = 0;
     env->cumulative_episode_return = 0.0f;
@@ -297,6 +314,7 @@ static void full_reset(Env* env, int hard_reset_score) {
             env->blue_left = !env->blue_left;
         }
     }
+    sample_active_team_size(env);
     reset_field(env);
 }
 
@@ -354,7 +372,7 @@ static void ball_check_hit(Env* env, const float* kick_scales) {
 
     for (int i = 0; i < env->num_players; i++) {
         Agent* a = &env->agents[i];
-        if (is_inactive_opponent(env, i)) continue;
+        if (is_inactive_player(env, i)) continue;
         float d = dist2(env->ball_x, env->ball_y, a->x, a->y);
         if (d < ball_radius + agent_radius) {
             float x_diff = env->ball_x - a->x;
@@ -461,7 +479,7 @@ static void compute_observations(Env* env, int goal_scored_team) {
     int sidx = 5;
     for (int i = 0; i < np; i++) {
         Agent* a = &env->agents[i];
-        if (is_inactive_opponent(env, i)) {
+        if (is_inactive_player(env, i)) {
             for (int k = 0; k < 17; k++) state_base[sidx++] = 0.0f;
             continue;
         }
@@ -486,6 +504,12 @@ static void compute_observations(Env* env, int goal_scored_team) {
         float* out = env->observations + (i * env->obs_size);
         int o = 0;
 
+        if (is_inactive_player(env, i)) {
+            memset(out, 0, sizeof(float) * env->obs_size);
+            env->rewards[i] = 0.0f;
+            continue;
+        }
+
         out[o++] = time_left;
         out[o++] = sign * focus->x / half_width;
         out[o++] = sign * focus->y / half_height;
@@ -506,13 +530,17 @@ static void compute_observations(Env* env, int goal_scored_team) {
             if (j == i) continue;
             if (env->agents[j].team != focus->team) continue;
             float aobs[7];
-            rel_obs_agent(env, focus, &env->agents[j], aobs);
+            if (is_inactive_player(env, j)) {
+                memset(aobs, 0, sizeof(float) * 7);
+            } else {
+                rel_obs_agent(env, focus, &env->agents[j], aobs);
+            }
             for (int k = 0; k < 7; k++) out[o++] = aobs[k];
         }
         for (int j = 0; j < np; j++) {
             if (env->agents[j].team == focus->team) continue;
             float aobs[7];
-            if (is_inactive_opponent(env, j)) {
+            if (is_inactive_player(env, j)) {
                 memset(aobs, 0, sizeof(float) * 7);
             } else {
                 rel_obs_agent(env, focus, &env->agents[j], aobs);
@@ -557,6 +585,9 @@ static void init_env_common(
 ) {
     memset(&env->log, 0, sizeof(Log));
     env->players_per_team = players_per_team;
+    env->active_players_per_team = players_per_team;
+    env->random_team_size_min = players_per_team;
+    env->random_team_size_max = players_per_team;
     env->num_players = players_per_team * 2;
     env->game_length = game_length;
     env->do_team_switch = do_team_switch;
@@ -624,7 +655,7 @@ static void c_step(Env* env) {
         float move = 0.0f;
         float rot = 0.0f;
 
-        if (is_inactive_opponent(env, i)) {
+        if (is_inactive_player(env, i)) {
             a->last_move = 0.0f;
             a->last_rot = 0.0f;
             kick_scales[i] = 0.0f;
@@ -1080,6 +1111,30 @@ static PyObject* py_env_set_spawn_difficulty(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static void set_random_team_size_range(Env* env, int min_size, int max_size) {
+    if (min_size < 1) min_size = 1;
+    if (max_size < min_size) max_size = min_size;
+    if (max_size > env->players_per_team) max_size = env->players_per_team;
+    env->random_team_size_min = min_size;
+    env->random_team_size_max = max_size;
+    sample_active_team_size(env);
+    reset_field(env);
+    compute_observations(env, -1);
+}
+
+static PyObject* py_env_set_random_team_size_range(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int min_size;
+    int max_size;
+    if (!PyArg_ParseTuple(args, "Oii", &handle_obj, &min_size, &max_size)) {
+        return NULL;
+    }
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    set_random_team_size_range(env, min_size, max_size);
+    Py_RETURN_NONE;
+}
+
 static PyObject* py_env_log(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     if (!PyArg_ParseTuple(args, "O", &handle_obj)) {
@@ -1293,6 +1348,21 @@ static PyObject* py_vec_set_spawn_difficulty(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* py_vec_set_random_team_size_range(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int min_size;
+    int max_size;
+    if (!PyArg_ParseTuple(args, "Oii", &handle_obj, &min_size, &max_size)) {
+        return NULL;
+    }
+    Vec* vec = unpack_vec_handle(handle_obj);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++) {
+        set_random_team_size_range(&vec->envs[i], min_size, max_size);
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject* py_vec_log(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
@@ -1370,6 +1440,7 @@ static PyMethodDef Methods[] = {
     {"env_step", py_env_step, METH_VARARGS, "Step one env"},
     {"env_set_field_scale", py_env_set_field_scale, METH_VARARGS, "Set one env field scale"},
     {"env_set_spawn_difficulty", py_env_set_spawn_difficulty, METH_VARARGS, "Set one env spawn curriculum difficulty"},
+    {"env_set_random_team_size_range", py_env_set_random_team_size_range, METH_VARARGS, "Set one env random active team-size range"},
     {"env_log", py_env_log, METH_VARARGS, "Get one env log"},
     {"env_get_last_scores", py_env_get_last_scores, METH_VARARGS, "Get last scalar env scores"},
     {"env_get_state", py_env_get_state, METH_VARARGS, "Get one env state"},
@@ -1379,6 +1450,7 @@ static PyMethodDef Methods[] = {
     {"vec_step", py_vec_step, METH_VARARGS, "Step vector env"},
     {"vec_set_field_scale", py_vec_set_field_scale, METH_VARARGS, "Set vector env field scale"},
     {"vec_set_spawn_difficulty", py_vec_set_spawn_difficulty, METH_VARARGS, "Set vector env spawn curriculum difficulty"},
+    {"vec_set_random_team_size_range", py_vec_set_random_team_size_range, METH_VARARGS, "Set vector env random active team-size range"},
     {"vec_log", py_vec_log, METH_VARARGS, "Get vector log"},
     {"vec_get_last_scores", py_vec_get_last_scores, METH_VARARGS, "Get last vector env scores"},
     {"vec_get_state", py_vec_get_state, METH_VARARGS, "Get one env state from vector env"},

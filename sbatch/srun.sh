@@ -7,7 +7,7 @@ srun \
   --mem=64G \
   --gres=gpu:1 \
   --time=48:00:00 \
-  --account=torch_pr_45_tandon_advanced \
+  --account=torch_pr_1066_tandon_advanced \
   --mail-type=END,FAIL \
   --mail-user=fyy2003@nyu.edu \
   --chdir=/scratch/fyy2003/repos/Puffer-Soccer \

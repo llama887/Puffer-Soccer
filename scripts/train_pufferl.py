@@ -141,7 +141,7 @@ KL_REGULARIZATION_OFF = "off"
 
 
 class Policy(torch.nn.Module):
-    """Encode one soccer observation and decode action logits plus state value.
+    """Encode one soccer observation with shared per-player weights.
 
     This module is deliberately the feed-forward core, not the whole memory policy. PufferLib's
     ``LSTMWrapper`` expects a policy core with ``encode_observations`` and ``decode_actions`` so
@@ -149,10 +149,12 @@ class Policy(torch.nn.Module):
     updates. Keeping this class as the core lets old non-recurrent checkpoints still load while
     new runs can wrap the same encoder with an LSTM by calling ``build_policy``.
 
-    The default hidden sizes are larger than the previous single-width setup because soccer
-    requires tracking teammates, opponents, ball state, and set-piece context from a partially
-    visible observation. The network is still plain and fast: two ReLU layers before the LSTM
-    or action heads, no attention, and no per-object Python loops in the forward pass.
+    The observation is parsed into self, ball, teammate, and opponent blocks. Every other-player
+    block is passed through the same small encoder, then masked mean and max summaries are built
+    separately for teammates and opponents. This gives the policy one set-style representation
+    that works when only one player per side is active and when all eleven players are active.
+    The implementation stays batch-vectorized: reshaping and reductions replace Python loops, so
+    the added flexibility does not create a slow per-agent forward path.
     """
 
     is_continuous = False
@@ -166,7 +168,13 @@ class Policy(torch.nn.Module):
     ):
         super().__init__()
         obs_dim = env.single_observation_space.shape[0]
+        if (obs_dim - 16) % 14 != 0 or obs_dim < 30:
+            raise ValueError(
+                "soccer observations must have shape 16 + 14 * players_per_team"
+            )
+        self.players_per_team = int((obs_dim - 16) // 14)
         self.encoder_output_size = int(encoder_output_size)
+        self.player_embedding_size = int(encoder_hidden_size)
         if hasattr(env.single_action_space, "n"):
             self.discrete = True
             act_dim = env.single_action_space.n
@@ -175,8 +183,21 @@ class Policy(torch.nn.Module):
             act_dim = env.single_action_space.shape[0]
             self.is_continuous = True
 
+        self.self_encoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(torch.nn.Linear(18, encoder_hidden_size)),
+            torch.nn.ReLU(),
+        )
+        self.ball_encoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(torch.nn.Linear(5, encoder_hidden_size)),
+            torch.nn.ReLU(),
+        )
+        self.player_encoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(torch.nn.Linear(7, encoder_hidden_size)),
+            torch.nn.ReLU(),
+        )
+        combined_size = encoder_hidden_size * 6 + 2
         self.net = torch.nn.Sequential(
-            pufferlib.pytorch.layer_init(torch.nn.Linear(obs_dim, encoder_hidden_size)),
+            pufferlib.pytorch.layer_init(torch.nn.Linear(combined_size, encoder_hidden_size)),
             torch.nn.ReLU(),
             pufferlib.pytorch.layer_init(
                 torch.nn.Linear(encoder_hidden_size, encoder_output_size)
@@ -186,17 +207,66 @@ class Policy(torch.nn.Module):
         self.action_head = torch.nn.Linear(encoder_output_size, act_dim)
         self.value_head = torch.nn.Linear(encoder_output_size, 1)
 
+    def _masked_player_summary(self, player_features: "torch.Tensor") -> "torch.Tensor":
+        """Return mean, max, and count summaries for a variable-size player set.
+
+        Player slots are fixed-width in the rollout buffer, but inactive or unseen players are
+        represented by all-zero feature rows. This helper treats those rows as absent by building
+        a mask from the raw feature magnitude before encoding. Mean pooling captures the overall
+        local shape of a team, max pooling preserves the strongest single-player signal, and the
+        normalized count tells the policy how crowded the game is. These summaries are cheaper
+        than attention and are enough for the first cross-team-size experiment.
+        """
+
+        if player_features.shape[1] == 0:
+            batch = player_features.shape[0]
+            hidden = self.player_embedding_size
+            empty = player_features.new_zeros((batch, hidden * 2 + 1))
+            return empty
+
+        mask = player_features.abs().sum(dim=-1, keepdim=True).gt(0.0)
+        encoded = self.player_encoder(player_features.reshape(-1, 7)).reshape(
+            player_features.shape[0],
+            player_features.shape[1],
+            -1,
+        )
+        mask_f = mask.to(encoded.dtype)
+        raw_count = mask_f.sum(dim=1)
+        count = raw_count.clamp_min(1.0)
+        mean = (encoded * mask_f).sum(dim=1) / count
+        max_values = encoded.masked_fill(~mask, torch.finfo(encoded.dtype).min).max(dim=1).values
+        max_values = torch.where(raw_count.gt(0.0), max_values, torch.zeros_like(max_values))
+        normalized_count = raw_count / max(1, player_features.shape[1])
+        return torch.cat([mean, max_values, normalized_count], dim=-1)
+
     def encode_observations(self, observations, state=None):
-        """Return the per-timestep feature vector consumed by policy heads or an LSTM.
+        """Return the fixed-size feature vector consumed by policy heads or an LSTM.
 
         The method exists for PufferLib's recurrent wrapper. It intentionally ignores
         ``state`` because this core is memoryless; recurrent memory belongs to the wrapper so
-        training, evaluation, checkpointing, and old feed-forward compatibility all use one
-        canonical state contract.
+        training, evaluation, and checkpointing all use one canonical state contract. The input
+        may come from any supported soccer team size as long as the observation follows the
+        environment's block layout; the shared player encoder and masked summaries remove the
+        need for a different first linear layer per team size.
         """
 
         _ = state
-        return self.net(observations)
+        self_features = observations[:, :18]
+        ball_features = observations[:, 18:23]
+        player_features = observations[:, 23:].reshape(observations.shape[0], -1, 7)
+        teammate_count = max(0, self.players_per_team - 1)
+        teammate_features = player_features[:, :teammate_count]
+        opponent_features = player_features[:, teammate_count:]
+
+        self_hidden = self.self_encoder(self_features)
+        ball_hidden = self.ball_encoder(ball_features)
+        teammate_summary = self._masked_player_summary(teammate_features)
+        opponent_summary = self._masked_player_summary(opponent_features)
+        combined = torch.cat(
+            [self_hidden, ball_hidden, teammate_summary, opponent_summary],
+            dim=-1,
+        )
+        return self.net(combined)
 
     def decode_actions(self, hidden):
         """Decode encoded features into action logits and scalar value estimates.
@@ -1237,6 +1307,7 @@ class BlueTeamNoOpponentWrapper(pufferlib.PufferEnv):
         self.single_observation_space = env.single_observation_space
         self.single_action_space = env.single_action_space
         self.num_agents = self.num_envs * self.players_per_team
+        self.agents_per_batch = self.num_agents
         self._blue_indices = self._build_blue_indices()
         self._full_action_template = np.zeros_like(env.actions)
 
@@ -2873,6 +2944,24 @@ def build_training_parser(
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--players-per-team", type=int, default=5)
+    parser.add_argument(
+        "--random-team-size-min",
+        type=int,
+        default=None,
+        help=(
+            "Minimum active players per team to sample each episode. The env still allocates "
+            "--players-per-team slots, so use --players-per-team 11 for 1v1 through 11v11."
+        ),
+    )
+    parser.add_argument(
+        "--random-team-size-max",
+        type=int,
+        default=None,
+        help=(
+            "Maximum active players per team to sample each episode. Defaults to the minimum "
+            "when only --random-team-size-min is set."
+        ),
+    )
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--no-opponent-num-envs", type=int, default=64)
     parser.add_argument(
@@ -3193,6 +3282,32 @@ def validate_rl_algorithm_args(args) -> None:
         raise ValueError("marlodonna-eval-ratio must be in [0.0, 1.0)")
     if args.marlodonna_standardized_eval_games < 1:
         raise ValueError("marlodonna-standardized-eval-games must be positive")
+
+
+def validate_random_team_size_args(args) -> None:
+    """Check that active team-size randomization matches the fixed buffer contract.
+
+    PufferLib rollout buffers need a single observation and agent count for the whole training
+    job. The variable-team-size experiment therefore allocates the maximum requested team size
+    and lets the native simulator mask inactive slots each episode. This validator catches
+    impossible ranges early and gives a clear error before a long Slurm job starts.
+    """
+
+    min_size = args.random_team_size_min
+    max_size = args.random_team_size_max
+    if min_size is None and max_size is None:
+        return
+    if min_size is None:
+        raise ValueError("random-team-size-min is required when random-team-size-max is set")
+    if max_size is None:
+        args.random_team_size_max = int(min_size)
+        max_size = args.random_team_size_max
+    if int(min_size) < 1:
+        raise ValueError("random-team-size-min must be at least 1")
+    if int(max_size) < int(min_size):
+        raise ValueError("random-team-size-max must be >= random-team-size-min")
+    if int(max_size) > int(args.players_per_team):
+        raise ValueError("random-team-size-max cannot exceed players-per-team")
 
 
 def make_side_assignment(num_envs: int) -> np.ndarray:
@@ -4950,6 +5065,7 @@ def main():
     load_env_file(".env")
     run_start_time = time.time()
     validate_rl_algorithm_args(args)
+    validate_random_team_size_args(args)
     league_config = build_league_config(args)
     effective_kl_regularization = resolve_kl_regularization_enabled(args)
 
@@ -5073,6 +5189,8 @@ def main():
             render_mode=None,
             seed=args.seed,
             opponents_enabled=False,
+            random_team_size_min=args.random_team_size_min,
+            random_team_size_max=args.random_team_size_max,
             vec=warm_start_vec_config,
         )
         warm_start_vecenv = BlueTeamNoOpponentWrapper(
@@ -5329,6 +5447,8 @@ def main():
             render_mode=None,
             seed=args.seed,
             opponents_enabled=True,
+            random_team_size_min=args.random_team_size_min,
+            random_team_size_max=args.random_team_size_max,
             vec=vec_config,
         )
         if autotune_result is not None:
