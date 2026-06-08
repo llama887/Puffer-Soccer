@@ -1,4 +1,4 @@
-.PHONY: build test train benchmark demo
+.PHONY: build test train benchmark demo flamegraph
 
 build:
 	uv sync --extra dev
@@ -14,3 +14,6 @@ benchmark:
 
 demo:
 	uv run python main.py
+
+flamegraph:
+	bash scripts/flamegraph.sh
