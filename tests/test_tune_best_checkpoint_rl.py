@@ -115,6 +115,7 @@ def test_build_trial_command_freezes_runtime_and_best_checkpoint_target(tmp_path
     )
 
     assert "--fixed-best-checkpoint" in command
+    assert "--best-checkpoint-eval" in command
     assert "--wandb" in command
     assert "--no-export-videos" in command
     assert "--use-lstm" in command
