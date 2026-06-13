@@ -12,9 +12,16 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
-import pufferlib.sweep
+
+try:
+    import optuna as _optuna  # type: ignore[import-not-found]
+except ImportError:
+    _optuna = None  # type: ignore[assignment]
+
+optuna: Any | None = _optuna
 
 import train_pufferl
 
@@ -120,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         ],
     )
     parser.add_argument("--total-timesteps", type=int, default=30_000_000)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--policy-hidden-size", type=int, default=512)
     parser.add_argument("--policy-encoder-size", type=int, default=512)
     parser.add_argument("--lstm-hidden-size", type=int, default=512)
@@ -127,7 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-runs", type=int, default=8)
     parser.add_argument("--confirm-candidates", type=int, default=3)
     parser.add_argument("--candidate-total-seeds", type=int, default=3)
-    parser.add_argument("--method", type=str, default="Protein")
+    parser.add_argument("--study-name", type=str, default="best_checkpoint_rl")
+    parser.add_argument("--storage", type=str, default=None)
     parser.add_argument(
         "--runtime-config-path",
         type=str,
@@ -159,143 +168,60 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_sweep_config() -> dict[str, object]:
-    """Define the PufferLib-supported search space for RL-only tuning.
+def require_optuna():
+    """Return the imported Optuna module or raise a command-focused install error.
 
-    The official Puffer sweep classes expect the same nested distribution schema used by
-    PufferLib config files. We keep rollout-shape choices in a separate `rollout` section so
-    the tuner can jointly search over horizon, effective batch size, and minibatch size
-    while the driver later converts those latent choices into the exact CLI arguments that
-    `scripts/train_pufferl.py` consumes.
+    Optuna is only needed by this launcher, not by normal training. Keeping it optional avoids
+    adding tuner-only dependencies to every install, while the error still tells the user the
+    exact `uv run` form that supplies the package for a long tuning job.
+    """
+
+    if optuna is None:
+        raise RuntimeError(
+            "tune_best_checkpoint_rl.py requires optuna. Run it with "
+            "`uv run --with optuna python -u scripts/tune_best_checkpoint_rl.py ...`."
+        )
+    return optuna
+
+
+def suggest_hyperparameters(trial) -> dict[str, object]:
+    """Sample one RL-only hyperparameter set from the Optuna search space.
+
+    The architecture, environment runtime, best checkpoint, and total training budget are fixed
+    outside this function. The sampled values only affect how PPO learns: rollout length,
+    effective batch shape, optimizer settings, loss coefficients, prioritization, and the KL
+    regularization terms used by the existing training loop. The returned nested dictionary keeps
+    the same shape as older Puffer-sweep suggestions so command construction and result logging
+    stay simple.
     """
 
     return {
-        "metric": "best_checkpoint_win_rate",
-        "goal": "maximize",
         "rollout": {
-            "horizon": {
-                "distribution": "uniform_pow2",
-                "min": 64,
-                "max": 256,
-                "mean": 64,
-                "scale": "auto",
-            },
-            "batch_multiple": {
-                "distribution": "uniform_pow2",
-                "min": 1,
-                "max": 4,
-                "mean": 1,
-                "scale": "auto",
-            },
-            "minibatch_divisor": {
-                "distribution": "uniform_pow2",
-                "min": 1,
-                "max": 16,
-                "mean": 4,
-                "scale": "auto",
-            },
+            "horizon": trial.suggest_categorical("rollout_horizon", [64, 128, 256]),
+            "batch_multiple": trial.suggest_categorical("rollout_batch_multiple", [1, 2, 4]),
+            "minibatch_divisor": trial.suggest_categorical(
+                "rollout_minibatch_divisor", [1, 2, 4, 8, 16]
+            ),
         },
         "train": {
-            "learning_rate": {
-                "distribution": "log_normal",
-                "min": 1e-5,
-                "max": 3e-3,
-                "mean": 3e-4,
-                "scale": 0.5,
-            },
-            "update_epochs": {
-                "distribution": "int_uniform",
-                "min": 1,
-                "max": 6,
-                "mean": 2,
-                "scale": "auto",
-            },
-            "gamma": {
-                "distribution": "logit_normal",
-                "min": 0.95,
-                "max": 0.9999,
-                "mean": 0.995,
-                "scale": "auto",
-            },
-            "gae_lambda": {
-                "distribution": "logit_normal",
-                "min": 0.8,
-                "max": 0.995,
-                "mean": 0.9,
-                "scale": "auto",
-            },
-            "clip_coef": {
-                "distribution": "uniform",
-                "min": 0.05,
-                "max": 0.4,
-                "mean": 0.2,
-                "scale": "auto",
-            },
-            "vf_coef": {
-                "distribution": "uniform",
-                "min": 0.25,
-                "max": 4.0,
-                "mean": 2.0,
-                "scale": "auto",
-            },
-            "vf_clip_coef": {
-                "distribution": "uniform",
-                "min": 0.05,
-                "max": 1.0,
-                "mean": 0.2,
-                "scale": "auto",
-            },
-            "max_grad_norm": {
-                "distribution": "uniform",
-                "min": 0.25,
-                "max": 3.0,
-                "mean": 1.5,
-                "scale": "auto",
-            },
-            "ent_coef": {
-                "distribution": "log_normal",
-                "min": 1e-6,
-                "max": 1e-2,
-                "mean": 1e-4,
-                "scale": "auto",
-            },
-            "prio_alpha": {
-                "distribution": "logit_normal",
-                "min": 0.05,
-                "max": 0.99,
-                "mean": 0.8,
-                "scale": "auto",
-            },
-            "prio_beta0": {
-                "distribution": "logit_normal",
-                "min": 0.05,
-                "max": 0.99,
-                "mean": 0.2,
-                "scale": "auto",
-            },
+            "learning_rate": trial.suggest_float("learning_rate", 1e-5, 3e-3, log=True),
+            "update_epochs": trial.suggest_int("update_epochs", 1, 6),
+            "gamma": trial.suggest_float("gamma", 0.95, 0.9999),
+            "gae_lambda": trial.suggest_float("gae_lambda", 0.8, 0.995),
+            "clip_coef": trial.suggest_float("clip_coef", 0.05, 0.4),
+            "vf_coef": trial.suggest_float("vf_coef", 0.25, 4.0),
+            "vf_clip_coef": trial.suggest_float("vf_clip_coef", 0.05, 1.0),
+            "max_grad_norm": trial.suggest_float("max_grad_norm", 0.25, 3.0),
+            "ent_coef": trial.suggest_float("ent_coef", 1e-6, 1e-2, log=True),
+            "prio_alpha": trial.suggest_float("prio_alpha", 0.05, 0.99),
+            "prio_beta0": trial.suggest_float("prio_beta0", 0.05, 0.99),
         },
         "regularization": {
-            "past_kl_coef": {
-                "distribution": "log_normal",
-                "min": 1e-4,
-                "max": 1.0,
-                "mean": 0.1,
-                "scale": "auto",
-            },
-            "uniform_kl_base_coef": {
-                "distribution": "log_normal",
-                "min": 1e-4,
-                "max": 0.2,
-                "mean": 0.05,
-                "scale": "auto",
-            },
-            "uniform_kl_power": {
-                "distribution": "uniform",
-                "min": 0.0,
-                "max": 1.0,
-                "mean": 0.3,
-                "scale": "auto",
-            },
+            "past_kl_coef": trial.suggest_float("past_kl_coef", 1e-4, 1.0, log=True),
+            "uniform_kl_base_coef": trial.suggest_float(
+                "uniform_kl_base_coef", 1e-4, 0.2, log=True
+            ),
+            "uniform_kl_power": trial.suggest_float("uniform_kl_power", 0.0, 1.0),
         },
     }
 
@@ -517,6 +443,7 @@ def build_trial_command(
         "--final-best-eval-games",
         str(args.final_eval_games),
         "--fixed-best-checkpoint",
+        "--best-checkpoint-eval",
         "--best-checkpoint-config-path",
         args.best_checkpoint_config_path,
         "--checkpoint-interval",
@@ -759,10 +686,10 @@ def print_top_results(results: Sequence[TrialResult], limit: int = 5) -> None:
 def main() -> None:
     """Tune RL hyperparameters against the fixed best checkpoint and confirm the winner.
 
-    The workflow is intentionally two-stage. First we let Puffer's sweep algorithm explore a
-    broad set of RL hyperparameters, always using a new seed for each trial and always
-    holding the runtime layout fixed. Then we rerun the strongest candidates with additional
-    fresh seeds so the final recommendation reflects more than one lucky draw.
+    The workflow is intentionally two-stage. First Optuna explores a broad set of RL
+    hyperparameters, always using a new seed for each trial and always holding the runtime
+    layout fixed. Then we rerun the strongest candidates with additional fresh seeds so the
+    final recommendation reflects more than one lucky draw.
     """
 
     parser = build_parser()
@@ -823,13 +750,21 @@ def main() -> None:
         f"total_agents={args.total_agents}, device={device}"
     )
 
-    method_cls = getattr(pufferlib.sweep, args.method)
-    sweep = method_cls(build_sweep_config())
+    optuna_module = require_optuna()
+    sampler = optuna_module.samplers.TPESampler(seed=args.seed)
+    study = optuna_module.create_study(
+        study_name=args.study_name,
+        storage=args.storage,
+        direction="maximize",
+        load_if_exists=args.storage is not None,
+        sampler=sampler,
+    )
     rng = random.Random(time.time_ns())
     all_results: list[TrialResult] = []
 
     for trial_index in range(1, args.max_runs + 1):
-        suggestion, _ = sweep.suggest(None)
+        trial = study.ask()
+        suggestion = suggest_hyperparameters(trial)
         seed = sample_seed(rng)
         result = run_trial(
             phase="search",
@@ -842,15 +777,13 @@ def main() -> None:
         )
         all_results.append(result)
         append_jsonl(history_path, result.to_record())
-        observe_cost = (
-            result.runtime_seconds if np.isfinite(result.runtime_seconds) else 1e12
-        )
-        sweep.observe(
-            suggestion,
-            result.objective_win_rate,
-            observe_cost,
-            is_failure=result.failed,
-        )
+        if result.failed:
+            study.tell(trial, state=optuna_module.trial.TrialState.FAIL)
+        else:
+            trial.set_user_attr("score_diff", result.objective_score_diff)
+            trial.set_user_attr("runtime_seconds", result.runtime_seconds)
+            trial.set_user_attr("summary_path", str(result.summary_path))
+            study.tell(trial, result.objective_win_rate)
         print_top_results(all_results)
 
     successful = sorted(

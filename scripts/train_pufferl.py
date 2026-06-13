@@ -3103,6 +3103,11 @@ def build_training_parser(
     parser.add_argument("--past-iterate-eval-envs", type=int, default=None)
     parser.add_argument("--past-iterate-eval-games", type=int, default=64)
     parser.add_argument("--past-iterate-eval-game-length", type=int, default=400)
+    parser.add_argument(
+        "--best-checkpoint-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--no-opponent-eval-games", type=int, default=100)
     parser.add_argument("--no-opponent-eval-max-steps", type=int, default=600)
     parser.add_argument("--final-best-eval-games", type=int, default=0)
@@ -5594,6 +5599,7 @@ def main():
 
         needs_evaluator = (
             args.past_iterate_eval
+            or args.best_checkpoint_eval
             or args.final_best_eval_games > 0
             or league_manager is not None
         )
@@ -5660,7 +5666,9 @@ def main():
                 eval_interval_epochs,
             )
             should_eval = should_run_periodic_event and (
-                args.past_iterate_eval or league_manager is not None
+                args.past_iterate_eval
+                or args.best_checkpoint_eval
+                or league_manager is not None
             )
             if should_run_periodic_event and not should_eval and logger is not None:
                 logger.wandb.log(
@@ -5712,7 +5720,7 @@ def main():
                     )
                     print_match_summary("Past iterate eval", trainer.epoch, eval_metrics)
 
-                if best_opponent is not None:
+                if args.best_checkpoint_eval and best_opponent is not None:
                     best_metrics = evaluator.evaluate(
                         current_policy,
                         best_opponent,
@@ -5821,7 +5829,7 @@ def main():
 
                 if logger is not None:
                     logger.wandb.log(log_payload, step=trainer.global_step)
-                if args.past_iterate_eval:
+                if args.past_iterate_eval or args.best_checkpoint_eval:
                     log_periodic_eval_match_videos(
                         current_policy,
                         args,

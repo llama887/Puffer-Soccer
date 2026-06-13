@@ -114,7 +114,7 @@ echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
 OUTPUT_DIR="$TUNE_OUTPUT_ROOT/$TUNE_MATRIX_LABEL"
 mkdir -p "$OUTPUT_DIR"
 
-uv run python -u scripts/tune_best_checkpoint_rl.py \
+uv run --with optuna python -u scripts/tune_best_checkpoint_rl.py \
     --rl-alg "$TUNE_RL_ALG" \
     --kl-regularization-mode "$TUNE_KL_MODE" \
     --device "$TUNE_DEVICE" \
@@ -125,7 +125,6 @@ uv run python -u scripts/tune_best_checkpoint_rl.py \
     --max-runs "$TUNE_MAX_RUNS" \
     --confirm-candidates "$TUNE_CONFIRM_CANDIDATES" \
     --candidate-total-seeds "$TUNE_CANDIDATE_TOTAL_SEEDS" \
-    --method "$TUNE_METHOD" \
     --output-dir "$OUTPUT_DIR" \
     --runtime-config-path "$TUNE_RUNTIME_CONFIG_PATH" \
     --reuse-runtime-config \
