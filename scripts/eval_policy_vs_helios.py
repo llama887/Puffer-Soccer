@@ -46,97 +46,6 @@ train_pufferl = _load_train_module()
 torch = train_pufferl.torch
 
 
-class LegacyObservationPolicy(torch.nn.Module):  # type: ignore[name-defined]
-    """Rebuild the older observation-MLP policy used by ``t5f7yhut`` checkpoints.
-
-    The current training code uses a factorized per-player encoder, but the checked-in best
-    checkpoint stores the previous architecture: one MLP directly over the full observation,
-    followed by action and value heads. The checkpoint is still a valid bot, so evaluation needs
-    this small compatibility core. It implements the same ``encode_observations`` and
-    ``decode_actions`` methods expected by PufferLib's ``LSTMWrapper``, which keeps recurrent
-    checkpoint keys such as ``policy.net.*`` and ``lstm.*`` loadable without changing the saved
-    artifact.
-    """
-
-    is_continuous = False
-
-    def __init__(
-        self,
-        env,
-        *,
-        hidden_size: int,
-        encoder_output_size: int,
-        input_size: int | None = None,
-        action_dim: int | None = None,
-    ) -> None:
-        super().__init__()
-        env_obs_dim = int(env.single_observation_space.shape[0])
-        obs_dim = env_obs_dim if input_size is None else int(input_size)
-        act_dim = int(env.single_action_space.n) if action_dim is None else int(action_dim)
-        self.input_size = obs_dim
-        self.discrete = True
-        self.net = torch.nn.Sequential(
-            train_pufferl.pufferlib.pytorch.layer_init(torch.nn.Linear(obs_dim, hidden_size)),
-            torch.nn.ReLU(),
-            train_pufferl.pufferlib.pytorch.layer_init(
-                torch.nn.Linear(hidden_size, encoder_output_size)
-            ),
-            torch.nn.ReLU(),
-        )
-        self.action_head = torch.nn.Linear(encoder_output_size, act_dim)
-        self.value_head = torch.nn.Linear(encoder_output_size, 1)
-
-    def _adapt_observations(self, observations):
-        """Return observations with the width expected by the legacy checkpoint.
-
-        Old flat-observation checkpoints were trained before the ball had height, so their MLP
-        expects the self block, the first five ball features, and then the player blocks. The
-        live environment now inserts two ball features at columns 23 and 24. Dropping only those
-        two columns preserves the old semantic layout while allowing old bots to run in the new
-        environment as ground-ball policies that simply ignore lofted-state information.
-        """
-
-        if observations.shape[-1] == self.input_size:
-            return observations
-        if observations.shape[-1] == self.input_size + 2:
-            return torch.cat([observations[..., :23], observations[..., 25:]], dim=-1)
-        raise ValueError(
-            f"legacy checkpoint expected observation width {self.input_size}, "
-            f"got {observations.shape[-1]}"
-        )
-
-    def encode_observations(self, observations, state=None):
-        """Return the legacy flat-observation feature vector consumed by the LSTM wrapper.
-
-        This method intentionally ignores recurrent state because memory lives in the wrapper,
-        not in the feed-forward core. It differs from the current policy encoder by preserving
-        the old direct MLP over the entire observation, which is required for checkpoints whose
-        first saved layer has shape ``[hidden_size, observation_size]``.
-        """
-
-        _ = state
-        return self.net(self._adapt_observations(observations))
-
-    def decode_actions(self, hidden):
-        """Decode legacy hidden features into action logits and scalar values."""
-
-        return self.action_head(hidden), self.value_head(hidden).squeeze(-1)
-
-    def forward(self, observations, _state=None):
-        """Run feed-forward inference for non-recurrent compatibility."""
-
-        hidden = self.encode_observations(observations, state=_state)
-        logits, values = self.decode_actions(hidden)
-        if values.ndim == 1 and observations.ndim > 1:
-            values = values.unsqueeze(-1)
-        return logits, values
-
-    def forward_eval(self, observations, _state=None):
-        """Run one-step evaluation using the same path as direct forward inference."""
-
-        return self.forward(observations, _state=_state)
-
-
 class PolicyVsHeliosEvaluator:  # pylint: disable=too-many-instance-attributes
     """Run side-balanced matches between one torch policy and the scripted teacher.
 
@@ -346,10 +255,7 @@ def load_checkpoint_policy(
         state_dict = train_pufferl.load_checkpoint_state_dict(
             train_pufferl.resolve_checkpoint_file(checkpoint_path)
         )
-        if _is_legacy_observation_policy(state_dict):
-            policy = build_legacy_policy_for_state(env, state_dict).to(device)
-        else:
-            policy = train_pufferl.build_policy_for_state(env, state_dict).to(device)
+        policy = train_pufferl.build_policy_for_state(env, state_dict).to(device)
         policy.load_state_dict(state_dict, strict=True)
         return policy
     finally:
@@ -448,85 +354,16 @@ def record_policy_vs_helios_video(  # pylint: disable=too-many-arguments,too-man
     return score
 
 
-def _is_legacy_observation_policy(state_dict: dict[str, Any]) -> bool:
-    """Return whether a checkpoint uses the old flat-observation MLP core.
-
-    New checkpoints contain encoder keys such as ``policy.self_encoder.*``. Legacy checkpoints
-    instead start with ``policy.net.0.weight`` whose input width equals the full observation
-    size. Detecting that shape lets the evaluator load older best bots without weakening strict
-    state-dict loading.
-    """
-
-    return "policy.net.0.weight" in state_dict and not any(
-        key.startswith("policy.self_encoder.") for key in state_dict
-    )
-
-
-def infer_players_per_team_from_state(state_dict: dict[str, Any]) -> int | None:
-    """Infer the soccer team size encoded by a legacy checkpoint's input layer.
-
-    The current environment observation width is ``18 + 14 * players_per_team`` because the
-    ball block includes height and vertical speed. Older flat-observation checkpoints used
-    ``16 + 14 * players_per_team`` before the ball became 3D. Current checkpoints are team-size
-    agnostic in the first policy layer, but the old flat-observation MLP stores this width
-    directly in ``policy.net.0.weight``. Returning ``None`` for newer checkpoints keeps the CLI
-    value authoritative when no inference is possible.
-    """
-
-    first_weight = state_dict.get("policy.net.0.weight")
-    if not isinstance(first_weight, torch.Tensor):
-        return None
-    obs_dim = int(first_weight.shape[1])
-    if obs_dim >= 32 and (obs_dim - 18) % 14 == 0:
-        return int((obs_dim - 18) // 14)
-    if obs_dim >= 30 and (obs_dim - 16) % 14 == 0:
-        return int((obs_dim - 16) // 14)
-    return None
-
-
-def build_legacy_policy_for_state(env, state_dict: dict[str, Any]) -> Any:
-    """Build the old flat-observation policy core and recurrent wrapper if needed."""
-
-    first_weight = state_dict["policy.net.0.weight"]
-    second_weight = state_dict["policy.net.2.weight"]
-    action_weight = state_dict.get("policy.action_head.weight")
-    hidden_size = int(first_weight.shape[0])
-    input_size = int(first_weight.shape[1])
-    encoder_output_size = int(second_weight.shape[0])
-    action_dim = (
-        int(action_weight.shape[0])
-        if isinstance(action_weight, torch.Tensor)
-        else int(env.single_action_space.n)
-    )
-    core = LegacyObservationPolicy(
-        env,
-        hidden_size=hidden_size,
-        encoder_output_size=encoder_output_size,
-        input_size=input_size,
-        action_dim=action_dim,
-    )
-    if not any(key.startswith(("lstm.", "cell.")) for key in state_dict):
-        return core
-    lstm_weight = state_dict.get("lstm.weight_hh_l0")
-    lstm_hidden_size = (
-        encoder_output_size
-        if not isinstance(lstm_weight, torch.Tensor)
-        else int(lstm_weight.shape[1])
-    )
-    return train_pufferl.pufferlib.models.LSTMWrapper(
-        env,
-        core,
-        input_size=encoder_output_size,
-        hidden_size=lstm_hidden_size,
-    )
-
-
 def parse_args() -> argparse.Namespace:
     """Parse CLI options for policy-vs-Helios evaluation."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint-path", type=Path, default=Path("experiments/t5f7yhut.pt"))
-    parser.add_argument("--players-per-team", type=int, default=11)
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=Path("experiments/lhasdbcl/model_100000.pt"),
+    )
+    parser.add_argument("--players-per-team", type=int, default=5)
     parser.add_argument("--games", type=int, default=128)
     parser.add_argument("--game-length", type=int, default=400)
     parser.add_argument("--eval-envs", type=int, default=16)
@@ -543,20 +380,6 @@ def main() -> None:
 
     args = parse_args()
     device = train_pufferl.resolve_device(args.device)
-    state_dict = train_pufferl.load_checkpoint_state_dict(
-        train_pufferl.resolve_checkpoint_file(args.checkpoint_path)
-    )
-    inferred_players_per_team = infer_players_per_team_from_state(state_dict)
-    if (
-        inferred_players_per_team is not None
-        and inferred_players_per_team != args.players_per_team
-    ):
-        print(
-            "checkpoint_players_per_team="
-            f"{inferred_players_per_team}; overriding CLI players_per_team="
-            f"{args.players_per_team}"
-        )
-        args.players_per_team = inferred_players_per_team
     policy = load_checkpoint_policy(
         checkpoint_path=args.checkpoint_path,
         players_per_team=args.players_per_team,
