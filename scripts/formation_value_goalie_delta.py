@@ -47,6 +47,7 @@ sys.modules[_spec2.name] = _fvh
 _spec2.loader.exec_module(_fvh)
 
 from value_heatmap import build_observation_batch  # noqa: E402
+from puffer_soccer.envs.marl2d.core import DISCRETE_ACTION_COUNT  # noqa: E402
 
 
 PPT = 5
@@ -95,14 +96,14 @@ def eval_ckpt_no_goalie(
     if "state_dict" in state and "format_version" in state:
         state = state["state_dict"]
 
-    obs_size = 16 + 14 * PPT
+    obs_size = 18 + 14 * PPT
 
     class _Shim:
         class _Obs:
             shape = (obs_size,)
 
         class _Act:
-            n = 13
+            n = DISCRETE_ACTION_COUNT
 
         single_observation_space = _Obs()
         single_action_space = _Act()

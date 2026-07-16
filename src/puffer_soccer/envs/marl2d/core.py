@@ -21,6 +21,7 @@ DISCRETE_ACTION_MOVE_BACKWARD = 2
 DISCRETE_ACTION_ROTATE_LEFT = 3
 DISCRETE_ACTION_ROTATE_RIGHT = 4
 DISCRETE_KICK_ACTION_START = 5
+DISCRETE_GROUND_KICK_ACTION_START = DISCRETE_KICK_ACTION_START
 DISCRETE_KICK_STRENGTHS = (
     0.1,
     0.22857143,
@@ -31,7 +32,10 @@ DISCRETE_KICK_STRENGTHS = (
     0.87142855,
     1.0,
 )
-DISCRETE_ACTION_COUNT = DISCRETE_KICK_ACTION_START + len(DISCRETE_KICK_STRENGTHS)
+DISCRETE_LOFTED_KICK_ACTION_START = DISCRETE_GROUND_KICK_ACTION_START + len(
+    DISCRETE_KICK_STRENGTHS
+)
+DISCRETE_ACTION_COUNT = DISCRETE_LOFTED_KICK_ACTION_START + len(DISCRETE_KICK_STRENGTHS)
 
 
 def normalize_env_seed(seed: int | None) -> int:
@@ -54,22 +58,28 @@ def normalize_env_seed(seed: int | None) -> int:
     return int(seed) % MAX_SIGNED_ENV_SEED
 
 
-def encode_discrete_kick_action(kick_strength: int) -> int:
+def encode_discrete_kick_action(kick_strength: int, *, lofted: bool = False) -> int:
     """Return the discrete action id for one forward kick-strength choice.
 
-    The competition-facing discrete API now allows exactly one intent per step. Kicks occupy a
-    contiguous action range after the locomotion actions so agents, tests, and future baseline
-    policies can refer to them with a simple helper instead of hand-written offsets. The helper
-    validates the kick-strength index against the canonical Python-side lookup table so the
-    action contract stays synchronized with the native C decoder.
+    The discrete soccer API gives every agent exactly one intent per simulator step. Ground
+    kicks and lofted kicks therefore live in two adjacent action ranges after the locomotion
+    actions: the first range preserves the old rolling-pass behavior, while the second range
+    applies the same horizontal direction with an upward impulse. Keeping both variants in the
+    same helper avoids scattered offset math in tests, scripted teachers, and future baselines.
 
-    The returned value is the public action id that should be sent into the environment. Kick
-    index `0` is the weakest dribble-like tap and the last index is the old full-strength kick.
+    ``kick_strength`` selects one of the canonical strength buckets, where index ``0`` is a
+    weak dribble-like tap and the final index is a full-strength kick. Set ``lofted=True`` when
+    the caller wants the ball to leave the ground and be affected by gravity before it lands.
     """
 
     if kick_strength < 0 or kick_strength >= len(DISCRETE_KICK_STRENGTHS):
         raise ValueError("kick_strength must be in [0, 7]")
-    return DISCRETE_KICK_ACTION_START + kick_strength
+    start = (
+        DISCRETE_LOFTED_KICK_ACTION_START
+        if lofted
+        else DISCRETE_GROUND_KICK_ACTION_START
+    )
+    return start + kick_strength
 
 
 def _validate_args(players_per_team: int, action_mode: str, reset_setup: str) -> None:
@@ -214,8 +224,8 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         self.random_team_size_min = random_team_size_min
         self.random_team_size_max = random_team_size_max
 
-        self.obs_size = 16 + 14 * players_per_team
-        self.state_size = 5 + 34 * players_per_team
+        self.obs_size = 18 + 14 * players_per_team
+        self.state_size = 7 + 34 * players_per_team
 
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0,
@@ -429,8 +439,8 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         self.random_team_size_min = random_team_size_min
         self.random_team_size_max = random_team_size_max
 
-        self.obs_size = 16 + 14 * players_per_team
-        self.state_size = 5 + 34 * players_per_team
+        self.obs_size = 18 + 14 * players_per_team
+        self.state_size = 7 + 34 * players_per_team
 
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0,

@@ -5,7 +5,7 @@ srun \
   --nodes=1 \
   --cpus-per-task=32 \
   --mem=64G \
-  --gres=gpu:1 \
+  --gres=gpu:l40s:1 \
   --time=48:00:00 \
   --account=torch_pr_1066_tandon_advanced \
   --mail-type=END,FAIL \

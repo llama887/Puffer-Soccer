@@ -296,7 +296,7 @@ def main() -> None:
     blue_left = bool(st["blue_left"])
     T_alloc = args.total_steps + 2
     positions = np.zeros((T_alloc, num_players, 2), dtype=np.float32)
-    ball = np.zeros((T_alloc, 4), dtype=np.float32)
+    ball = np.zeros((T_alloc, 6), dtype=np.float32)
     positions[0] = st["positions"]
     ball[0] = np.asarray(st["ball"], dtype=np.float32)
 

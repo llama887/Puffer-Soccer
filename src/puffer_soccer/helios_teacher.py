@@ -313,7 +313,7 @@ class HeliosTeacher:  # pylint: disable=too-few-public-methods
             else positions[: self.players_per_team]
         )
         ball_xy = ball[:2]
-        ball_velocity = ball[2:4]
+        ball_velocity = ball[3:5]
         context = TeamContext(
             positions=team_positions,
             rotations=team_rotations,

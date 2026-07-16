@@ -60,10 +60,20 @@ class LegacyObservationPolicy(torch.nn.Module):  # type: ignore[name-defined]
 
     is_continuous = False
 
-    def __init__(self, env, *, hidden_size: int, encoder_output_size: int) -> None:
+    def __init__(
+        self,
+        env,
+        *,
+        hidden_size: int,
+        encoder_output_size: int,
+        input_size: int | None = None,
+        action_dim: int | None = None,
+    ) -> None:
         super().__init__()
-        obs_dim = int(env.single_observation_space.shape[0])
-        act_dim = int(env.single_action_space.n)
+        env_obs_dim = int(env.single_observation_space.shape[0])
+        obs_dim = env_obs_dim if input_size is None else int(input_size)
+        act_dim = int(env.single_action_space.n) if action_dim is None else int(action_dim)
+        self.input_size = obs_dim
         self.discrete = True
         self.net = torch.nn.Sequential(
             train_pufferl.pufferlib.pytorch.layer_init(torch.nn.Linear(obs_dim, hidden_size)),
@@ -76,6 +86,25 @@ class LegacyObservationPolicy(torch.nn.Module):  # type: ignore[name-defined]
         self.action_head = torch.nn.Linear(encoder_output_size, act_dim)
         self.value_head = torch.nn.Linear(encoder_output_size, 1)
 
+    def _adapt_observations(self, observations):
+        """Return observations with the width expected by the legacy checkpoint.
+
+        Old flat-observation checkpoints were trained before the ball had height, so their MLP
+        expects the self block, the first five ball features, and then the player blocks. The
+        live environment now inserts two ball features at columns 23 and 24. Dropping only those
+        two columns preserves the old semantic layout while allowing old bots to run in the new
+        environment as ground-ball policies that simply ignore lofted-state information.
+        """
+
+        if observations.shape[-1] == self.input_size:
+            return observations
+        if observations.shape[-1] == self.input_size + 2:
+            return torch.cat([observations[..., :23], observations[..., 25:]], dim=-1)
+        raise ValueError(
+            f"legacy checkpoint expected observation width {self.input_size}, "
+            f"got {observations.shape[-1]}"
+        )
+
     def encode_observations(self, observations, state=None):
         """Return the legacy flat-observation feature vector consumed by the LSTM wrapper.
 
@@ -86,7 +115,7 @@ class LegacyObservationPolicy(torch.nn.Module):  # type: ignore[name-defined]
         """
 
         _ = state
-        return self.net(observations)
+        return self.net(self._adapt_observations(observations))
 
     def decode_actions(self, hidden):
         """Decode legacy hidden features into action logits and scalar values."""
@@ -436,19 +465,23 @@ def _is_legacy_observation_policy(state_dict: dict[str, Any]) -> bool:
 def infer_players_per_team_from_state(state_dict: dict[str, Any]) -> int | None:
     """Infer the soccer team size encoded by a legacy checkpoint's input layer.
 
-    The environment observation width is ``16 + 14 * players_per_team``. Current checkpoints are
-    team-size agnostic in the first policy layer, but the old flat-observation MLP stores this
-    width directly in ``policy.net.0.weight``. Returning ``None`` for newer checkpoints keeps the
-    CLI value authoritative when no inference is possible.
+    The current environment observation width is ``18 + 14 * players_per_team`` because the
+    ball block includes height and vertical speed. Older flat-observation checkpoints used
+    ``16 + 14 * players_per_team`` before the ball became 3D. Current checkpoints are team-size
+    agnostic in the first policy layer, but the old flat-observation MLP stores this width
+    directly in ``policy.net.0.weight``. Returning ``None`` for newer checkpoints keeps the CLI
+    value authoritative when no inference is possible.
     """
 
     first_weight = state_dict.get("policy.net.0.weight")
     if not isinstance(first_weight, torch.Tensor):
         return None
     obs_dim = int(first_weight.shape[1])
-    if obs_dim < 30 or (obs_dim - 16) % 14 != 0:
-        return None
-    return int((obs_dim - 16) // 14)
+    if obs_dim >= 32 and (obs_dim - 18) % 14 == 0:
+        return int((obs_dim - 18) // 14)
+    if obs_dim >= 30 and (obs_dim - 16) % 14 == 0:
+        return int((obs_dim - 16) // 14)
+    return None
 
 
 def build_legacy_policy_for_state(env, state_dict: dict[str, Any]) -> Any:
@@ -456,12 +489,21 @@ def build_legacy_policy_for_state(env, state_dict: dict[str, Any]) -> Any:
 
     first_weight = state_dict["policy.net.0.weight"]
     second_weight = state_dict["policy.net.2.weight"]
+    action_weight = state_dict.get("policy.action_head.weight")
     hidden_size = int(first_weight.shape[0])
+    input_size = int(first_weight.shape[1])
     encoder_output_size = int(second_weight.shape[0])
+    action_dim = (
+        int(action_weight.shape[0])
+        if isinstance(action_weight, torch.Tensor)
+        else int(env.single_action_space.n)
+    )
     core = LegacyObservationPolicy(
         env,
         hidden_size=hidden_size,
         encoder_output_size=encoder_output_size,
+        input_size=input_size,
+        action_dim=action_dim,
     )
     if not any(key.startswith(("lstm.", "cell.")) for key in state_dict):
         return core

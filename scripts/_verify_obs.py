@@ -17,14 +17,14 @@ obs_env, _ = env.reset(seed=42)
 state = env.get_state(0)
 positions = state["positions"]  # (10, 2)
 rotations = state["rotations"]  # (10,)
-ball = state["ball"]  # (bx, by, bvx, bvy)
+ball = state["ball"]  # (bx, by, bz, bvx, bvy, bvz)
 blue_left = state["blue_left"]
 
 team = np.zeros(10, dtype=np.int32)
 team[5:] = 1
 
 bxy_one = np.array([[ball[0], ball[1]]], dtype=np.float32)
-bv = np.array([ball[2], ball[3]], dtype=np.float32)
+bv = np.array([ball[3], ball[4]], dtype=np.float32)
 
 py_obs_blue = build_observation_batch(
     agents_xy=positions,

@@ -29,9 +29,15 @@ sys.modules[_spec.name] = _train
 _spec.loader.exec_module(_train)
 
 from puffer_soccer.envs.marl2d import make_native_vec_env
+from puffer_soccer.envs.marl2d.core import (
+    DISCRETE_ACTION_COUNT,
+    DISCRETE_GROUND_KICK_ACTION_START,
+    DISCRETE_KICK_STRENGTHS,
+    DISCRETE_LOFTED_KICK_ACTION_START,
+)
 
-KICK_ACTION_MIN = 5
-KICK_ACTION_MAX = 12
+KICK_ACTION_MIN = DISCRETE_GROUND_KICK_ACTION_START
+KICK_ACTION_MAX = DISCRETE_LOFTED_KICK_ACTION_START + len(DISCRETE_KICK_STRENGTHS) - 1
 MODEL_NAME_RE = re.compile(r"model_(\d+)\.pt$")
 
 
@@ -46,7 +52,7 @@ def run_checkpoint(ckpt_path: Path, ppt: int, num_envs: int, steps: int, device:
     policy.load_state_dict(state, strict=True)
     policy.eval()
     obs, _ = env.reset(seed=seed)
-    total = np.zeros(13, dtype=np.int64)
+    total = np.zeros(DISCRETE_ACTION_COUNT, dtype=np.int64)
     with torch.no_grad():
         for _ in range(steps):
             obs_t = torch.from_numpy(obs).to(device)

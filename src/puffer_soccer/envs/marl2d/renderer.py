@@ -47,6 +47,7 @@ class SoccerRenderer:
         blue = (0, 0, 255)
         red = (255, 0, 0)
         yellow = (255, 255, 0)
+        shadow = (40, 90, 40)
 
         field = pygame.Surface(self.screen_size)
         field.fill(green)
@@ -95,10 +96,12 @@ class SoccerRenderer:
             dy = math.sin(rot) * 1.0 * self.r_to_s
             pygame.draw.line(field, yellow, (x, y), (x + dx, y + dy), 2)
 
-        bx, by, _, _ = state["ball"]
+        bx, by, bz, _, _, _ = state["ball"]
         bx = (bx + off_x) * self.r_to_s
         by = (by + off_y) * self.r_to_s
-        pygame.draw.circle(field, white, (int(bx), int(by)), int(1.0 * self.r_to_s))
+        ball_radius = int((1.0 + 0.05 * min(float(bz), 12.0)) * self.r_to_s)
+        pygame.draw.circle(field, shadow, (int(bx), int(by)), int(0.75 * self.r_to_s))
+        pygame.draw.circle(field, white, (int(bx), int(by)), ball_radius)
 
         goals_blue, goals_red = state["goals"]
         font = pygame.font.SysFont("comicsansms", 48)
@@ -146,6 +149,7 @@ class SoccerRenderer:
         blue = (0, 0, 255)
         red = (255, 0, 0)
         yellow = (255, 255, 0)
+        shadow = (40, 90, 40)
 
         x_out_start = int((self.field_size[0] / 2 - self.in_field_size[0] / 2) * self.r_to_s)
         y_out_start = int((self.field_size[1] / 2 - self.in_field_size[1] / 2) * self.r_to_s)
@@ -189,10 +193,12 @@ class SoccerRenderer:
             dy = int(math.sin(rot) * 1.0 * self.r_to_s)
             self._line(frame, x, y, x + dx, y + dy, yellow, 2)
 
-        bx, by, _, _ = state["ball"]
+        bx, by, bz, _, _, _ = state["ball"]
         bx = int((bx + off_x) * self.r_to_s)
         by = int((by + off_y) * self.r_to_s)
-        self._circle(frame, bx, by, int(1.0 * self.r_to_s), white)
+        ball_radius = int((1.0 + 0.05 * min(float(bz), 12.0)) * self.r_to_s)
+        self._circle(frame, bx, by, int(0.75 * self.r_to_s), shadow)
+        self._circle(frame, bx, by, ball_radius, white)
         return frame
 
     def render(self, state: dict[str, Any]) -> np.ndarray | None:
