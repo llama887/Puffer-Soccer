@@ -95,10 +95,26 @@ class SoccerRenderer:
             dy = math.sin(rot) * 1.0 * self.r_to_s
             pygame.draw.line(field, yellow, (x, y), (x + dx, y + dy), 2)
 
+        offside_marked = state.get("offside_marked")
+        if offside_marked is not None:
+            for i in range(positions.shape[0]):
+                if not offside_marked[i]:
+                    continue
+                x = (positions[i, 0] + off_x) * self.r_to_s
+                y = (positions[i, 1] + off_y) * self.r_to_s
+                pygame.draw.circle(field, (255, 140, 0), (int(x), int(y)), int(1.4 * self.r_to_s), 3)
+
         bx, by, _, _ = state["ball"]
         bx = (bx + off_x) * self.r_to_s
         by = (by + off_y) * self.r_to_s
         pygame.draw.circle(field, white, (int(bx), int(by)), int(1.0 * self.r_to_s))
+
+        if state.get("play_state", 0):
+            rx, ry = state["restart_spot"]
+            rx = (rx + off_x) * self.r_to_s
+            ry = (ry + off_y) * self.r_to_s
+            restart_col = blue if state.get("restart_team", 0) == 0 else red
+            pygame.draw.circle(field, restart_col, (int(rx), int(ry)), int(1.6 * self.r_to_s), 2)
 
         goals_blue, goals_red = state["goals"]
         font = pygame.font.SysFont("comicsansms", 48)
@@ -189,10 +205,28 @@ class SoccerRenderer:
             dy = int(math.sin(rot) * 1.0 * self.r_to_s)
             self._line(frame, x, y, x + dx, y + dy, yellow, 2)
 
+        offside_marked = state.get("offside_marked")
+        if offside_marked is not None:
+            orange = (255, 140, 0)
+            for i in range(positions.shape[0]):
+                if not offside_marked[i]:
+                    continue
+                x = int((positions[i, 0] + off_x) * self.r_to_s)
+                y = int((positions[i, 1] + off_y) * self.r_to_s)
+                self._circle(frame, x, y, int(0.3 * self.r_to_s), orange)
+
         bx, by, _, _ = state["ball"]
         bx = int((bx + off_x) * self.r_to_s)
         by = int((by + off_y) * self.r_to_s)
         self._circle(frame, bx, by, int(1.0 * self.r_to_s), white)
+
+        if state.get("play_state", 0):
+            rx, ry = state["restart_spot"]
+            rx = int((rx + off_x) * self.r_to_s)
+            ry = int((ry + off_y) * self.r_to_s)
+            restart_col = blue if state.get("restart_team", 0) == 0 else red
+            self._circle(frame, rx, ry, int(0.35 * self.r_to_s), restart_col)
+
         return frame
 
     def render(self, state: dict[str, Any]) -> np.ndarray | None:

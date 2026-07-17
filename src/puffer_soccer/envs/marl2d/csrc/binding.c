@@ -19,6 +19,16 @@
 #define DISCRETE_KICK_BUCKETS 8
 #define DISCRETE_ACTION_COUNT (DISCRETE_KICK_ACTION_START + DISCRETE_KICK_BUCKETS)
 
+#define PLAY_STATE_IN_PLAY 0
+#define PLAY_STATE_THROW_IN 1
+#define PLAY_STATE_GOAL_KICK 2
+#define PLAY_STATE_CORNER_KICK 3
+#define PLAY_STATE_OFFSIDE_FREE_KICK 4
+#define REFEREE_OBS_EXTRA 5
+#define REFEREE_STATE_EXTRA 5
+#define REFEREE_DEAD_BALL_RADIUS 9.0f
+#define REFEREE_GOAL_AREA_DEPTH_FRAC 0.12f
+
 typedef struct {
     float score;
     float episode_return;
@@ -91,6 +101,14 @@ typedef struct {
     float base_goal_half_h;
     int obs_size;
     int state_size;
+    int enable_referee;
+    int play_state;
+    int restart_team;
+    float restart_x;
+    float restart_y;
+    int last_touch_team;
+    int last_touch_player;
+    unsigned char offside_marked[MAX_PLAYERS];
     uint32_t rng;
     Agent terminal_render_agents[MAX_PLAYERS];
     int terminal_render_num_steps;
@@ -143,12 +161,12 @@ static float randf(uint32_t* s, float lo, float hi) {
     return lo + (hi - lo) * r;
 }
 
-static int obs_size_for_team(int n) {
-    return 16 + 14*n;
+static int obs_size_for_team(int n, int enable_referee) {
+    return 16 + 14*n + (enable_referee ? REFEREE_OBS_EXTRA : 0);
 }
 
-static int state_size_for_team(int n) {
-    return 5 + 34*n;
+static int state_size_for_team(int n, int enable_referee) {
+    return 5 + 34*n + (enable_referee ? REFEREE_STATE_EXTRA : 0);
 }
 
 static void get_one_hot(int id, float* out11) {
@@ -302,7 +320,18 @@ static void sample_active_team_size(Env* env) {
     env->active_players_per_team = min_size + (int)(next_u32(&env->rng) % (uint32_t)(max_size - min_size + 1));
 }
 
+static void reset_referee_state(Env* env) {
+    env->play_state = PLAY_STATE_IN_PLAY;
+    env->restart_team = 0;
+    env->restart_x = 0.0f;
+    env->restart_y = 0.0f;
+    env->last_touch_team = -1;
+    env->last_touch_player = -1;
+    memset(env->offside_marked, 0, sizeof(env->offside_marked));
+}
+
 static void full_reset(Env* env, int hard_reset_score) {
+    reset_referee_state(env);
     env->num_steps = 0;
     env->cumulative_episode_return = 0.0f;
     env->cumulative_blue_team_episode_return = 0.0f;
@@ -363,12 +392,14 @@ static float discrete_kick_scale(int action) {
     return kick_scales[kick_idx];
 }
 
-static void ball_check_hit(Env* env, const float* kick_scales) {
+static int ball_check_hit(Env* env, const float* kick_scales) {
     const float ball_radius = 1.0f;
     const float body_speed = 0.6f;
     const float leg_speed = 4.0f;
     const float agent_radius = 1.0f;
     const float leg_length = 3.0f;
+    int step_toucher = -1;
+    float step_best_scale = 0.0f;
 
     for (int i = 0; i < env->num_players; i++) {
         Agent* a = &env->agents[i];
@@ -387,6 +418,10 @@ static void ball_check_hit(Env* env, const float* kick_scales) {
             if (delta >= 0.0f && d < 2.0f * agent_radius + 2.0f * ball_radius) {
                 env->ball_vx += leg_speed * kick_scales[i] * cc;
                 env->ball_vy += leg_speed * kick_scales[i] * ss;
+                if (kick_scales[i] > step_best_scale) {
+                    step_best_scale = kick_scales[i];
+                    step_toucher = i;
+                }
             }
         }
     }
@@ -397,6 +432,7 @@ static void ball_check_hit(Env* env, const float* kick_scales) {
         env->ball_vx *= ratio;
         env->ball_vy *= ratio;
     }
+    return step_toucher;
 }
 
 static int visible(float focus_rot, float obj_rot, float vision_range, float* obj_rot_view) {
@@ -494,6 +530,15 @@ static void compute_observations(Env* env, int goal_scored_team) {
         for (int k = 0; k < 11; k++) state_base[sidx++] = onehot[k];
     }
 
+    if (env->enable_referee) {
+        int dead_ball = (env->play_state != PLAY_STATE_IN_PLAY);
+        state_base[sidx++] = (float)env->play_state / 4.0f;
+        state_base[sidx++] = dead_ball ? (float)env->restart_team : -1.0f;
+        state_base[sidx++] = sign_state * env->restart_x / half_width;
+        state_base[sidx++] = sign_state * env->restart_y / half_height;
+        state_base[sidx++] = dead_ball ? 1.0f : 0.0f;
+    }
+
     for (int a = 1; a < np; a++) {
         memcpy(state + a * env->state_size, state_base, sizeof(float) * env->state_size);
     }
@@ -548,6 +593,15 @@ static void compute_observations(Env* env, int goal_scored_team) {
             for (int k = 0; k < 7; k++) out[o++] = aobs[k];
         }
 
+        if (env->enable_referee) {
+            int dead_ball = (env->play_state != PLAY_STATE_IN_PLAY);
+            out[o++] = dead_ball ? 1.0f : 0.0f;
+            out[o++] = dead_ball ? ((focus->team == env->restart_team) ? 1.0f : -1.0f) : 0.0f;
+            out[o++] = env->offside_marked[i] ? 1.0f : 0.0f;
+            out[o++] = dead_ball ? sign * (env->restart_x - focus->x) / half_width : 0.0f;
+            out[o++] = dead_ball ? sign * (env->restart_y - focus->y) / half_height : 0.0f;
+        }
+
         float r = 0.0f;
         if (goal_scored_team >= 0) {
             if (!env->opponents_enabled) {
@@ -581,7 +635,8 @@ static void init_env_common(
     int do_team_switch,
     int opponents_enabled,
     float vision_range,
-    int reset_setup
+    int reset_setup,
+    int enable_referee
 ) {
     memset(&env->log, 0, sizeof(Log));
     env->players_per_team = players_per_team;
@@ -596,8 +651,9 @@ static void init_env_common(
     env->reset_setup = reset_setup;
     env->vision_range = vision_range;
     env->action_mode = action_mode;
-    env->obs_size = obs_size_for_team(players_per_team);
-    env->state_size = state_size_for_team(players_per_team);
+    env->enable_referee = enable_referee;
+    env->obs_size = obs_size_for_team(players_per_team, enable_referee);
+    env->state_size = state_size_for_team(players_per_team, enable_referee);
     env->last_goals_blue = 0;
     env->last_goals_red = 0;
     env->last_done = 0;
@@ -638,6 +694,155 @@ static void c_reset(Env* env, int seed) {
     clear_terminal_render_state(env);
     clear_outputs(env);
     compute_observations(env, -1);
+}
+
+/* --- Referee module: out-of-bounds restarts and offside (see EnvConfig.enable_referee). --- */
+
+static void apply_dead_ball_radial_clamp(Env* env) {
+    for (int i = 0; i < env->num_players; i++) {
+        if (is_inactive_player(env, i)) continue;
+        Agent* a = &env->agents[i];
+        if (a->team == env->restart_team) continue;
+        float dx = a->x - env->restart_x;
+        float dy = a->y - env->restart_y;
+        float d = sqrtf(dx*dx + dy*dy);
+        if (d > 1e-4f && d < REFEREE_DEAD_BALL_RADIUS) {
+            float scale = REFEREE_DEAD_BALL_RADIUS / d;
+            a->x = clampf(env->restart_x + dx * scale, env->x_out_start, env->x_out_end);
+            a->y = clampf(env->restart_y + dy * scale, env->y_out_start, env->y_out_end);
+        } else if (d <= 1e-4f) {
+            float sign = team_on_left(env, a->team) ? -1.0f : 1.0f;
+            a->x = clampf(env->restart_x + sign * REFEREE_DEAD_BALL_RADIUS, env->x_out_start, env->x_out_end);
+            a->y = env->restart_y;
+        }
+    }
+}
+
+static void start_throw_in(Env* env) {
+    env->play_state = PLAY_STATE_THROW_IN;
+    env->restart_team = (env->last_touch_team < 0 || env->last_touch_team == 0) ? 1 : 0;
+    env->restart_x = clampf(env->ball_x, env->x_out_start, env->x_out_end);
+    env->restart_y = (env->ball_y < 0.0f) ? env->y_out_start : env->y_out_end;
+    env->ball_x = env->restart_x;
+    env->ball_y = env->restart_y;
+    env->ball_vx = 0.0f;
+    env->ball_vy = 0.0f;
+    memset(env->offside_marked, 0, sizeof(env->offside_marked));
+}
+
+static void start_goal_or_corner_kick(Env* env, int went_out_at_start) {
+    int defending_team = went_out_at_start
+        ? (team_on_left(env, 0) ? 0 : 1)
+        : (team_on_left(env, 0) ? 1 : 0);
+    int attacking_team = 1 - defending_team;
+    int restart_y_at_start_edge = (env->ball_y < 0.0f);
+
+    if (env->last_touch_team < 0 || env->last_touch_team == attacking_team) {
+        env->play_state = PLAY_STATE_GOAL_KICK;
+        env->restart_team = defending_team;
+        float box_depth = REFEREE_GOAL_AREA_DEPTH_FRAC * field_half_width(env);
+        env->restart_x = went_out_at_start
+            ? env->x_out_start + box_depth
+            : env->x_out_end - box_depth;
+        env->restart_y = 0.0f;
+    } else {
+        env->play_state = PLAY_STATE_CORNER_KICK;
+        env->restart_team = attacking_team;
+        env->restart_x = went_out_at_start ? env->x_out_start : env->x_out_end;
+        env->restart_y = restart_y_at_start_edge ? env->y_out_start : env->y_out_end;
+    }
+
+    env->ball_x = env->restart_x;
+    env->ball_y = env->restart_y;
+    env->ball_vx = 0.0f;
+    env->ball_vy = 0.0f;
+    memset(env->offside_marked, 0, sizeof(env->offside_marked));
+}
+
+/* Approximates "second-to-last opponent" (usually excludes only the goalkeeper) by the
+ * second-highest position along the attacking team's forward axis among active defenders.
+ * Fewer than two active defenders means no offside line can be formed, so nobody is offside. */
+static float second_to_last_defender_forwardness(const Env* env, int attacking_team, float attack_sign) {
+    int defending_team = 1 - attacking_team;
+    float best = -1e9f;
+    float second = -1e9f;
+    for (int j = 0; j < env->num_players; j++) {
+        if (is_inactive_player(env, j)) continue;
+        if (env->agents[j].team != defending_team) continue;
+        float fw = attack_sign * env->agents[j].x;
+        if (fw > best) {
+            second = best;
+            best = fw;
+        } else if (fw > second) {
+            second = fw;
+        }
+    }
+    return second;
+}
+
+/* Marks every teammate of `passer_idx` (other than the passer) who is currently ahead of both
+ * the ball and the second-to-last defender, in their own attacking half. This snapshots
+ * positions at the moment the ball changes hands between teammates, which is this engine's
+ * closest analogue to "the moment the ball was played" since there is no discrete pass action. */
+static void mark_offside(Env* env, int passer_idx) {
+    int team = env->agents[passer_idx].team;
+    float attack_sign = team_on_left(env, team) ? 1.0f : -1.0f;
+    float def_line = second_to_last_defender_forwardness(env, team, attack_sign);
+    float ball_fw = attack_sign * env->ball_x;
+    memset(env->offside_marked, 0, sizeof(env->offside_marked));
+    for (int j = 0; j < env->num_players; j++) {
+        if (j == passer_idx) continue;
+        if (is_inactive_player(env, j)) continue;
+        if (env->agents[j].team != team) continue;
+        float fw = attack_sign * env->agents[j].x;
+        if (fw > 0.0f && fw > def_line && fw > ball_fw) {
+            env->offside_marked[j] = 1;
+        }
+    }
+}
+
+static void trigger_offside_free_kick(Env* env, int offender_idx) {
+    Agent* offender = &env->agents[offender_idx];
+    env->play_state = PLAY_STATE_OFFSIDE_FREE_KICK;
+    env->restart_team = 1 - env->agents[offender_idx].team;
+    env->restart_x = clampf(offender->x, env->x_out_start, env->x_out_end);
+    env->restart_y = clampf(offender->y, env->y_out_start, env->y_out_end);
+    env->ball_x = env->restart_x;
+    env->ball_y = env->restart_y;
+    env->ball_vx = 0.0f;
+    env->ball_vy = 0.0f;
+    memset(env->offside_marked, 0, sizeof(env->offside_marked));
+}
+
+/* Single entry point for referee touch handling: resumes play when the restart team touches
+ * the ball during a dead ball, and detects pass/offside events during live play. Also callable
+ * directly (bypassing kick physics) so tests can exercise the rule logic deterministically. */
+static void update_touch_tracking(Env* env, int step_toucher) {
+    if (step_toucher < 0) return;
+    int new_team = env->agents[step_toucher].team;
+
+    if (env->play_state == PLAY_STATE_THROW_IN ||
+        env->play_state == PLAY_STATE_GOAL_KICK ||
+        env->play_state == PLAY_STATE_CORNER_KICK) {
+        if (new_team == env->restart_team) {
+            env->play_state = PLAY_STATE_IN_PLAY;
+        }
+    }
+
+    if (env->play_state == PLAY_STATE_IN_PLAY) {
+        if (env->last_touch_player >= 0 && new_team == env->last_touch_team &&
+                step_toucher != env->last_touch_player) {
+            mark_offside(env, env->last_touch_player);
+            if (env->offside_marked[step_toucher]) {
+                trigger_offside_free_kick(env, step_toucher);
+            }
+        } else if (env->last_touch_player >= 0 && new_team != env->last_touch_team) {
+            memset(env->offside_marked, 0, sizeof(env->offside_marked));
+        }
+    }
+
+    env->last_touch_player = step_toucher;
+    env->last_touch_team = new_team;
 }
 
 static void c_step(Env* env) {
@@ -707,7 +912,14 @@ static void c_step(Env* env) {
         a->y = clampf(a->y + sin_comp, env->y_out_start, env->y_out_end);
     }
 
-    ball_check_hit(env, kick_scales);
+    if (env->enable_referee && env->play_state != PLAY_STATE_IN_PLAY) {
+        apply_dead_ball_radial_clamp(env);
+        for (int i = 0; i < np; i++) {
+            if (env->agents[i].team != env->restart_team) kick_scales[i] = 0.0f;
+        }
+    }
+
+    int step_toucher = ball_check_hit(env, kick_scales);
 
     env->ball_x += env->ball_vx;
     env->ball_y += env->ball_vy;
@@ -719,45 +931,75 @@ static void c_step(Env* env) {
         env->ball_vy = 0.0f;
     }
 
-    int goal_scored = -1;
-    if (fabsf(env->ball_y) <= env->goal_half_h) {
-        if (env->ball_x < env->x_out_start) {
-            goal_scored = team_on_left(env, 0) ? 1 : 0;
-            if (goal_scored == 0) env->goals_blue += 1;
-            else env->goals_red += 1;
-        } else if (env->ball_x > env->x_out_end) {
-            goal_scored = team_on_left(env, 0) ? 0 : 1;
-            if (goal_scored == 0) env->goals_blue += 1;
-            else env->goals_red += 1;
-        }
-    } else {
-        if (env->ball_x < env->x_out_start) {
-            env->ball_x = env->x_out_start;
-            env->ball_vx = -env->ball_vx;
-            env->ball_vx *= 0.6f;
-            env->ball_vy *= 0.6f;
-        } else if (env->ball_x > env->x_out_end) {
-            env->ball_x = env->x_out_end;
-            env->ball_vx = -env->ball_vx;
-            env->ball_vx *= 0.6f;
-            env->ball_vy *= 0.6f;
-        }
+    if (env->enable_referee) {
+        update_touch_tracking(env, step_toucher);
     }
 
-    if (env->ball_y < env->y_out_start) {
-        env->ball_y = env->y_out_start;
-        env->ball_vy = -env->ball_vy;
-        env->ball_vx *= 0.6f;
-        env->ball_vy *= 0.6f;
-    } else if (env->ball_y > env->y_out_end) {
-        env->ball_y = env->y_out_end;
-        env->ball_vy = -env->ball_vy;
-        env->ball_vx *= 0.6f;
-        env->ball_vy *= 0.6f;
+    int goal_scored = -1;
+    if (env->enable_referee && env->play_state != PLAY_STATE_IN_PLAY) {
+        env->ball_x = env->restart_x;
+        env->ball_y = env->restart_y;
+        env->ball_vx = 0.0f;
+        env->ball_vy = 0.0f;
+    } else {
+        if (fabsf(env->ball_y) <= env->goal_half_h) {
+            if (env->ball_x < env->x_out_start) {
+                goal_scored = team_on_left(env, 0) ? 1 : 0;
+                if (goal_scored == 0) env->goals_blue += 1;
+                else env->goals_red += 1;
+            } else if (env->ball_x > env->x_out_end) {
+                goal_scored = team_on_left(env, 0) ? 0 : 1;
+                if (goal_scored == 0) env->goals_blue += 1;
+                else env->goals_red += 1;
+            }
+        } else {
+            if (env->ball_x < env->x_out_start) {
+                if (env->enable_referee) {
+                    start_goal_or_corner_kick(env, 1);
+                } else {
+                    env->ball_x = env->x_out_start;
+                    env->ball_vx = -env->ball_vx;
+                    env->ball_vx *= 0.6f;
+                    env->ball_vy *= 0.6f;
+                }
+            } else if (env->ball_x > env->x_out_end) {
+                if (env->enable_referee) {
+                    start_goal_or_corner_kick(env, 0);
+                } else {
+                    env->ball_x = env->x_out_end;
+                    env->ball_vx = -env->ball_vx;
+                    env->ball_vx *= 0.6f;
+                    env->ball_vy *= 0.6f;
+                }
+            }
+        }
+
+        if (env->play_state == PLAY_STATE_IN_PLAY) {
+            if (env->ball_y < env->y_out_start) {
+                if (env->enable_referee) {
+                    start_throw_in(env);
+                } else {
+                    env->ball_y = env->y_out_start;
+                    env->ball_vy = -env->ball_vy;
+                    env->ball_vx *= 0.6f;
+                    env->ball_vy *= 0.6f;
+                }
+            } else if (env->ball_y > env->y_out_end) {
+                if (env->enable_referee) {
+                    start_throw_in(env);
+                } else {
+                    env->ball_y = env->y_out_end;
+                    env->ball_vy = -env->ball_vy;
+                    env->ball_vx *= 0.6f;
+                    env->ball_vy *= 0.6f;
+                }
+            }
+        }
     }
 
     if (goal_scored >= 0) {
         reset_field(env);
+        reset_referee_state(env);
     }
 
     int done = (env->num_steps >= env->game_length);
@@ -798,21 +1040,26 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
     float ball_vx, float ball_vy, int goals_blue, int goals_red, int num_steps, int blue_left) {
     npy_intp pos_dims[2] = {env->num_players, 2};
     npy_intp rot_dims[1] = {env->num_players};
+    npy_intp marked_dims[1] = {env->num_players};
 
     PyObject* pos = PyArray_SimpleNew(2, pos_dims, NPY_FLOAT32);
     PyObject* rot = PyArray_SimpleNew(1, rot_dims, NPY_FLOAT32);
-    if (!pos || !rot) {
+    PyObject* offside_marked = PyArray_SimpleNew(1, marked_dims, NPY_BOOL);
+    if (!pos || !rot || !offside_marked) {
         Py_XDECREF(pos);
         Py_XDECREF(rot);
+        Py_XDECREF(offside_marked);
         return NULL;
     }
 
     float* pdat = (float*)PyArray_DATA((PyArrayObject*)pos);
     float* rdat = (float*)PyArray_DATA((PyArrayObject*)rot);
+    unsigned char* mdat = (unsigned char*)PyArray_DATA((PyArrayObject*)offside_marked);
     for (int i = 0; i < env->num_players; i++) {
         pdat[i*2] = agents[i].x;
         pdat[i*2 + 1] = agents[i].y;
         rdat[i] = agents[i].rot;
+        mdat[i] = env->offside_marked[i];
     }
 
     PyObject* ball = Py_BuildValue("(ffff)", ball_x, ball_y, ball_vx, ball_vy);
@@ -822,9 +1069,14 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
     PyObject* blue_left_obj = PyBool_FromLong(blue_left);
     PyObject* field_scale_obj = PyFloat_FromDouble(env->field_scale);
     PyObject* spawn_difficulty_obj = PyFloat_FromDouble(env->spawn_difficulty);
-    if (!ball || !goals || !d || !num_steps_obj || !blue_left_obj || !field_scale_obj || !spawn_difficulty_obj) {
+    PyObject* play_state_obj = PyLong_FromLong(env->play_state);
+    PyObject* restart_team_obj = PyLong_FromLong(env->restart_team);
+    PyObject* restart_spot_obj = Py_BuildValue("(ff)", env->restart_x, env->restart_y);
+    if (!ball || !goals || !d || !num_steps_obj || !blue_left_obj || !field_scale_obj ||
+            !spawn_difficulty_obj || !play_state_obj || !restart_team_obj || !restart_spot_obj) {
         Py_XDECREF(pos);
         Py_XDECREF(rot);
+        Py_XDECREF(offside_marked);
         Py_XDECREF(ball);
         Py_XDECREF(goals);
         Py_XDECREF(d);
@@ -832,6 +1084,9 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         Py_XDECREF(blue_left_obj);
         Py_XDECREF(field_scale_obj);
         Py_XDECREF(spawn_difficulty_obj);
+        Py_XDECREF(play_state_obj);
+        Py_XDECREF(restart_team_obj);
+        Py_XDECREF(restart_spot_obj);
         return NULL;
     }
 
@@ -842,9 +1097,14 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         PyDict_SetItemString(d, "num_steps", num_steps_obj) < 0 ||
         PyDict_SetItemString(d, "blue_left", blue_left_obj) < 0 ||
         PyDict_SetItemString(d, "field_scale", field_scale_obj) < 0 ||
-        PyDict_SetItemString(d, "spawn_difficulty", spawn_difficulty_obj) < 0) {
+        PyDict_SetItemString(d, "spawn_difficulty", spawn_difficulty_obj) < 0 ||
+        PyDict_SetItemString(d, "play_state", play_state_obj) < 0 ||
+        PyDict_SetItemString(d, "restart_team", restart_team_obj) < 0 ||
+        PyDict_SetItemString(d, "restart_spot", restart_spot_obj) < 0 ||
+        PyDict_SetItemString(d, "offside_marked", offside_marked) < 0) {
         Py_DECREF(pos);
         Py_DECREF(rot);
+        Py_DECREF(offside_marked);
         Py_DECREF(ball);
         Py_DECREF(goals);
         Py_DECREF(d);
@@ -852,17 +1112,24 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         Py_DECREF(blue_left_obj);
         Py_DECREF(field_scale_obj);
         Py_DECREF(spawn_difficulty_obj);
+        Py_DECREF(play_state_obj);
+        Py_DECREF(restart_team_obj);
+        Py_DECREF(restart_spot_obj);
         return NULL;
     }
 
     Py_DECREF(pos);
     Py_DECREF(rot);
+    Py_DECREF(offside_marked);
     Py_DECREF(ball);
     Py_DECREF(goals);
     Py_DECREF(num_steps_obj);
     Py_DECREF(blue_left_obj);
     Py_DECREF(field_scale_obj);
     Py_DECREF(spawn_difficulty_obj);
+    Py_DECREF(play_state_obj);
+    Py_DECREF(restart_team_obj);
+    Py_DECREF(restart_spot_obj);
     return d;
 }
 
@@ -998,18 +1265,19 @@ static int validate_vector_arrays(
 static PyObject* py_env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyObject *obs_obj, *act_obj, *rew_obj, *term_obj, *trunc_obj, *state_obj;
     int seed, players_per_team, game_length, action_mode, do_team_switch, opponents_enabled, reset_setup;
+    int enable_referee = 0;
     float vision_range;
 
     static char* kwlist[] = {
         "observations", "actions", "rewards", "terminals", "truncations", "global_states",
         "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
-        "opponents_enabled", "vision_range", "reset_setup", NULL
+        "opponents_enabled", "vision_range", "reset_setup", "enable_referee", NULL
     };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiifi", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiifi|i", kwlist,
             &obs_obj, &act_obj, &rew_obj, &term_obj, &trunc_obj, &state_obj,
             &seed, &players_per_team, &game_length, &action_mode,
-            &do_team_switch, &opponents_enabled, &vision_range, &reset_setup)) {
+            &do_team_switch, &opponents_enabled, &vision_range, &reset_setup, &enable_referee)) {
         return NULL;
     }
 
@@ -1056,7 +1324,8 @@ static PyObject* py_env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         do_team_switch,
         opponents_enabled,
         vision_range,
-        reset_setup
+        reset_setup,
+        enable_referee
     );
 
     Py_DECREF(obs); Py_DECREF(act); Py_DECREF(rew); Py_DECREF(term); Py_DECREF(trunc); Py_DECREF(gst);
@@ -1135,6 +1404,63 @@ static PyObject* py_env_set_random_team_size_range(PyObject* self, PyObject* arg
     Py_RETURN_NONE;
 }
 
+/* Test-only setters used to construct exact referee scenarios deterministically, without
+ * needing to replay real kick physics to move the ball/agents into position. */
+static PyObject* py_env_debug_set_ball(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    float x, y, vx, vy;
+    if (!PyArg_ParseTuple(args, "Offff", &handle_obj, &x, &y, &vx, &vy)) return NULL;
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    env->ball_x = x;
+    env->ball_y = y;
+    env->ball_vx = vx;
+    env->ball_vy = vy;
+    compute_observations(env, -1);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_env_debug_set_agent(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int idx;
+    float x, y, rot;
+    if (!PyArg_ParseTuple(args, "Oifff", &handle_obj, &idx, &x, &y, &rot)) return NULL;
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    if (idx < 0 || idx >= env->num_players) {
+        PyErr_SetString(PyExc_ValueError, "invalid agent index");
+        return NULL;
+    }
+    env->agents[idx].x = x;
+    env->agents[idx].y = y;
+    env->agents[idx].rot = rot;
+    compute_observations(env, -1);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_env_debug_trigger_touch(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    int player_idx;
+    if (!PyArg_ParseTuple(args, "Oi", &handle_obj, &player_idx)) return NULL;
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    if (player_idx < 0 || player_idx >= env->num_players) {
+        PyErr_SetString(PyExc_ValueError, "invalid agent index");
+        return NULL;
+    }
+    update_touch_tracking(env, player_idx);
+    compute_observations(env, -1);
+    Py_RETURN_NONE;
+}
+
+static PyObject* py_env_debug_get_last_touch(PyObject* self, PyObject* args) {
+    PyObject* handle_obj;
+    if (!PyArg_ParseTuple(args, "O", &handle_obj)) return NULL;
+    Env* env = unpack_env_handle(handle_obj);
+    if (!env) return NULL;
+    return Py_BuildValue("(ii)", env->last_touch_player, env->last_touch_team);
+}
+
 static PyObject* py_env_log(PyObject* self, PyObject* args) {
     PyObject* handle_obj;
     if (!PyArg_ParseTuple(args, "O", &handle_obj)) {
@@ -1204,18 +1530,19 @@ static PyObject* py_env_close(PyObject* self, PyObject* args) {
 static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyObject *obs_obj, *act_obj, *rew_obj, *term_obj, *trunc_obj, *state_obj;
     int num_envs, seed, players_per_team, game_length, action_mode, do_team_switch, opponents_enabled, reset_setup;
+    int enable_referee = 0;
     float vision_range;
 
     static char* kwlist[] = {
         "observations", "actions", "rewards", "terminals", "truncations", "global_states",
         "num_envs", "seed", "players_per_team", "game_length", "action_mode", "do_team_switch",
-        "opponents_enabled", "vision_range", "reset_setup", NULL
+        "opponents_enabled", "vision_range", "reset_setup", "enable_referee", NULL
     };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiiifi", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOOOOOiiiiiiifi|i", kwlist,
             &obs_obj, &act_obj, &rew_obj, &term_obj, &trunc_obj, &state_obj,
             &num_envs, &seed, &players_per_team, &game_length, &action_mode,
-            &do_team_switch, &opponents_enabled, &vision_range, &reset_setup)) {
+            &do_team_switch, &opponents_enabled, &vision_range, &reset_setup, &enable_referee)) {
         return NULL;
     }
 
@@ -1284,7 +1611,8 @@ static PyObject* py_vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
             do_team_switch,
             opponents_enabled,
             vision_range,
-            reset_setup
+            reset_setup,
+            enable_referee
         );
     }
 
@@ -1441,6 +1769,10 @@ static PyMethodDef Methods[] = {
     {"env_set_field_scale", py_env_set_field_scale, METH_VARARGS, "Set one env field scale"},
     {"env_set_spawn_difficulty", py_env_set_spawn_difficulty, METH_VARARGS, "Set one env spawn curriculum difficulty"},
     {"env_set_random_team_size_range", py_env_set_random_team_size_range, METH_VARARGS, "Set one env random active team-size range"},
+    {"env_debug_set_ball", py_env_debug_set_ball, METH_VARARGS, "Test-only: force one env's ball position/velocity"},
+    {"env_debug_set_agent", py_env_debug_set_agent, METH_VARARGS, "Test-only: force one env agent's position/rotation"},
+    {"env_debug_trigger_touch", py_env_debug_trigger_touch, METH_VARARGS, "Test-only: run referee touch-tracking for a given player without kick physics"},
+    {"env_debug_get_last_touch", py_env_debug_get_last_touch, METH_VARARGS, "Test-only: read one env's (last_touch_player, last_touch_team)"},
     {"env_log", py_env_log, METH_VARARGS, "Get one env log"},
     {"env_get_last_scores", py_env_get_last_scores, METH_VARARGS, "Get last scalar env scores"},
     {"env_get_state", py_env_get_state, METH_VARARGS, "Get one env state"},

@@ -33,6 +33,10 @@ DISCRETE_KICK_STRENGTHS = (
 )
 DISCRETE_ACTION_COUNT = DISCRETE_KICK_ACTION_START + len(DISCRETE_KICK_STRENGTHS)
 
+# Must match REFEREE_OBS_EXTRA / REFEREE_STATE_EXTRA in csrc/binding.c.
+REFEREE_OBS_EXTRA = 5
+REFEREE_STATE_EXTRA = 5
+
 
 def normalize_env_seed(seed: int | None) -> int:
     """Map arbitrary Python integer seeds onto the signed range accepted by the C env.
@@ -163,6 +167,7 @@ class EnvConfig:
     log_interval: int = 128
     render_mode: str | None = None
     seed: int = 0
+    enable_referee: bool = False
     buf: dict[str, np.ndarray] | None = None
 
 
@@ -199,12 +204,14 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         render_mode: str | None = None,
         buf: dict[str, np.ndarray] | None = None,
         seed: int = 0,
+        enable_referee: bool = False,
     ):
         _validate_args(players_per_team, action_mode, reset_setup)
 
         self.render_mode = render_mode
         self.players_per_team = players_per_team
         self.opponents_enabled = opponents_enabled
+        self.enable_referee = enable_referee
         self.num_players = players_per_team * 2
         self.num_envs = 1
         self.num_agents = self.num_players
@@ -214,8 +221,8 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
         self.random_team_size_min = random_team_size_min
         self.random_team_size_max = random_team_size_max
 
-        self.obs_size = 16 + 14 * players_per_team
-        self.state_size = 5 + 34 * players_per_team
+        self.obs_size = 16 + 14 * players_per_team + (REFEREE_OBS_EXTRA if enable_referee else 0)
+        self.state_size = 5 + 34 * players_per_team + (REFEREE_STATE_EXTRA if enable_referee else 0)
 
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0,
@@ -255,6 +262,7 @@ class MARL2DPufferEnv(pufferlib.PufferEnv):
             opponents_enabled=int(opponents_enabled),
             vision_range=float(vision_range),
             reset_setup=0 if reset_setup == "position" else 1,
+            enable_referee=int(enable_referee),
         )
         self._apply_random_team_size_range()
         self.tick = 0
@@ -412,6 +420,7 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         render_mode: str | None = None,
         buf: dict[str, np.ndarray] | None = None,
         seed: int = 0,
+        enable_referee: bool = False,
     ):
         if num_envs < 1:
             raise ValueError("num_envs must be positive")
@@ -420,6 +429,7 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         self.render_mode = render_mode
         self.players_per_team = players_per_team
         self.opponents_enabled = opponents_enabled
+        self.enable_referee = enable_referee
         self.num_players = players_per_team * 2
         self.num_envs = num_envs
         self.num_agents = self.num_players * num_envs
@@ -429,8 +439,8 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
         self.random_team_size_min = random_team_size_min
         self.random_team_size_max = random_team_size_max
 
-        self.obs_size = 16 + 14 * players_per_team
-        self.state_size = 5 + 34 * players_per_team
+        self.obs_size = 16 + 14 * players_per_team + (REFEREE_OBS_EXTRA if enable_referee else 0)
+        self.state_size = 5 + 34 * players_per_team + (REFEREE_STATE_EXTRA if enable_referee else 0)
 
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0,
@@ -471,6 +481,7 @@ class MARL2DNativeVecEnv(pufferlib.PufferEnv):
             opponents_enabled=int(opponents_enabled),
             vision_range=float(vision_range),
             reset_setup=0 if reset_setup == "position" else 1,
+            enable_referee=int(enable_referee),
         )
         self._apply_random_team_size_range()
         self.tick = 0
