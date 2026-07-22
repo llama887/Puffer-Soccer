@@ -31,6 +31,7 @@ from puffer_soccer.autotune import (
     vec_config_from_benchmark,
 )
 from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.envs.marl2d.core import REFEREE_OBS_EXTRA
 from puffer_soccer.league import (
     LeagueConfig,
     LeagueEntry,
@@ -168,11 +169,15 @@ class Policy(torch.nn.Module):
     ):
         super().__init__()
         obs_dim = env.single_observation_space.shape[0]
-        if (obs_dim - 16) % 14 != 0 or obs_dim < 30:
+        if (obs_dim - 16) % 14 == 0 and obs_dim >= 30:
+            self.referee_obs_extra = 0
+        elif (obs_dim - 16 - REFEREE_OBS_EXTRA) % 14 == 0 and obs_dim >= 30 + REFEREE_OBS_EXTRA:
+            self.referee_obs_extra = REFEREE_OBS_EXTRA
+        else:
             raise ValueError(
                 "soccer observations must have shape 16 + 14 * players_per_team"
             )
-        self.players_per_team = int((obs_dim - 16) // 14)
+        self.players_per_team = int((obs_dim - 16 - self.referee_obs_extra) // 14)
         self.encoder_output_size = int(encoder_output_size)
         self.player_embedding_size = int(encoder_hidden_size)
         if hasattr(env.single_action_space, "n"):
@@ -195,7 +200,16 @@ class Policy(torch.nn.Module):
             pufferlib.pytorch.layer_init(torch.nn.Linear(7, encoder_hidden_size)),
             torch.nn.ReLU(),
         )
-        combined_size = encoder_hidden_size * 6 + 2
+        if self.referee_obs_extra > 0:
+            self.referee_encoder = torch.nn.Sequential(
+                pufferlib.pytorch.layer_init(
+                    torch.nn.Linear(self.referee_obs_extra, encoder_hidden_size)
+                ),
+                torch.nn.ReLU(),
+            )
+        else:
+            self.referee_encoder = None
+        combined_size = encoder_hidden_size * (6 + (1 if self.referee_obs_extra else 0)) + 2
         self.net = torch.nn.Sequential(
             pufferlib.pytorch.layer_init(torch.nn.Linear(combined_size, encoder_hidden_size)),
             torch.nn.ReLU(),
@@ -253,7 +267,8 @@ class Policy(torch.nn.Module):
         _ = state
         self_features = observations[:, :18]
         ball_features = observations[:, 18:23]
-        player_features = observations[:, 23:].reshape(observations.shape[0], -1, 7)
+        player_end = observations.shape[1] - self.referee_obs_extra
+        player_features = observations[:, 23:player_end].reshape(observations.shape[0], -1, 7)
         teammate_count = max(0, self.players_per_team - 1)
         teammate_features = player_features[:, :teammate_count]
         opponent_features = player_features[:, teammate_count:]
@@ -262,10 +277,11 @@ class Policy(torch.nn.Module):
         ball_hidden = self.ball_encoder(ball_features)
         teammate_summary = self._masked_player_summary(teammate_features)
         opponent_summary = self._masked_player_summary(opponent_features)
-        combined = torch.cat(
-            [self_hidden, ball_hidden, teammate_summary, opponent_summary],
-            dim=-1,
-        )
+        parts = [self_hidden, ball_hidden, teammate_summary, opponent_summary]
+        if self.referee_encoder is not None:
+            referee_features = observations[:, player_end:]
+            parts.append(self.referee_encoder(referee_features))
+        combined = torch.cat(parts, dim=-1)
         return self.net(combined)
 
     def decode_actions(self, hidden):
@@ -845,6 +861,7 @@ class HeadToHeadEvaluator:
         game_length: int,
         vec_config: VecEnvConfig,
         device: str,
+        enable_referee: bool = False,
     ):
         """Create the reusable evaluation environment and agent index maps."""
 
@@ -858,6 +875,7 @@ class HeadToHeadEvaluator:
             seed=0,
             log_interval=1,
             opponents_enabled=True,
+            enable_referee=enable_referee,
         )
         self.opponent_policy: torch.nn.Module | None = None
         self.num_envs = self.eval_env.num_envs
@@ -2944,6 +2962,11 @@ def build_training_parser(
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--players-per-team", type=int, default=5)
+    parser.add_argument(
+        "--enable-referee",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--random-team-size-min",
         type=int,
@@ -5191,6 +5214,7 @@ def main():
             opponents_enabled=False,
             random_team_size_min=args.random_team_size_min,
             random_team_size_max=args.random_team_size_max,
+            enable_referee=args.enable_referee,
             vec=warm_start_vec_config,
         )
         warm_start_vecenv = BlueTeamNoOpponentWrapper(
@@ -5449,6 +5473,7 @@ def main():
             opponents_enabled=True,
             random_team_size_min=args.random_team_size_min,
             random_team_size_max=args.random_team_size_max,
+            enable_referee=args.enable_referee,
             vec=vec_config,
         )
         if autotune_result is not None:
@@ -5624,6 +5649,7 @@ def main():
                 game_length=args.past_iterate_eval_game_length,
                 vec_config=eval_vec_config,
                 device=device,
+                enable_referee=args.enable_referee,
             )
         eval_interval_epochs = max(
             1,
