@@ -74,11 +74,9 @@ def test_train_automode_uses_standardized_hyperparameter_file() -> None:
     assert 'JOB_COPY_BASE="$REPO_ROOT/sbatch-tmp"' in contents
     assert 'JOB_COPY_ROOT="$JOB_COPY_BASE/${SLURM_JOB_ID:-local}"' in contents
     assert 'JOB_WORKSPACE_ROOT="$JOB_COPY_ROOT/$(basename "$REPO_ROOT")"' in contents
-    assert (
-        'rsync -a --delete --exclude \'sbatch-tmp/\' "$REPO_ROOT/" '
-        '"$JOB_WORKSPACE_ROOT/"'
-        in contents
-    )
+    assert "rsync -a --delete \\" in contents
+    assert "--exclude 'sbatch-tmp/'" in contents
+    assert '"$REPO_ROOT/" "$JOB_WORKSPACE_ROOT/"' in contents
     assert '--bind "$JOB_WORKSPACE_ROOT:/workspace"' in contents
     assert (
         'TRAIN_AUTOMODE_HYPERPARAMETERS_PATH="${TRAIN_AUTOMODE_HYPERPARAMETERS_PATH:-'
@@ -119,9 +117,15 @@ def test_train_automode_uses_standardized_hyperparameter_file() -> None:
     assert 'TRAIN_AUTOMODE_PPO_ITERATIONS="${TRAIN_AUTOMODE_PPO_ITERATIONS:-100000}"' in contents
     assert (
         'TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS="'
-        '${TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS:-$TRAIN_AUTOMODE_PPO_ITERATIONS}"'
+        '${TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS:-0}"'
         in contents
     )
+    assert (
+        'TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS="'
+        '${TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS:-0}"'
+        in contents
+    )
+    assert "--past-iterate-eval-fractions 5" in contents
     assert (
         'TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD="'
         '${TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD:-0.80}"'

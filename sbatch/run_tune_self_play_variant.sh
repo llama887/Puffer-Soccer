@@ -43,7 +43,12 @@ mkdir -p \
 
 rm -rf "$JOB_COPY_ROOT"
 mkdir -p "$JOB_COPY_ROOT"
-rsync -a --delete --exclude 'sbatch-tmp/' "$REPO_ROOT/" "$JOB_WORKSPACE_ROOT/"
+rsync -a --delete \
+    --exclude 'sbatch-tmp/' \
+    --exclude '.venv/' \
+    --exclude 'videos/' \
+    --exclude 'sbatch/logs/' \
+    "$REPO_ROOT/" "$JOB_WORKSPACE_ROOT/"
 
 printf 'REPO_ROOT=%s\n' "$REPO_ROOT"
 printf 'JOB_WORKSPACE_ROOT=%s\n' "$JOB_WORKSPACE_ROOT"

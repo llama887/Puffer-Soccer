@@ -9,15 +9,30 @@
 #define MAX_PLAYERS 22
 #define MAX_PER_TEAM 11
 #define MAX_BALL_SPEED 5.0f
+#define MAX_BALL_VERTICAL_SPEED 4.0f
+#define MAX_BALL_HEIGHT 15.0f
 #define BALL_VELOCITY_DECAY 0.85f
+#define BALL_GRAVITY 0.18f
+#define BALL_BOUNCE_RESTITUTION 0.55f
+#define BALL_BOUNCE_FRICTION 0.78f
+#define BALL_REST_VERTICAL_SPEED 0.08f
+#define BALL_AIRBORNE_EPS 0.05f
+#define BODY_CONTACT_BALL_HEIGHT 0.9f
+#define KICKABLE_BALL_HEIGHT 1.4f
+#define LOFTED_KICK_HORIZONTAL_SCALE 0.85f
+#define LOFTED_KICK_VERTICAL_SPEED 2.8f
+#define GOAL_CROSSBAR_HEIGHT 2.44f
 #define DISCRETE_ACTION_NOOP 0
 #define DISCRETE_ACTION_MOVE_FORWARD 1
 #define DISCRETE_ACTION_MOVE_BACKWARD 2
 #define DISCRETE_ACTION_ROTATE_LEFT 3
 #define DISCRETE_ACTION_ROTATE_RIGHT 4
 #define DISCRETE_KICK_ACTION_START 5
+#define DISCRETE_GROUND_KICK_ACTION_START DISCRETE_KICK_ACTION_START
 #define DISCRETE_KICK_BUCKETS 8
-#define DISCRETE_ACTION_COUNT (DISCRETE_KICK_ACTION_START + DISCRETE_KICK_BUCKETS)
+#define DISCRETE_LOFTED_KICK_ACTION_START (DISCRETE_GROUND_KICK_ACTION_START + DISCRETE_KICK_BUCKETS)
+#define DISCRETE_KICK_VARIANTS 2
+#define DISCRETE_ACTION_COUNT (DISCRETE_GROUND_KICK_ACTION_START + DISCRETE_KICK_BUCKETS * DISCRETE_KICK_VARIANTS)
 
 typedef struct {
     float score;
@@ -28,6 +43,9 @@ typedef struct {
     float wins_blue;
     float wins_red;
     float draws;
+    float ball_air_step_frac;
+    float ball_peak_height;
+    float lofted_kicks;
     float n;
 } Log;
 
@@ -59,6 +77,9 @@ typedef struct {
     float cumulative_episode_return;
     float cumulative_blue_team_episode_return;
     float cumulative_red_team_episode_return;
+    float episode_ball_air_steps;
+    float episode_ball_peak_height;
+    float episode_lofted_kicks;
     int do_team_switch;
     int opponents_enabled;
     int blue_left;
@@ -78,8 +99,10 @@ typedef struct {
     float move_speed;
     float ball_x;
     float ball_y;
+    float ball_z;
     float ball_vx;
     float ball_vy;
+    float ball_vz;
     int goals_blue;
     int goals_red;
     float field_scale;
@@ -97,8 +120,10 @@ typedef struct {
     int terminal_render_blue_left;
     float terminal_render_ball_x;
     float terminal_render_ball_y;
+    float terminal_render_ball_z;
     float terminal_render_ball_vx;
     float terminal_render_ball_vy;
+    float terminal_render_ball_vz;
     int terminal_render_goals_blue;
     int terminal_render_goals_red;
 } Env;
@@ -129,6 +154,14 @@ static float speed2(float vx, float vy) {
     return sqrtf(vx*vx + vy*vy);
 }
 
+static float normalized_ball_height(float z) {
+    return clampf(z / MAX_BALL_HEIGHT, 0.0f, 1.0f);
+}
+
+static float normalized_ball_vertical_speed(float vz) {
+    return clampf(vz / MAX_BALL_VERTICAL_SPEED, -1.0f, 1.0f);
+}
+
 static uint32_t next_u32(uint32_t* s) {
     uint32_t x = *s;
     x ^= x << 13;
@@ -144,11 +177,11 @@ static float randf(uint32_t* s, float lo, float hi) {
 }
 
 static int obs_size_for_team(int n) {
-    return 16 + 14*n;
+    return 18 + 14*n;
 }
 
 static int state_size_for_team(int n) {
-    return 5 + 34*n;
+    return 7 + 34*n;
 }
 
 static void get_one_hot(int id, float* out11) {
@@ -277,8 +310,10 @@ static void reset_field(Env* env) {
         a->last_rot = 0.0f;
     }
 
+    env->ball_z = 0.0f;
     env->ball_vx = 0.0f;
     env->ball_vy = 0.0f;
+    env->ball_vz = 0.0f;
     if (use_guided_spawn) {
         float uniform_ball_x = randf(&env->rng, env->x_out_start, env->x_out_end);
         float uniform_ball_y = randf(&env->rng, env->y_out_start, env->y_out_end);
@@ -307,6 +342,9 @@ static void full_reset(Env* env, int hard_reset_score) {
     env->cumulative_episode_return = 0.0f;
     env->cumulative_blue_team_episode_return = 0.0f;
     env->cumulative_red_team_episode_return = 0.0f;
+    env->episode_ball_air_steps = 0.0f;
+    env->episode_ball_peak_height = 0.0f;
+    env->episode_lofted_kicks = 0.0f;
     if (hard_reset_score) {
         env->goals_blue = 0;
         env->goals_red = 0;
@@ -328,8 +366,10 @@ static void capture_terminal_render_state(Env* env) {
     env->terminal_render_blue_left = env->blue_left;
     env->terminal_render_ball_x = env->ball_x;
     env->terminal_render_ball_y = env->ball_y;
+    env->terminal_render_ball_z = env->ball_z;
     env->terminal_render_ball_vx = env->ball_vx;
     env->terminal_render_ball_vy = env->ball_vy;
+    env->terminal_render_ball_vz = env->ball_vz;
     env->terminal_render_goals_blue = env->goals_blue;
     env->terminal_render_goals_red = env->goals_red;
     env->has_terminal_render_state = 1;
@@ -356,14 +396,25 @@ static float discrete_kick_scale(int action) {
         0.1f, 0.22857143f, 0.35714287f, 0.4857143f,
         0.6142857f, 0.74285716f, 0.87142855f, 1.0f
     };
-    int kick_idx = action - DISCRETE_KICK_ACTION_START;
+    int kick_idx = action - DISCRETE_GROUND_KICK_ACTION_START;
+    if (kick_idx < 0 || kick_idx >= DISCRETE_KICK_BUCKETS) {
+        kick_idx = action - DISCRETE_LOFTED_KICK_ACTION_START;
+    }
     if (kick_idx < 0 || kick_idx >= DISCRETE_KICK_BUCKETS) {
         return 0.0f;
     }
     return kick_scales[kick_idx];
 }
 
-static void ball_check_hit(Env* env, const float* kick_scales) {
+static float discrete_lift_scale(int action) {
+    if (action < DISCRETE_LOFTED_KICK_ACTION_START ||
+            action >= DISCRETE_LOFTED_KICK_ACTION_START + DISCRETE_KICK_BUCKETS) {
+        return 0.0f;
+    }
+    return discrete_kick_scale(action);
+}
+
+static void ball_check_hit(Env* env, const float* kick_scales, const float* lift_scales) {
     const float ball_radius = 1.0f;
     const float body_speed = 0.6f;
     const float leg_speed = 4.0f;
@@ -374,19 +425,25 @@ static void ball_check_hit(Env* env, const float* kick_scales) {
         Agent* a = &env->agents[i];
         if (is_inactive_player(env, i)) continue;
         float d = dist2(env->ball_x, env->ball_y, a->x, a->y);
-        if (d < ball_radius + agent_radius) {
+        if (env->ball_z <= BODY_CONTACT_BALL_HEIGHT && d < ball_radius + agent_radius) {
             float x_diff = env->ball_x - a->x;
             float y_diff = env->ball_y - a->y;
             env->ball_vx += body_speed * x_diff / (d + 1e-4f);
             env->ball_vy += body_speed * y_diff / (d + 1e-4f);
         }
 
-        if (d < ball_radius + leg_length) {
+        if (env->ball_z <= KICKABLE_BALL_HEIGHT && d < ball_radius + leg_length) {
             float delta, cc, ss;
             calc_line_ball_stats(a->rot, ball_radius, env->ball_x, env->ball_y, a->x, a->y, &delta, &cc, &ss);
             if (delta >= 0.0f && d < 2.0f * agent_radius + 2.0f * ball_radius) {
-                env->ball_vx += leg_speed * kick_scales[i] * cc;
-                env->ball_vy += leg_speed * kick_scales[i] * ss;
+                float lift = lift_scales[i];
+                float horizontal_scale = lift > 0.0f ? LOFTED_KICK_HORIZONTAL_SCALE : 1.0f;
+                env->ball_vx += leg_speed * kick_scales[i] * horizontal_scale * cc;
+                env->ball_vy += leg_speed * kick_scales[i] * horizontal_scale * ss;
+                if (lift > 0.0f) {
+                    env->ball_vz += LOFTED_KICK_VERTICAL_SPEED * lift;
+                    env->episode_lofted_kicks += 1.0f;
+                }
             }
         }
     }
@@ -396,6 +453,32 @@ static void ball_check_hit(Env* env, const float* kick_scales) {
         float ratio = MAX_BALL_SPEED / spd;
         env->ball_vx *= ratio;
         env->ball_vy *= ratio;
+    }
+    env->ball_vz = clampf(env->ball_vz, -MAX_BALL_VERTICAL_SPEED, MAX_BALL_VERTICAL_SPEED);
+}
+
+static void integrate_ball_height(Env* env) {
+    if (env->ball_z <= 0.0f && fabsf(env->ball_vz) < BALL_REST_VERTICAL_SPEED) {
+        env->ball_z = 0.0f;
+        env->ball_vz = 0.0f;
+        return;
+    }
+
+    env->ball_vz -= BALL_GRAVITY;
+    env->ball_z += env->ball_vz;
+
+    if (env->ball_z <= 0.0f) {
+        env->ball_z = 0.0f;
+        if (env->ball_vz < -BALL_REST_VERTICAL_SPEED) {
+            env->ball_vz = -env->ball_vz * BALL_BOUNCE_RESTITUTION;
+            env->ball_vx *= BALL_BOUNCE_FRICTION;
+            env->ball_vy *= BALL_BOUNCE_FRICTION;
+        } else {
+            env->ball_vz = 0.0f;
+        }
+    } else if (env->ball_z > MAX_BALL_HEIGHT) {
+        env->ball_z = MAX_BALL_HEIGHT;
+        if (env->ball_vz > 0.0f) env->ball_vz = 0.0f;
     }
 }
 
@@ -441,25 +524,27 @@ static void rel_obs_agent(const Env* env, const Agent* focus, const Agent* other
     out7[6] = other->last_rot;
 }
 
-static void rel_obs_ball(const Env* env, const Agent* focus, float* out5) {
+static void rel_obs_ball(const Env* env, const Agent* focus, float* out7) {
     float obj_rot = atan2f(env->ball_y - focus->y, env->ball_x - focus->x);
     float obj_view = 0.0f;
     if (!visible(focus->rot, obj_rot, env->vision_range, &obj_view)) {
-        memset(out5, 0, sizeof(float) * 5);
+        memset(out7, 0, sizeof(float) * 7);
         return;
     }
 
     float max_dist = dist2(0, 0, field_half_width(env), field_half_height(env));
-    out5[0] = 1.0f;
-    out5[1] = dist2(focus->x, focus->y, env->ball_x, env->ball_y) / max_dist;
-    out5[2] = obj_view / (env->vision_range / 2.0f);
+    out7[0] = 1.0f;
+    out7[1] = dist2(focus->x, focus->y, env->ball_x, env->ball_y) / max_dist;
+    out7[2] = obj_view / (env->vision_range / 2.0f);
 
     float vel_rot = atan2f(env->ball_vy, env->ball_vx);
     float abs_val = speed2(env->ball_vx, env->ball_vy);
     float rel_x = cosf(vel_rot - focus->rot) * abs_val / MAX_BALL_SPEED;
     float rel_y = sinf(vel_rot - focus->rot) * abs_val / MAX_BALL_SPEED;
-    out5[3] = rel_x;
-    out5[4] = rel_y;
+    out7[3] = rel_x;
+    out7[4] = rel_y;
+    out7[5] = normalized_ball_height(env->ball_z);
+    out7[6] = normalized_ball_vertical_speed(env->ball_vz);
 }
 
 static void compute_observations(Env* env, int goal_scored_team) {
@@ -473,10 +558,12 @@ static void compute_observations(Env* env, int goal_scored_team) {
     state_base[0] = time_left;
     state_base[1] = sign_state * env->ball_x / half_width;
     state_base[2] = sign_state * env->ball_y / half_height;
-    state_base[3] = sign_state * env->ball_vx / MAX_BALL_SPEED;
-    state_base[4] = sign_state * env->ball_vy / MAX_BALL_SPEED;
+    state_base[3] = normalized_ball_height(env->ball_z);
+    state_base[4] = sign_state * env->ball_vx / MAX_BALL_SPEED;
+    state_base[5] = sign_state * env->ball_vy / MAX_BALL_SPEED;
+    state_base[6] = normalized_ball_vertical_speed(env->ball_vz);
 
-    int sidx = 5;
+    int sidx = 7;
     for (int i = 0; i < np; i++) {
         Agent* a = &env->agents[i];
         if (is_inactive_player(env, i)) {
@@ -522,9 +609,9 @@ static void compute_observations(Env* env, int goal_scored_team) {
         get_one_hot(i, onehot);
         for (int k = 0; k < 11; k++) out[o++] = onehot[k];
 
-        float brobs[5];
+        float brobs[7];
         rel_obs_ball(env, focus, brobs);
-        for (int k = 0; k < 5; k++) out[o++] = brobs[k];
+        for (int k = 0; k < 7; k++) out[o++] = brobs[k];
 
         for (int j = 0; j < np; j++) {
             if (j == i) continue;
@@ -643,6 +730,7 @@ static void c_reset(Env* env, int seed) {
 static void c_step(Env* env) {
     int np = env->num_players;
     float kick_scales[MAX_PLAYERS];
+    float lift_scales[MAX_PLAYERS];
     float step_reward_sum = 0.0f;
     float step_reward_sum_blue = 0.0f;
     float step_reward_sum_red = 0.0f;
@@ -659,6 +747,7 @@ static void c_step(Env* env) {
             a->last_move = 0.0f;
             a->last_rot = 0.0f;
             kick_scales[i] = 0.0f;
+            lift_scales[i] = 0.0f;
             continue;
         }
 
@@ -668,6 +757,7 @@ static void c_step(Env* env) {
             if (action < 0) action = 0;
             if (action >= DISCRETE_ACTION_COUNT) action = DISCRETE_ACTION_COUNT - 1;
             kick_scales[i] = discrete_kick_scale(action);
+            lift_scales[i] = discrete_lift_scale(action);
 
             switch (action) {
                 case DISCRETE_ACTION_MOVE_FORWARD:
@@ -691,6 +781,7 @@ static void c_step(Env* env) {
             move = clampf(arow[0], -1.0f, 1.0f);
             rot = clampf(arow[1], -1.0f, 1.0f);
             kick_scales[i] = 1.0f;
+            lift_scales[i] = 0.0f;
         }
 
         a->last_move = move;
@@ -707,10 +798,11 @@ static void c_step(Env* env) {
         a->y = clampf(a->y + sin_comp, env->y_out_start, env->y_out_end);
     }
 
-    ball_check_hit(env, kick_scales);
+    ball_check_hit(env, kick_scales, lift_scales);
 
     env->ball_x += env->ball_vx;
     env->ball_y += env->ball_vy;
+    integrate_ball_height(env);
 
     env->ball_vx *= BALL_VELOCITY_DECAY;
     env->ball_vy *= BALL_VELOCITY_DECAY;
@@ -718,9 +810,15 @@ static void c_step(Env* env) {
         env->ball_vx = 0.0f;
         env->ball_vy = 0.0f;
     }
+    if (env->ball_z > BALL_AIRBORNE_EPS) {
+        env->episode_ball_air_steps += 1.0f;
+    }
+    if (env->ball_z > env->episode_ball_peak_height) {
+        env->episode_ball_peak_height = env->ball_z;
+    }
 
     int goal_scored = -1;
-    if (fabsf(env->ball_y) <= env->goal_half_h) {
+    if (fabsf(env->ball_y) <= env->goal_half_h && env->ball_z <= GOAL_CROSSBAR_HEIGHT) {
         if (env->ball_x < env->x_out_start) {
             goal_scored = team_on_left(env, 0) ? 1 : 0;
             if (goal_scored == 0) env->goals_blue += 1;
@@ -788,14 +886,29 @@ static void c_step(Env* env) {
         env->log.blue_team_episode_return += env->cumulative_blue_team_episode_return;
         env->log.red_team_episode_return += env->cumulative_red_team_episode_return;
         env->log.episode_length += env->num_steps;
+        env->log.ball_air_step_frac += env->episode_ball_air_steps / fmaxf(1.0f, (float)env->num_steps);
+        env->log.ball_peak_height += env->episode_ball_peak_height;
+        env->log.lofted_kicks += env->episode_lofted_kicks;
         env->log.n += 1.0f;
         capture_terminal_render_state(env);
         full_reset(env, 1);
     }
 }
 
-static PyObject* build_state_dict(const Env* env, const Agent* agents, float ball_x, float ball_y,
-    float ball_vx, float ball_vy, int goals_blue, int goals_red, int num_steps, int blue_left) {
+static PyObject* build_state_dict(
+    const Env* env,
+    const Agent* agents,
+    float ball_x,
+    float ball_y,
+    float ball_z,
+    float ball_vx,
+    float ball_vy,
+    float ball_vz,
+    int goals_blue,
+    int goals_red,
+    int num_steps,
+    int blue_left
+) {
     npy_intp pos_dims[2] = {env->num_players, 2};
     npy_intp rot_dims[1] = {env->num_players};
 
@@ -815,7 +928,7 @@ static PyObject* build_state_dict(const Env* env, const Agent* agents, float bal
         rdat[i] = agents[i].rot;
     }
 
-    PyObject* ball = Py_BuildValue("(ffff)", ball_x, ball_y, ball_vx, ball_vy);
+    PyObject* ball = Py_BuildValue("(ffffff)", ball_x, ball_y, ball_z, ball_vx, ball_vy, ball_vz);
     PyObject* goals = Py_BuildValue("(ii)", goals_blue, goals_red);
     PyObject* d = PyDict_New();
     PyObject* num_steps_obj = PyLong_FromLong(num_steps);
@@ -877,6 +990,9 @@ static int assign_log_dict(PyObject* d, const Log* log) {
     if (PyDict_SetItemString(d, "wins_red", PyFloat_FromDouble(log->wins_red)) < 0) return -1;
     if (PyDict_SetItemString(d, "draws", PyFloat_FromDouble(log->draws)) < 0) return -1;
     if (PyDict_SetItemString(d, "win_rate_blue", PyFloat_FromDouble(log->wins_blue / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "ball_air_step_frac", PyFloat_FromDouble(log->ball_air_step_frac / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "ball_peak_height", PyFloat_FromDouble(log->ball_peak_height / log->n)) < 0) return -1;
+    if (PyDict_SetItemString(d, "lofted_kicks", PyFloat_FromDouble(log->lofted_kicks / log->n)) < 0) return -1;
     if (PyDict_SetItemString(d, "n", PyFloat_FromDouble(log->n)) < 0) return -1;
     return 0;
 }
@@ -1169,8 +1285,10 @@ static PyObject* py_env_get_state(PyObject* self, PyObject* args) {
             env->terminal_render_agents,
             env->terminal_render_ball_x,
             env->terminal_render_ball_y,
+            env->terminal_render_ball_z,
             env->terminal_render_ball_vx,
             env->terminal_render_ball_vy,
+            env->terminal_render_ball_vz,
             env->terminal_render_goals_blue,
             env->terminal_render_goals_red,
             env->terminal_render_num_steps,
@@ -1183,8 +1301,10 @@ static PyObject* py_env_get_state(PyObject* self, PyObject* args) {
         env->agents,
         env->ball_x,
         env->ball_y,
+        env->ball_z,
         env->ball_vx,
         env->ball_vy,
+        env->ball_vz,
         env->goals_blue,
         env->goals_red,
         env->num_steps,
@@ -1380,6 +1500,9 @@ static PyObject* py_vec_log(PyObject* self, PyObject* args) {
         aggregate.wins_blue += log->wins_blue;
         aggregate.wins_red += log->wins_red;
         aggregate.draws += log->draws;
+        aggregate.ball_air_step_frac += log->ball_air_step_frac;
+        aggregate.ball_peak_height += log->ball_peak_height;
+        aggregate.lofted_kicks += log->lofted_kicks;
         aggregate.n += log->n;
         memset(log, 0, sizeof(Log));
     }

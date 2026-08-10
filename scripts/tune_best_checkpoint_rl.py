@@ -516,6 +516,8 @@ def build_trial_command(
         str(float(regularization["uniform_kl_power"])),
         "--final-best-eval-games",
         str(args.final_eval_games),
+        "--past-iterate-eval-games",
+        str(args.final_eval_games),
         "--fixed-best-checkpoint",
         "--best-checkpoint-config-path",
         args.best_checkpoint_config_path,

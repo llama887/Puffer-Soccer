@@ -97,6 +97,12 @@ wheels = [
 ]
 
 [[package]]
+name = "axon"
+version = "0.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/dc/82/38f83f02deac4e9c8c754a966c0df2ebe08c0984abdfecd571a42a45296b/axon-0.2.1.tar.gz", hash = "sha256:f995066a76b3ca7e1833d06a41175fde40cddb0a553b644e9e886413462b0fe2", size = 1285, upload-time = "2013-04-24T12:02:43.845Z" }
+
+[[package]]
 name = "boto3"
 version = "1.42.58"
 source = { registry = "https://pypi.org/simple" }
@@ -1359,6 +1365,7 @@ dev = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "axon" },
     { name = "mypy" },
     { name = "pylint" },
 ]
@@ -1378,6 +1385,7 @@ provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "axon", specifier = ">=0.2.1" },
     { name = "mypy", specifier = ">=2.1.0" },
     { name = "pylint", specifier = ">=4.0.5" },
 ]

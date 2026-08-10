@@ -13,6 +13,7 @@ from puffer_soccer.envs.marl2d.core import (
     DISCRETE_ACTION_NOOP,
     DISCRETE_ACTION_ROTATE_LEFT,
     MAX_SIGNED_ENV_SEED,
+    DISCRETE_LOFTED_KICK_ACTION_START,
     _accumulate_team_episode_returns,
     _merge_team_episode_return_log,
     encode_discrete_kick_action,
@@ -43,6 +44,9 @@ class _NativeLog(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("wins_blue", ctypes.c_float),
         ("wins_red", ctypes.c_float),
         ("draws", ctypes.c_float),
+        ("ball_air_step_frac", ctypes.c_float),
+        ("ball_peak_height", ctypes.c_float),
+        ("lofted_kicks", ctypes.c_float),
         ("n", ctypes.c_float),
     ]
 
@@ -84,12 +88,18 @@ class _NativeEnv(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("global_states", ctypes.c_void_p),
         ("agents", _NativeAgent * 22),
         ("players_per_team", ctypes.c_int),
+        ("active_players_per_team", ctypes.c_int),
+        ("random_team_size_min", ctypes.c_int),
+        ("random_team_size_max", ctypes.c_int),
         ("num_players", ctypes.c_int),
         ("game_length", ctypes.c_int),
         ("num_steps", ctypes.c_int),
         ("cumulative_episode_return", ctypes.c_float),
         ("cumulative_blue_team_episode_return", ctypes.c_float),
         ("cumulative_red_team_episode_return", ctypes.c_float),
+        ("episode_ball_air_steps", ctypes.c_float),
+        ("episode_ball_peak_height", ctypes.c_float),
+        ("episode_lofted_kicks", ctypes.c_float),
         ("do_team_switch", ctypes.c_int),
         ("opponents_enabled", ctypes.c_int),
         ("blue_left", ctypes.c_int),
@@ -109,11 +119,14 @@ class _NativeEnv(ctypes.Structure):  # pylint: disable=too-few-public-methods
         ("move_speed", ctypes.c_float),
         ("ball_x", ctypes.c_float),
         ("ball_y", ctypes.c_float),
+        ("ball_z", ctypes.c_float),
         ("ball_vx", ctypes.c_float),
         ("ball_vy", ctypes.c_float),
+        ("ball_vz", ctypes.c_float),
         ("goals_blue", ctypes.c_int),
         ("goals_red", ctypes.c_int),
         ("field_scale", ctypes.c_float),
+        ("spawn_difficulty", ctypes.c_float),
         ("base_x_out_start", ctypes.c_float),
         ("base_x_out_end", ctypes.c_float),
         ("base_y_out_start", ctypes.c_float),
@@ -155,8 +168,10 @@ def _force_ball_into_goal(env, goal_side: str) -> None:
             "rebuild the extension to run direct goal-placement tests"
         )
     native_env.ball_y = 0.0
+    native_env.ball_z = 0.0
     native_env.ball_vx = 0.0
     native_env.ball_vy = 0.0
+    native_env.ball_vz = 0.0
     if goal_side == "left":
         native_env.ball_x = native_env.x_out_start - 1.0
     else:
@@ -176,8 +191,10 @@ def _set_symmetric_egocentric_state(env, *, ball_x: float, agent_x: float) -> No
     native_env.num_steps = 0
     native_env.ball_x = ball_x
     native_env.ball_y = 0.0
+    native_env.ball_z = 0.0
     native_env.ball_vx = 0.0
     native_env.ball_vy = 0.0
+    native_env.ball_vz = 0.0
 
     native_env.agents[0].x = agent_x
     native_env.agents[0].y = 0.0
@@ -192,23 +209,26 @@ def _set_symmetric_egocentric_state(env, *, ball_x: float, agent_x: float) -> No
     native_env.agents[1].last_rot = 0.0
 
 
-def _set_discrete_control_state(
+def _set_discrete_control_state(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     env,
     *,
     ball_x: float,
     ball_y: float = 0.0,
+    ball_z: float = 0.0,
     ball_vx: float = 0.0,
     ball_vy: float = 0.0,
+    ball_vz: float = 0.0,
     agent_x: float = 0.0,
     agent_y: float = 0.0,
     agent_rot: float = 0.0,
 ) -> _NativeEnv:
     """Install a deterministic one-agent control state for discrete action tests.
 
-    The new discrete interface is defined by exact one-step semantics such as "rotate only"
-    and "kick only". Those assertions are easiest to express by writing a fixed state directly
-    into the native env and then applying one chosen action. This helper centralizes that setup
-    so the tests share one consistent, byte-accurate initialization path.
+    The discrete interface is defined by exact one-step semantics such as "rotate only",
+    "kick only", and "loft the ball upward". Those assertions are easiest to express by
+    writing a fixed state directly into the native env and then applying one chosen action.
+    This helper centralizes that setup, including the ball's vertical coordinate, so the tests
+    share one consistent, byte-accurate initialization path.
 
     The helper returns the native env view so callers can read movement constants such as
     `move_speed` and `rot_speed` when forming exact expectations. The red-side opponent is
@@ -221,8 +241,10 @@ def _set_discrete_control_state(
     native_env.num_steps = 0
     native_env.ball_x = ball_x
     native_env.ball_y = ball_y
+    native_env.ball_z = ball_z
     native_env.ball_vx = ball_vx
     native_env.ball_vy = ball_vy
+    native_env.ball_vz = ball_vz
     native_env.agents[0].x = agent_x
     native_env.agents[0].y = agent_y
     native_env.agents[0].rot = agent_rot
@@ -234,13 +256,13 @@ def _set_discrete_control_state(
 def test_scalar_puffer_env_shapes_discrete():
     env = make_puffer_env(players_per_team=3, action_mode="discrete")
     obs, _ = env.reset(seed=0)
-    assert obs.shape == (6, 58)
-    assert env.global_states.shape == (6, 107)
+    assert obs.shape == (6, 60)
+    assert env.global_states.shape == (6, 109)
     assert env.single_action_space.n == DISCRETE_ACTION_COUNT
 
     actions = np.zeros((6,), dtype=np.int32)
     obs, rewards, terminals, truncations, _ = env.step(actions)
-    assert obs.shape == (6, 58)
+    assert obs.shape == (6, 60)
     assert rewards.shape == (6,)
     assert terminals.shape == (6,)
     assert truncations.shape == (6,)
@@ -263,12 +285,12 @@ def test_only_discrete_action_mode_is_supported() -> None:
 def test_scalar_puffer_env_roundtrip():
     env = make_puffer_env(players_per_team=2, action_mode="discrete")
     obs, infos = env.reset(seed=123)
-    assert obs.shape == (4, 44)
+    assert obs.shape == (4, 46)
     assert infos == []
 
     actions = np.zeros((4,), dtype=np.int32)
     obs, rewards, terms, truncs, infos = env.step(actions)
-    assert obs.shape == (4, 44)
+    assert obs.shape == (4, 46)
     assert rewards.shape == (4,)
     assert terms.shape == (4,)
     assert truncs.shape == (4,)
@@ -294,7 +316,7 @@ def test_discrete_noop_leaves_pose_and_ball_unchanged() -> None:
     finally:
         env.close()
 
-    assert state["ball"] == pytest.approx((10.0, 0.0, 0.0, 0.0))
+    assert state["ball"] == pytest.approx((10.0, 0.0, 0.0, 0.0, 0.0, 0.0))
     assert tuple(state["positions"][0]) == (0.0, 0.0)
     assert state["rotations"][0] == pytest.approx(0.0)
 
@@ -342,7 +364,7 @@ def test_discrete_kick_strength_changes_ball_speed_without_moving_agent() -> Non
         _set_discrete_control_state(env, ball_x=0.5, agent_x=0.0, agent_rot=0.0)
         env.step(np.full((2,), encode_discrete_kick_action(kick_strength), dtype=np.int32))
         state = env.get_state()
-        return tuple(state["positions"][0]), float(math.hypot(state["ball"][2], state["ball"][3]))
+        return tuple(state["positions"][0]), float(math.hypot(state["ball"][3], state["ball"][4]))
 
     try:
         weak_position, weakest_speed = measure_kick(kick_strength=0)
@@ -382,7 +404,116 @@ def test_discrete_ball_decay_uses_the_new_slower_constant() -> None:
         env.close()
 
     assert state["ball"][0] == pytest.approx(12.0)
-    assert state["ball"][2] == pytest.approx(1.7)
+    assert state["ball"][3] == pytest.approx(1.7)
+
+
+def test_discrete_lofted_kick_adds_vertical_ball_motion() -> None:
+    """Check that the new lofted kick range launches the ball into the air.
+
+    Ground kicks still use the original strength buckets, so a separate action range is needed
+    for chips and lifted passes. This test places the ball in the same deterministic kicking
+    setup used by the ground-kick test, applies the strongest lofted kick, and verifies three
+    things at once: the helper encodes into the lofted range, the agent does not translate on
+    the kick step, and the ball gains both horizontal and vertical motion.
+    """
+
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+
+    try:
+        _set_discrete_control_state(env, ball_x=0.5, agent_x=0.0, agent_rot=0.0)
+        action = encode_discrete_kick_action(7, lofted=True)
+        assert action >= DISCRETE_LOFTED_KICK_ACTION_START
+        env.step(np.full((2,), action, dtype=np.int32))
+        state = env.get_state()
+    finally:
+        env.close()
+
+    assert tuple(state["positions"][0]) == pytest.approx((0.0, 0.0))
+    assert state["ball"][2] > 0.0
+    assert state["ball"][5] > 0.0
+    assert math.hypot(state["ball"][3], state["ball"][4]) > 0.0
+
+
+def test_airborne_ball_gravity_and_ground_bounce() -> None:
+    """Check the vertical ball integrator without relying on a kick contact.
+
+    The environment should support a ball state that is already airborne, because rollouts can
+    start from saved states or terminal render snapshots. A stationary ball at height should
+    begin falling under gravity, while a downward-moving ball near the ground should bounce
+    upward with reduced speed instead of passing below the field plane.
+    """
+
+    env = make_puffer_env(players_per_team=1, action_mode="discrete", opponents_enabled=False)
+
+    try:
+        _set_discrete_control_state(
+            env,
+            ball_x=10.0,
+            ball_z=2.0,
+            ball_vz=0.0,
+            agent_x=0.0,
+            agent_rot=0.0,
+        )
+        env.step(np.full((2,), DISCRETE_ACTION_NOOP, dtype=np.int32))
+        falling_state = env.get_state()
+
+        _set_discrete_control_state(
+            env,
+            ball_x=10.0,
+            ball_z=0.05,
+            ball_vz=-1.0,
+            agent_x=0.0,
+            agent_rot=0.0,
+        )
+        env.step(np.full((2,), DISCRETE_ACTION_NOOP, dtype=np.int32))
+        bounce_state = env.get_state()
+    finally:
+        env.close()
+
+    assert falling_state["ball"][2] < 2.0
+    assert falling_state["ball"][5] < 0.0
+    assert bounce_state["ball"][2] == pytest.approx(0.0)
+    assert bounce_state["ball"][5] > 0.0
+
+
+def test_lofted_ball_metrics_are_logged() -> None:
+    """Verify that training logs can measure whether lofted play is happening.
+
+    Adding vertical ball physics changes the experiment only if agents actually learn to use
+    it. The native logger therefore reports the fraction of steps where the ball was airborne,
+    the peak ball height, and the number of successful lofted kick contacts per episode. This
+    test creates one short episode with a deterministic lofted kick and checks that all three
+    metrics become positive in the flushed log.
+    """
+
+    env = make_puffer_env(
+        players_per_team=1,
+        action_mode="discrete",
+        game_length=2,
+        opponents_enabled=False,
+    )
+
+    try:
+        _set_discrete_control_state(env, ball_x=0.5, agent_x=0.0, agent_rot=0.0)
+        env.step(
+            np.full(
+                (2,),
+                encode_discrete_kick_action(7, lofted=True),
+                dtype=np.int32,
+            )
+        )
+        _, _, terminals, _, _ = env.step(
+            np.full((2,), DISCRETE_ACTION_NOOP, dtype=np.int32)
+        )
+        log = env.flush_log()
+    finally:
+        env.close()
+
+    assert terminals.all()
+    assert log is not None
+    assert log["ball_air_step_frac"] > 0.0
+    assert log["ball_peak_height"] > 0.0
+    assert log["lofted_kicks"] >= 1.0
 
 
 
@@ -437,12 +568,12 @@ def test_native_vec_env_shapes_and_second_render():
         vec=VecEnvConfig(backend="native", shard_num_envs=2, num_shards=1),
     )
     obs, _ = env.reset(seed=0)
-    assert obs.shape == (8, 44)
-    assert env.global_states.shape == (8, 73)
+    assert obs.shape == (8, 46)
+    assert env.global_states.shape == (8, 75)
 
     actions = np.zeros((8,), dtype=np.int32)
     obs, rewards, terminals, truncations, _ = env.step(actions)
-    assert obs.shape == (8, 44)
+    assert obs.shape == (8, 46)
     assert rewards.shape == (8,)
     assert terminals.shape == (8,)
     assert truncations.shape == (8,)
@@ -459,7 +590,7 @@ def test_large_reset_seed_is_folded_into_signed_env_range():
     large_seed = MAX_SIGNED_ENV_SEED + 123_456
     obs, infos = env.reset(seed=large_seed)
 
-    assert obs.shape == (4, 44)
+    assert obs.shape == (4, 46)
     assert infos == []
     assert normalize_env_seed(large_seed) == 123_456
     env.close()

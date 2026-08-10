@@ -37,6 +37,11 @@ sys.modules[_spec.name] = _train
 _spec.loader.exec_module(_train)
 
 from puffer_soccer.envs.marl2d import make_native_vec_env
+from puffer_soccer.envs.marl2d.core import (
+    DISCRETE_GROUND_KICK_ACTION_START,
+    DISCRETE_KICK_STRENGTHS,
+    DISCRETE_LOFTED_KICK_ACTION_START,
+)
 
 # env constants that match binding.c at 1f266f4
 BALL_RADIUS = 1.0
@@ -47,8 +52,8 @@ MAX_BALL_SPEED = 5.0
 TOUCH_RADIUS = 4.0
 IMPULSE_THRESHOLD = 0.05
 
-KICK_ACTION_MIN = 5
-KICK_ACTION_MAX = 12
+KICK_ACTION_MIN = DISCRETE_GROUND_KICK_ACTION_START
+KICK_ACTION_MAX = DISCRETE_LOFTED_KICK_ACTION_START + len(DISCRETE_KICK_STRENGTHS) - 1
 
 FIELD_HALF_X = 50.0
 FIELD_HALF_Y = 35.0
@@ -70,10 +75,10 @@ def detect_touches_per_env(
     actions_t: np.ndarray,
 ) -> list[tuple[int, bool]]:
     """Return list of (player_idx, is_kick) touches for one env at one step."""
-    expected_vx = prev_ball[2] * BALL_DECAY
-    expected_vy = prev_ball[3] * BALL_DECAY
-    dvx = cur_ball[2] - expected_vx
-    dvy = cur_ball[3] - expected_vy
+    expected_vx = prev_ball[3] * BALL_DECAY
+    expected_vy = prev_ball[4] * BALL_DECAY
+    dvx = cur_ball[3] - expected_vx
+    dvy = cur_ball[4] - expected_vy
     impulse_sq = dvx * dvx + dvy * dvy
     if impulse_sq < IMPULSE_THRESHOLD * IMPULSE_THRESHOLD:
         return []
@@ -102,7 +107,7 @@ def compute_game_stats(
     """Compute all teamplay stats for one full game trajectory.
 
     positions: (T, 2*ppt, 2)
-    ball: (T, 4)  ->  (bx, by, bvx, bvy)
+    ball: (T, 6)  ->  (bx, by, bz, bvx, bvy, bvz)
     actions: (T, 2*ppt)
     """
 
@@ -395,7 +400,7 @@ def run_checkpoint(
     num_players = 2 * players_per_team
     T_alloc = game_length + 2
     positions = np.zeros((num_envs, T_alloc, num_players, 2), dtype=np.float32)
-    ball = np.zeros((num_envs, T_alloc, 4), dtype=np.float32)
+    ball = np.zeros((num_envs, T_alloc, 6), dtype=np.float32)
     actions_log = np.zeros((num_envs, T_alloc, num_players), dtype=np.int32)
     blue_left_per = np.zeros((num_envs,), dtype=bool)
 

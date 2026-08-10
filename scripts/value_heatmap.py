@@ -34,8 +34,11 @@ _spec.loader.exec_module(_train)
 
 from puffer_soccer.envs.marl2d.constants import (
     INIT_POSITION_11,
+    MAX_BALL_HEIGHT,
     MAX_BALL_SPEED,
+    MAX_BALL_VERTICAL_SPEED,
 )
+from puffer_soccer.envs.marl2d.core import DISCRETE_ACTION_COUNT
 
 # env geometry (scale=1.0, blue on left)
 FIELD_X = 110.0
@@ -66,15 +69,26 @@ def build_observation_batch(
     ball_v: np.ndarray,  # (2,)  shared across grid cells (typ: zero)
     blue_left: bool,
     focus_team: int,
+    ball_z: float = 0.0,
+    ball_vz: float = 0.0,
 ) -> np.ndarray:
-    """Return (N, num_focus_agents, obs_size) observation batch for the focus
-    team's agents, given a grid of ball positions. Rotations/positions/ball
-    velocity are shared across the grid; only ball_xy varies.
+    """Return synthetic soccer observations for one focus team over a ball grid.
+
+    This helper mirrors the native C observation layout without requiring a testing setter for
+    the environment state. It is used by value and policy heatmaps that sweep the ball over a
+    2D field while keeping players fixed. The live environment now carries a 3D ball state, so
+    the synthetic observation includes normalized ball height and vertical speed as the final
+    two values of the ball block. The defaults keep historical 2D heatmaps on the ground, while
+    callers can pass non-zero ``ball_z`` or ``ball_vz`` for chip-shot diagnostics.
+
+    Player positions remain 2D by design. The function only varies the ball's horizontal
+    position across ``ball_xy_grid`` because that is the expensive axis most heatmaps need; the
+    horizontal and vertical velocity values are shared across all grid cells for speed.
     """
 
     num_agents = agents_xy.shape[0]
     ppt = num_agents // 2
-    obs_size = 16 + 14 * ppt
+    obs_size = 18 + 14 * ppt
 
     focus_idx = np.where(agents_team == focus_team)[0]
     N = ball_xy_grid.shape[0]
@@ -108,7 +122,7 @@ def build_observation_batch(
         if int(global_idx) < 11:
             out[:, fi, 7 + int(global_idx)] = 1.0
 
-        # ball block (5 floats: present, dist, view_angle, rel_vx, rel_vy)
+        # ball block (7 floats: present, dist, view_angle, rel_vx, rel_vy, z, vz)
         d_ball_xy = ball_xy_grid - fxy[fi]  # (N, 2)
         obj_rot_ball = np.arctan2(d_ball_xy[:, 1], d_ball_xy[:, 0])
         vis, obj_view = visible_and_view_mask(
@@ -124,9 +138,15 @@ def build_observation_batch(
         rel_y = np.sin(vel_rot - frot[fi]) * abs_val / MAX_BALL_SPEED
         out[:, fi, 21] = np.where(vis, rel_x, 0.0)
         out[:, fi, 22] = np.where(vis, rel_y, 0.0)
+        out[:, fi, 23] = np.where(vis, np.clip(ball_z / MAX_BALL_HEIGHT, 0.0, 1.0), 0.0)
+        out[:, fi, 24] = np.where(
+            vis,
+            np.clip(ball_vz / MAX_BALL_VERTICAL_SPEED, -1.0, 1.0),
+            0.0,
+        )
 
         # teammates then opponents, in their per-team order (7 floats each)
-        o = 23
+        o = 25
         # teammates
         team_mates = [
             j for j in range(num_agents) if agents_team[j] == focus_team and j != global_idx
@@ -259,7 +279,7 @@ def eval_checkpoint(
             shape = (D,)
 
         class _Act:
-            n = 13
+            n = DISCRETE_ACTION_COUNT
 
         single_observation_space = _Obs()
         single_action_space = _Act()

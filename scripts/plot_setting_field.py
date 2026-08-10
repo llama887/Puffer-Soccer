@@ -43,7 +43,7 @@ def main() -> None:
     state = env.get_state(0)
     pos = np.asarray(state["positions"], dtype=np.float32)         # (2n, 2)
     rot = np.asarray(state["rotations"], dtype=np.float32)         # (2n,)
-    ball = np.asarray(state["ball"], dtype=np.float32)             # (4,) x,y,vx,vy
+    ball = np.asarray(state["ball"], dtype=np.float32)             # (6,) x,y,z,vx,vy,vz
     n = args.players_per_team
     teams = np.array([0] * n + [1] * n, dtype=np.int32)            # 0=blue, 1=red
     env.close()

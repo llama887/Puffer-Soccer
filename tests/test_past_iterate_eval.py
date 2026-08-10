@@ -1211,9 +1211,7 @@ def test_main_aligns_periodic_eval_video_and_baseline_rollover(tmp_path):
     assert video_output_paths == [
         Path("experiments/2026-03-22_10-28-13_run-123/video/self_play.mp4")
     ] * len(expected_epochs)
-    assert best_video_output_paths == [
-        Path("experiments/2026-03-22_10-28-13_run-123/video/best_checkpoint.mp4")
-    ]
+    assert best_video_output_paths == []
     assert run_summaries[0]["past_iterate_eval_interval_epochs"] == 5
     assert run_summaries[0]["retained_past_checkpoint_epochs"] == expected_epochs
     assert (

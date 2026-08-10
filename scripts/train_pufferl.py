@@ -149,12 +149,14 @@ class Policy(torch.nn.Module):
     updates. Keeping this class as the core lets old non-recurrent checkpoints still load while
     new runs can wrap the same encoder with an LSTM by calling ``build_policy``.
 
-    The observation is parsed into self, ball, teammate, and opponent blocks. Every other-player
-    block is passed through the same small encoder, then masked mean and max summaries are built
-    separately for teammates and opponents. This gives the policy one set-style representation
-    that works when only one player per side is active and when all eleven players are active.
-    The implementation stays batch-vectorized: reshaping and reductions replace Python loops, so
-    the added flexibility does not create a slow per-agent forward path.
+    The observation is parsed into self, ball, teammate, and opponent blocks. The ball block is
+    seven values wide: visibility, horizontal distance, view angle, relative horizontal
+    velocity, height, and vertical speed. Every other-player block is passed through the same
+    small encoder, then masked mean and max summaries are built separately for teammates and
+    opponents. This gives the policy one set-style representation that works when only one
+    player per side is active and when all eleven players are active. The implementation stays
+    batch-vectorized: reshaping and reductions replace Python loops, so the added flexibility
+    does not create a slow per-agent forward path.
     """
 
     is_continuous = False
@@ -168,11 +170,11 @@ class Policy(torch.nn.Module):
     ):
         super().__init__()
         obs_dim = env.single_observation_space.shape[0]
-        if (obs_dim - 16) % 14 != 0 or obs_dim < 30:
+        if (obs_dim - 18) % 14 != 0 or obs_dim < 32:
             raise ValueError(
-                "soccer observations must have shape 16 + 14 * players_per_team"
+                "soccer observations must have shape 18 + 14 * players_per_team"
             )
-        self.players_per_team = int((obs_dim - 16) // 14)
+        self.players_per_team = int((obs_dim - 18) // 14)
         self.encoder_output_size = int(encoder_output_size)
         self.player_embedding_size = int(encoder_hidden_size)
         if hasattr(env.single_action_space, "n"):
@@ -188,7 +190,7 @@ class Policy(torch.nn.Module):
             torch.nn.ReLU(),
         )
         self.ball_encoder = torch.nn.Sequential(
-            pufferlib.pytorch.layer_init(torch.nn.Linear(5, encoder_hidden_size)),
+            pufferlib.pytorch.layer_init(torch.nn.Linear(7, encoder_hidden_size)),
             torch.nn.ReLU(),
         )
         self.player_encoder = torch.nn.Sequential(
@@ -252,8 +254,8 @@ class Policy(torch.nn.Module):
 
         _ = state
         self_features = observations[:, :18]
-        ball_features = observations[:, 18:23]
-        player_features = observations[:, 23:].reshape(observations.shape[0], -1, 7)
+        ball_features = observations[:, 18:25]
+        player_features = observations[:, 25:].reshape(observations.shape[0], -1, 7)
         teammate_count = max(0, self.players_per_team - 1)
         teammate_features = player_features[:, :teammate_count]
         opponent_features = player_features[:, teammate_count:]
@@ -5047,7 +5049,13 @@ def _build_run_summary(
                 "environment/blue_team_episode_return for a one-team training reward view, "
                 "and use environment/score plus head-to-head eval win rates as the primary "
                 "strength signals."
-            )
+            ),
+            "vertical_ball_metrics": (
+                "The 3D ball experiment logs environment/lofted_kicks, "
+                "environment/ball_air_step_frac, and environment/ball_peak_height. The change "
+                "is helping only if those metrics become non-zero in policy play without a "
+                "drop in environment/score, eval win rate, or replay-video quality."
+            ),
         },
     }
 
@@ -5660,7 +5668,9 @@ def main():
                 eval_interval_epochs,
             )
             should_eval = should_run_periodic_event and (
-                args.past_iterate_eval or league_manager is not None
+                args.past_iterate_eval
+                or league_manager is not None
+                or (args.fixed_best_checkpoint and args.final_best_eval_games > 0)
             )
             if should_run_periodic_event and not should_eval and logger is not None:
                 logger.wandb.log(
@@ -6107,7 +6117,12 @@ def main():
         raise RuntimeError("training did not produce trainer metadata")
 
     best_video_path = None
-    if args.export_videos and best_opponent is not None and current_policy is not None:
+    if (
+        args.export_videos
+        and args.final_best_eval_games > 0
+        and best_opponent is not None
+        and current_policy is not None
+    ):
         best_video_path = save_best_checkpoint_video(
             current_policy, best_opponent, args
         )

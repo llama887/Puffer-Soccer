@@ -4,9 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH --time=48:00:00
-#SBATCH --account=torch_pr_45_tandon_advanced
+#SBATCH --account=torch_pr_1066_tandon_advanced
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
 #SBATCH --chdir=/scratch/fyy2003/repos/Puffer-Soccer
@@ -48,7 +48,30 @@ mkdir -p \
 
 rm -rf "$JOB_COPY_ROOT"
 mkdir -p "$JOB_COPY_ROOT"
-rsync -a --delete --exclude 'sbatch-tmp/' "$REPO_ROOT/" "$JOB_WORKSPACE_ROOT/"
+rsync -a --delete \
+    --exclude 'sbatch-tmp/' \
+    --exclude '.git/' \
+    --exclude '.venv/' \
+    --exclude '.mypy_cache/' \
+    --exclude '.pytest_cache/' \
+    --exclude '__pycache__/' \
+    --exclude 'build/' \
+    --exclude 'archive/' \
+    --exclude 'videos/' \
+    --exclude 'experiments/' \
+    --exclude 'wandb/' \
+    --exclude '.wandb/' \
+    "$REPO_ROOT/" "$JOB_WORKSPACE_ROOT/"
+
+mkdir -p "$JOB_WORKSPACE_ROOT/experiments/baselines"
+rsync -a "$REPO_ROOT/experiments/autoload_hyperparameters.json" \
+    "$JOB_WORKSPACE_ROOT/experiments/autoload_hyperparameters.json"
+rsync -a "$REPO_ROOT/experiments/best_checkpoint.json" \
+    "$JOB_WORKSPACE_ROOT/experiments/best_checkpoint.json"
+rsync -a "$REPO_ROOT/experiments/best_checkpoint_history.jsonl" \
+    "$JOB_WORKSPACE_ROOT/experiments/best_checkpoint_history.jsonl"
+rsync -a "$REPO_ROOT/experiments/baselines/current_best" \
+    "$JOB_WORKSPACE_ROOT/experiments/baselines/"
 
 printf 'REPO_ROOT=%s\n' "$REPO_ROOT"
 printf 'JOB_WORKSPACE_ROOT=%s\n' "$JOB_WORKSPACE_ROOT"
@@ -92,8 +115,8 @@ export GPU_HEARTBEAT_MATMULS_PER_CHUNK="${GPU_HEARTBEAT_MATMULS_PER_CHUNK:-8}"
 export GPU_HEARTBEAT_DTYPE="${GPU_HEARTBEAT_DTYPE:-bfloat16}"
 export TRAIN_AUTOMODE_HYPERPARAMETERS_PATH="${TRAIN_AUTOMODE_HYPERPARAMETERS_PATH:-experiments/autoload_hyperparameters.json}"
 export TRAIN_AUTOMODE_PPO_ITERATIONS="${TRAIN_AUTOMODE_PPO_ITERATIONS:-100000}"
-export TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS="${TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS:-8}"
-export TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS="${TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS:-$TRAIN_AUTOMODE_PPO_ITERATIONS}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS="${TRAIN_AUTOMODE_NO_OPPONENT_MIN_ITERATIONS:-0}"
+export TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS="${TRAIN_AUTOMODE_NO_OPPONENT_MAX_ITERATIONS:-0}"
 export TRAIN_AUTOMODE_NO_OPPONENT_EVAL_INTERVAL="${TRAIN_AUTOMODE_NO_OPPONENT_EVAL_INTERVAL:-4}"
 export TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD="${TRAIN_AUTOMODE_NO_OPPONENT_GOAL_RATE_THRESHOLD:-0.80}"
 export TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD="${TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD:-0.0}"
@@ -168,6 +191,7 @@ uv run python -u scripts/train_pufferl.py \
     --no-opponent-phase-multi-goal-rate-threshold "$TRAIN_AUTOMODE_NO_OPPONENT_MULTI_GOAL_RATE_THRESHOLD" \
     --no-opponent-eval-games "$TRAIN_AUTOMODE_NO_OPPONENT_EVAL_GAMES" \
     --no-opponent-map-scale-ladder "$TRAIN_AUTOMODE_NO_OPPONENT_MAP_SCALE_LADDER" \
+    --past-iterate-eval-fractions 5 \
     --final-best-eval-games "$TRAIN_AUTOMODE_FINAL_BEST_EVAL_GAMES" \
     --best-checkpoint-promotion-confidence "$TRAIN_AUTOMODE_BEST_PROMOTION_CONFIDENCE" \
     --best-checkpoint-promotion-min-batches "$TRAIN_AUTOMODE_BEST_PROMOTION_MIN_BATCHES" \

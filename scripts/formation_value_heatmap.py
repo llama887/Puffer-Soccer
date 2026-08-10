@@ -40,6 +40,7 @@ sys.modules[_spec.name] = _train
 _spec.loader.exec_module(_train)
 
 from value_heatmap import build_observation_batch  # noqa: E402
+from puffer_soccer.envs.marl2d.core import DISCRETE_ACTION_COUNT  # noqa: E402
 
 PPT = 5
 LINE_YS = (-20.0, -7.0, 7.0, 20.0)  # 4-agent vertical line
@@ -96,14 +97,14 @@ def eval_ckpt(ckpt_path: Path, grid_blue_x: np.ndarray, grid_red_x: np.ndarray, 
 
     # build one example to get obs dim
     xy0, rot0, team0, carrier_idx = build_formation(0.0, 33.0)
-    obs_size = 16 + 14 * PPT
+    obs_size = 18 + 14 * PPT
 
     class _Shim:
         class _Obs:
             shape = (obs_size,)
 
         class _Act:
-            n = 13
+            n = DISCRETE_ACTION_COUNT
 
         single_observation_space = _Obs()
         single_action_space = _Act()

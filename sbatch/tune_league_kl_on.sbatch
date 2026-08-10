@@ -4,9 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH --time=48:00:00
-#SBATCH --account=torch_pr_45_tandon_advanced
+#SBATCH --account=torch_pr_1066_tandon_advanced
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
 #SBATCH --chdir=/scratch/fyy2003/repos/Puffer-Soccer

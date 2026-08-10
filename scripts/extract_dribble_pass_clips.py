@@ -35,13 +35,18 @@ sys.modules[_spec.name] = _train
 _spec.loader.exec_module(_train)
 
 from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.envs.marl2d.core import (
+    DISCRETE_GROUND_KICK_ACTION_START,
+    DISCRETE_KICK_STRENGTHS,
+    DISCRETE_LOFTED_KICK_ACTION_START,
+)
 
 BALL_DECAY = 0.85
 MAX_BALL_SPEED = 5.0
 TOUCH_RADIUS = 4.0
 IMPULSE_THRESHOLD = 0.05
-KICK_ACTION_MIN = 5
-KICK_ACTION_MAX = 12
+KICK_ACTION_MIN = DISCRETE_GROUND_KICK_ACTION_START
+KICK_ACTION_MAX = DISCRETE_LOFTED_KICK_ACTION_START + len(DISCRETE_KICK_STRENGTHS) - 1
 
 DRIBBLE_MIN_TOUCHES = 5
 CENTER_HALF_X = 30.0
@@ -62,8 +67,8 @@ def detect_touches(positions, ball, actions):
     num_players = positions.shape[1]
     touches: list[tuple[int, int, bool]] = []
     for t in range(1, T):
-        dvx = ball[t, 2] - ball[t - 1, 2] * BALL_DECAY
-        dvy = ball[t, 3] - ball[t - 1, 3] * BALL_DECAY
+        dvx = ball[t, 3] - ball[t - 1, 3] * BALL_DECAY
+        dvy = ball[t, 4] - ball[t - 1, 4] * BALL_DECAY
         imp_sq = dvx * dvx + dvy * dvy
         if imp_sq < IMPULSE_THRESHOLD ** 2 or imp_sq > (MAX_BALL_SPEED * 1.1) ** 2:
             continue
@@ -178,7 +183,7 @@ def rollout_state(ckpt_path, seed, ppt, total_steps, device):
     T_alloc = total_steps + 2
     num_players = 2 * ppt
     positions = np.zeros((T_alloc, num_players, 2), dtype=np.float32)
-    ball = np.zeros((T_alloc, 4), dtype=np.float32)
+    ball = np.zeros((T_alloc, 6), dtype=np.float32)
     actions = np.zeros((T_alloc, num_players), dtype=np.int32)
     positions[0] = st["positions"]
     ball[0] = np.asarray(st["ball"], dtype=np.float32)

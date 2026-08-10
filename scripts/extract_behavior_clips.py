@@ -41,6 +41,11 @@ sys.modules[_spec.name] = _train
 _spec.loader.exec_module(_train)
 
 from puffer_soccer.envs.marl2d import make_puffer_env
+from puffer_soccer.envs.marl2d.core import (
+    DISCRETE_GROUND_KICK_ACTION_START,
+    DISCRETE_KICK_STRENGTHS,
+    DISCRETE_LOFTED_KICK_ACTION_START,
+)
 
 FIELD_HALF_X = 50.0
 GOAL_HALF_Y = 20.0
@@ -49,8 +54,8 @@ BALL_DECAY = 0.85
 MAX_BALL_SPEED = 5.0
 TOUCH_RADIUS = 4.0
 IMPULSE_THRESHOLD = 0.05
-KICK_ACTION_MIN = 5
-KICK_ACTION_MAX = 12
+KICK_ACTION_MIN = DISCRETE_GROUND_KICK_ACTION_START
+KICK_ACTION_MAX = DISCRETE_LOFTED_KICK_ACTION_START + len(DISCRETE_KICK_STRENGTHS) - 1
 GOALIE_ROTATION_WINDOW = 20
 
 
@@ -60,8 +65,8 @@ def is_kick(a: int) -> bool:
 
 def detect_touch(prev_ball, cur_ball, positions_t, actions_t):
     """Return (player_idx, is_kick) or None. See teamplay_trace.py for logic."""
-    dvx = cur_ball[2] - prev_ball[2] * BALL_DECAY
-    dvy = cur_ball[3] - prev_ball[3] * BALL_DECAY
+    dvx = cur_ball[3] - prev_ball[3] * BALL_DECAY
+    dvy = cur_ball[4] - prev_ball[4] * BALL_DECAY
     imp_sq = dvx * dvx + dvy * dvy
     if imp_sq < IMPULSE_THRESHOLD ** 2:
         return None
@@ -154,7 +159,7 @@ def main() -> None:
 
     st = vec_state()
     positions = np.zeros((args.total_steps + 2, num_players, 2), dtype=np.float32)
-    ball = np.zeros((args.total_steps + 2, 4), dtype=np.float32)
+    ball = np.zeros((args.total_steps + 2, 6), dtype=np.float32)
     actions_log = np.zeros((args.total_steps + 2, num_players), dtype=np.int32)
     positions[0] = st["positions"]
     ball[0] = np.asarray(st["ball"], dtype=np.float32)
